@@ -4,7 +4,9 @@
 #include <iostream>
 
 MeshRenderer::MeshRenderer()
-    : isInitialized(false), vao(0), vboPos(0), vboNorm(0), ebo(0),
+    : diffuseColor(0.85f, 0.55f, 0.75f),  // default pink
+      alpha(1.0f),
+      isInitialized(false), vao(0), vboPos(0), vboNorm(0), ebo(0),
       vertexCount(0), indexCount(0) {}
 
 MeshRenderer::~MeshRenderer() {
@@ -92,15 +94,16 @@ void MeshRenderer::Draw(GLuint shaderProgram, const glm::mat4& viewProj) {
     glUseProgram(shaderProgram);
 
     glm::mat4 model(1.0f);
-    glm::vec3 diffuse(0.85f, 0.55f, 0.75f);  // pink-ish, matches the app aesthetic
 
     GLint locVP    = glGetUniformLocation(shaderProgram, "viewProj");
     GLint locM     = glGetUniformLocation(shaderProgram, "model");
     GLint locDiff  = glGetUniformLocation(shaderProgram, "DiffuseColor");
+    GLint locAlpha = glGetUniformLocation(shaderProgram, "alpha");
 
-    if (locVP   >= 0) glUniformMatrix4fv(locVP,  1, GL_FALSE, glm::value_ptr(viewProj));
-    if (locM    >= 0) glUniformMatrix4fv(locM,   1, GL_FALSE, glm::value_ptr(model));
-    if (locDiff >= 0) glUniform3fv(locDiff, 1, glm::value_ptr(diffuse));
+    if (locVP    >= 0) glUniformMatrix4fv(locVP,  1, GL_FALSE, glm::value_ptr(viewProj));
+    if (locM     >= 0) glUniformMatrix4fv(locM,   1, GL_FALSE, glm::value_ptr(model));
+    if (locDiff  >= 0) glUniform3fv(locDiff, 1, glm::value_ptr(diffuseColor));
+    if (locAlpha >= 0) glUniform1f(locAlpha, alpha);
 
     // Fixed-function lighting doesn't affect shader path, but disable it to be safe.
     glDisable(GL_LIGHTING);

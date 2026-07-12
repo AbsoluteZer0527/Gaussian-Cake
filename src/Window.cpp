@@ -19,8 +19,9 @@ const char* Window::windowTitle = "Gaussian Cake";
 Camera* Cam;
 
 //Object particles
-ParticleSystem* Window::particleSystem = nullptr;
-MeshRenderer*   Window::meshRenderer   = nullptr;
+ParticleSystem* Window::particleSystem     = nullptr;
+MeshRenderer*   Window::meshRenderer       = nullptr;
+MeshRenderer*   Window::meshRendererTarget = nullptr;
 
 //Render mode
 RenderMode Window::renderMode = RenderMode::TriangleMorph;
@@ -30,7 +31,13 @@ std::vector<glm::vec3>    Window::meshStartPositions;
 std::vector<glm::vec3>    Window::meshEndPositions;
 std::vector<unsigned int> Window::meshIndices;
 bool                      Window::meshMorphActive = false;
-bool                      Window::snapToTarget    = true;   // Phase 2 default on
+SnapMode                  Window::snapMode        = SnapMode::NearestTriangle;  // Phase 3 default
+
+//Dual-mesh (Option B) target-side state
+std::vector<glm::vec3>    Window::meshTargetStart;
+std::vector<glm::vec3>    Window::meshTargetEnd;
+std::vector<glm::vec3>    Window::meshTargetCurrent;
+std::vector<unsigned int> Window::meshTargetIndices;
 
 //Gaussian OT pipeline
 Gaussian*        Window::gaussianA     = nullptr;
@@ -43,7 +50,8 @@ std::vector<std::string> Window::meshNames;
 std::vector<std::string> Window::meshPaths;
 int              Window::meshIndexA    = 0;
 int              Window::meshIndexB    = 0;
-int              Window::sampleCount   = 5000;
+int              Window::sampleCount        = 5000;
+int              Window::subdivisionLevel   = 0;
 
 //Interaction Variables
 bool LeftDown, RightDown;
@@ -102,8 +110,13 @@ static int FindMeshIndex(const std::string& filename) {
 }
 
 bool Window::initializeObjects() {
-    particleSystem = new ParticleSystem();
-    meshRenderer   = new MeshRenderer();
+    particleSystem     = new ParticleSystem();
+    meshRenderer       = new MeshRenderer();
+    meshRendererTarget = new MeshRenderer();
+
+    // Distinct diffuse colors so overlapping source/target are visually separable.
+    meshRenderer->diffuseColor       = glm::vec3(0.85f, 0.55f, 0.75f);  // pink (source)
+    meshRendererTarget->diffuseColor = glm::vec3(0.40f, 0.75f, 0.85f);  // teal (target)
 
     gaussianA = new Gaussian();
     gaussianB = new Gaussian();
@@ -132,6 +145,7 @@ bool Window::initializeObjects() {
 void Window::cleanUp() {
     delete particleSystem;
     delete meshRenderer;
+    delete meshRendererTarget;
     delete gaussianA;
     delete gaussianB;
     delete otMap;
@@ -191,10 +205,19 @@ void Window::idleCallback() {
     particleSystem->Update(deltaTime);
 
     if (meshMorphActive) {
-        // Triangle-morph path: animator writes lerp'd vertex positions into
-        // meshStartPositions each frame, then we push them to the GPU.
+        // Source mesh: animator advances the shared timeline and writes
+        // lerp'd source-vertex positions into meshStartPositions.
         animator->Update(deltaTime, meshStartPositions);
         meshRenderer->UpdatePositions(meshStartPositions);
+
+        // Target mesh: manually lerp using the same easing curve so it stays
+        // perfectly in sync with the source.
+        if (!meshTargetCurrent.empty()) {
+            float e = animator->ApplyEasing(animator->GetProgress());
+            for (size_t i = 0; i < meshTargetCurrent.size(); ++i)
+                meshTargetCurrent[i] = glm::mix(meshTargetStart[i], meshTargetEnd[i], e);
+            meshRendererTarget->UpdatePositions(meshTargetCurrent);
+        }
     } else if (otMapComputed) {
         animator->Update(deltaTime, particleSystem->transportPositions);
         particleSystem->useOTPositions = (animator->state != AnimationState::GAUSSIAN_A);
@@ -217,7 +240,31 @@ void Window::displayCallback(GLFWwindow* window) {
     glLightfv(GL_LIGHT1, GL_DIFFUSE, light1_color);
 
     if (renderMode == RenderMode::TriangleMorph && meshMorphActive) {
-        meshRenderer->Draw(shaderProgram, Cam->GetViewProjectMtx());
+        // Crossfade: source fades out (1→0) as target fades in (0→1).
+        float e = animator->ApplyEasing(animator->GetProgress());
+        meshRenderer->alpha       = 1.0f - e;
+        meshRendererTarget->alpha = e;
+
+        // Enable alpha blending. Draw the more-opaque mesh first so it
+        // gets depth priority; draw the less-opaque one with depth-write
+        // disabled so it blends correctly on top without z-fighting.
+        glEnable(GL_BLEND);
+        glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
+
+        if (meshRenderer->alpha >= meshRendererTarget->alpha) {
+            glDepthMask(GL_TRUE);
+            meshRenderer->Draw(shaderProgram, Cam->GetViewProjectMtx());
+            glDepthMask(GL_FALSE);
+            meshRendererTarget->Draw(shaderProgram, Cam->GetViewProjectMtx());
+        } else {
+            glDepthMask(GL_TRUE);
+            meshRendererTarget->Draw(shaderProgram, Cam->GetViewProjectMtx());
+            glDepthMask(GL_FALSE);
+            meshRenderer->Draw(shaderProgram, Cam->GetViewProjectMtx());
+        }
+
+        glDepthMask(GL_TRUE);
+        glDisable(GL_BLEND);
     } else {
         particleSystem->Draw(Cam->GetViewProjectMtx());
     }
@@ -248,6 +295,26 @@ static bool LoadMeshGaussian(const char* path, int N, Gaussian* g) {
     auto pts = MeshSampler::Sample(tris, N);
     g->FitFromPoints(pts);
     return true;
+}
+
+// Midpoint subdivision: split every triangle into 4 smaller ones.
+// Increasing levels: 1→4x, 2→16x, 3→64x triangles. Applied to source mesh
+// only to add vertices for better endpoint coverage after surface snapping.
+static void SubdivideTriangles(std::vector<Triangle>& tris, int levels) {
+    for (int l = 0; l < levels; ++l) {
+        std::vector<Triangle> result;
+        result.reserve(tris.size() * 4);
+        for (const auto& t : tris) {
+            glm::vec3 m01 = (t.v0 + t.v1) * 0.5f;
+            glm::vec3 m12 = (t.v1 + t.v2) * 0.5f;
+            glm::vec3 m20 = (t.v2 + t.v0) * 0.5f;
+            result.push_back({t.v0, m01, m20});
+            result.push_back({m01, t.v1, m12});
+            result.push_back({m20, m12, t.v2});
+            result.push_back({m01, m12, m20});
+        }
+        tris = std::move(result);
+    }
 }
 
 // Deduplicate vertices from an OBJ triangle soup into a unique-vertex list +
@@ -290,6 +357,76 @@ static void BuildMeshTopology(const std::vector<Triangle>& tris,
         outIndices.push_back(addVertex(t.v0));
         outIndices.push_back(addVertex(t.v1));
         outIndices.push_back(addVertex(t.v2));
+    }
+}
+
+// Phase 3: closest point on triangle (a, b, c) to a query point p.
+// Ericson, "Real-Time Collision Detection" §5.1.5 — Voronoi-region test.
+// Returns a point on the triangle surface (interior or boundary edge/vertex).
+static glm::vec3 ClosestPointOnTriangle(const glm::vec3& p,
+                                        const glm::vec3& a,
+                                        const glm::vec3& b,
+                                        const glm::vec3& c) {
+    glm::vec3 ab = b - a;
+    glm::vec3 ac = c - a;
+    glm::vec3 ap = p - a;
+
+    float d1 = glm::dot(ab, ap);
+    float d2 = glm::dot(ac, ap);
+    if (d1 <= 0.0f && d2 <= 0.0f) return a;                   // vertex A region
+
+    glm::vec3 bp = p - b;
+    float d3 = glm::dot(ab, bp);
+    float d4 = glm::dot(ac, bp);
+    if (d3 >= 0.0f && d4 <= d3) return b;                     // vertex B region
+
+    float vc = d1 * d4 - d3 * d2;
+    if (vc <= 0.0f && d1 >= 0.0f && d3 <= 0.0f) {             // edge AB
+        float v = d1 / (d1 - d3);
+        return a + v * ab;
+    }
+
+    glm::vec3 cp = p - c;
+    float d5 = glm::dot(ab, cp);
+    float d6 = glm::dot(ac, cp);
+    if (d6 >= 0.0f && d5 <= d6) return c;                     // vertex C region
+
+    float vb = d5 * d2 - d1 * d6;
+    if (vb <= 0.0f && d2 >= 0.0f && d6 <= 0.0f) {             // edge AC
+        float w = d2 / (d2 - d6);
+        return a + w * ac;
+    }
+
+    float va = d3 * d6 - d5 * d4;
+    if (va <= 0.0f && (d4 - d3) >= 0.0f && (d5 - d6) >= 0.0f) { // edge BC
+        float w = (d4 - d3) / ((d4 - d3) + (d5 - d6));
+        return b + w * (c - b);
+    }
+
+    // Interior projection via barycentric coordinates.
+    float denom = 1.0f / (va + vb + vc);
+    float v = vb * denom;
+    float w = vc * denom;
+    return a + v * ab + w * ac;
+}
+
+// Phase 3 snap: for each endpoint, find the closest point on *any* target
+// triangle. Continuous surface projection — sub-triangle precision, no
+// collapse to shared samples. Brute force O(V*T) — one-time Bake cost.
+// For large target meshes this can take a few seconds; a BVH would fix that.
+static void SnapToNearestOnTriangles(std::vector<glm::vec3>& endVerts,
+                                     const std::vector<Triangle>& tris) {
+    if (tris.empty()) return;
+    for (auto& p : endVerts) {
+        float bestDist = 1e30f;
+        glm::vec3 best = p;
+        for (const auto& t : tris) {
+            glm::vec3 q = ClosestPointOnTriangle(p, t.v0, t.v1, t.v2);
+            glm::vec3 d = p - q;
+            float dist = glm::dot(d, d);
+            if (dist < bestDist) { bestDist = dist; best = q; }
+        }
+        p = best;
     }
 }
 
@@ -355,6 +492,11 @@ void Window::ComputeOTAndSpawnParticles() {
         OBJLoader::Normalize(trisA);
         OBJLoader::Normalize(trisB);
 
+        // Optional midpoint subdivision: adds more source vertices so snap
+        // endpoints cover the target surface more densely.
+        if (subdivisionLevel > 0)
+            SubdivideTriangles(trisA, subdivisionLevel);
+
         // Extract the source mesh's actual vertices + triangle indices.
         std::vector<glm::vec3>    verts;
         std::vector<unsigned int> indices;
@@ -377,19 +519,66 @@ void Window::ComputeOTAndSpawnParticles() {
         for (size_t i = 0; i < verts.size(); ++i)
             endVerts[i] = OptimalTransport::Apply(*otMap, verts[i]);
 
-        // Phase 2: snap each endpoint to the nearest sampled point on B's surface,
-        // so the morph destination truly sits on the target mesh, not on a linear
-        // warp of the source. sampledB is reused (already computed above for OT).
-        if (snapToTarget)
-            SnapToNearestOnTarget(endVerts, sampledB);
+        // Refine SOURCE endpoints toward target surface.
+        //   None            (Phase 1): no snap — endpoint = OT-warped source
+        //   NearestSample   (Phase 2): snap to closest of the K sampled points
+        //   NearestTriangle (Phase 3): snap to closest point on any target triangle
+        switch (snapMode) {
+            case SnapMode::NearestSample:
+                SnapToNearestOnTarget(endVerts, sampledB);
+                break;
+            case SnapMode::NearestTriangle:
+                SnapToNearestOnTriangles(endVerts, trisB);
+                break;
+            case SnapMode::None:
+            default:
+                break;
+        }
 
-        // Hand off to renderer + animator. The animator writes lerp'd positions
-        // into meshStartPositions each frame (see idleCallback).
+        // === Option B: parallel target-topology mesh ===
+        // Extract the target mesh's actual vertices + indices.
+        std::vector<glm::vec3>    tVerts;
+        std::vector<unsigned int> tIndices;
+        BuildMeshTopology(trisB, tVerts, tIndices);
+
+        // Compute A^-1 once. OT^-1(y) = mu_A + A^-1 * (y - mu_B).
+        Eigen::Matrix3d Ainv = otMap->A.inverse();
+
+        std::vector<glm::vec3> tStart(tVerts.size());
+        for (size_t i = 0; i < tVerts.size(); ++i) {
+            Eigen::Vector3d yE((double)tVerts[i].x, (double)tVerts[i].y, (double)tVerts[i].z);
+            Eigen::Vector3d xE = otMap->muA + Ainv * (yE - otMap->muB);
+            tStart[i] = glm::vec3((float)xE.x(), (float)xE.y(), (float)xE.z());
+        }
+
+        // Symmetric snap: pull target-start positions onto the source surface,
+        // so at t=0 the target mesh's vertices sit on/near the source.
+        switch (snapMode) {
+            case SnapMode::NearestSample:
+                SnapToNearestOnTarget(tStart, sampledA);
+                break;
+            case SnapMode::NearestTriangle:
+                SnapToNearestOnTriangles(tStart, trisA);
+                break;
+            case SnapMode::None:
+            default:
+                break;
+        }
+
+        // Hand off to renderers + animator. Source animator drives the timeline;
+        // target buffer is manually lerp'd each frame using animator.GetProgress().
         meshStartPositions = verts;
         meshEndPositions   = endVerts;
         meshIndices        = indices;
 
+        meshTargetStart   = tStart;
+        meshTargetEnd     = tVerts;
+        meshTargetCurrent = tStart;       // t=0 initial state
+        meshTargetIndices = tIndices;
+
         meshRenderer->Initialize(verts, indices);
+        meshRendererTarget->Initialize(tStart, tIndices);
+
         animator->InitializeWithEndPoints(verts, endVerts);
         animator->StartTransport();
         meshMorphActive = true;
@@ -494,11 +683,20 @@ void Window::DrawMainGUI() {
     if (renderMode == RenderMode::TriangleMorph) {
         ImGui::TextColored(ImVec4(0.7f, 0.7f, 0.7f, 1.0f),
                            "  (triangle morph requires both A and B to be meshes)");
-        ImGui::Checkbox("Snap endpoint to target surface", &snapToTarget);
+
+        const char* snapItems[] = {
+            "None (Phase 1: OT warp only)",
+            "Nearest Sample (Phase 2)",
+            "Nearest Triangle (Phase 3)"
+        };
+        int snapInt = (int)snapMode;
+        if (ImGui::Combo("Endpoint Snap", &snapInt, snapItems, 3))
+            snapMode = (SnapMode)snapInt;
+
         ImGui::TextColored(ImVec4(0.6f, 0.6f, 0.6f, 1.0f),
-                           snapToTarget
-                               ? "  endpoint sits on target mesh (Phase 2)"
-                               : "  endpoint = linearly warped source (Phase 1)");
+            snapMode == SnapMode::NearestTriangle ? "  continuous surface projection"
+          : snapMode == SnapMode::NearestSample   ? "  snap to K sampled points"
+          :                                          "  raw linear OT warp");
     }
 
     ImGui::Separator();
@@ -509,7 +707,15 @@ void Window::DrawMainGUI() {
 
     ImGui::Separator();
     ImGui::SliderInt("Particles",    &particleCount, 100, 10000);
-    ImGui::SliderInt("Mesh Samples", &sampleCount,   500, 10000);
+    ImGui::SliderInt("Mesh Samples", &sampleCount,   500, 20000);
+    if (renderMode == RenderMode::TriangleMorph) {
+        ImGui::SliderInt("Subdivide Source", &subdivisionLevel, 0, 3);
+        ImGui::TextColored(ImVec4(0.6f, 0.6f, 0.6f, 1.0f),
+            subdivisionLevel == 0 ? "  no subdivision (original mesh)" :
+            subdivisionLevel == 1 ? "  1 pass = 4x triangles" :
+            subdivisionLevel == 2 ? "  2 passes = 16x triangles" :
+                                    "  3 passes = 64x triangles (slow Bake)");
+    }
 
     ImGui::Spacing();
     ImGui::PushStyleColor(ImGuiCol_Button,        ImVec4(1.0f, 0.4f, 0.7f, 1.0f));

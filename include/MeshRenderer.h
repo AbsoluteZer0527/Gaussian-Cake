@@ -22,6 +22,10 @@ public:
     // Render as GL_TRIANGLES using the provided shader program.
     void Draw(GLuint shaderProgram, const glm::mat4& viewProj);
 
+    // Diffuse color and opacity passed to the fragment shader. Public — set directly.
+    glm::vec3 diffuseColor;
+    float     alpha;          // 0.0 = fully transparent, 1.0 = fully opaque
+
     bool isInitialized;
 
 private:

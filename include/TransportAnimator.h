@@ -42,11 +42,13 @@ public:
     bool IsTransporting() const { return state == AnimationState::BAKING; }
     float GetProgress()   const { return transportProgress; }
 
+    // Exposed so callers (e.g., a parallel target-topology mesh) can lerp
+    // their own buffers in sync with this animator's timeline.
+    float ApplyEasing(float t) const;
+
     void DrawGUI();
 
 private:
     std::vector<glm::vec3> startPos;
     std::vector<glm::vec3> destPos;
-
-    float ApplyEasing(float t) const;
 };

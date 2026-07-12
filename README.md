@@ -8,7 +8,9 @@
 ### Model Morphing: Triangle mesh rather than particles
 1. loads source triangles → fits Gaussians to both meshes → computes OT map → applies T(v) to every source vertex → initializes both meshRenderer and animator. This allows the model to be "linearly warped (rotation + scale + shear) into another models' Gaussian with lerp. So the source topology is preserved; only the endpoint is approximate.
 
-2. 
+2. Given a point P and triangle (A, B, C), find Q on the triangle surface (interior or boundary) minimizing ‖P − Q‖. The classic algorithm uses Voronoi regions: the plane containing the triangle is subdivided into 7 regions by the triangle edges' perpendiculars — one for each vertex (P projects to the vertex), one for each edge (P projects to somewhere on the edge), and one for the interior (P projects into the triangle). Which region P falls into is determined by sign tests on ~6 dot products.
+![alt text](image.png)
+Reference: Christer Ericson, Real-Time Collision Detection (2005), §5.1.5 — the standard implementation.
 
 
 ## Inspiration
