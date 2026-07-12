@@ -30,6 +30,7 @@ std::vector<glm::vec3>    Window::meshStartPositions;
 std::vector<glm::vec3>    Window::meshEndPositions;
 std::vector<unsigned int> Window::meshIndices;
 bool                      Window::meshMorphActive = false;
+bool                      Window::snapToTarget    = true;   // Phase 2 default on
 
 //Gaussian OT pipeline
 Gaussian*        Window::gaussianA     = nullptr;
@@ -292,6 +293,25 @@ static void BuildMeshTopology(const std::vector<Triangle>& tris,
     }
 }
 
+// Phase 2 snap: pull each OT-mapped endpoint to the nearest sampled point on
+// the target surface. Runs in-place. Brute force O(V*K) — one-time Bake cost.
+// Unlike greedy discrete OT, the same target sample can attract multiple source
+// vertices (may cause local triangle collapse near dense clusters).
+static void SnapToNearestOnTarget(std::vector<glm::vec3>& endVerts,
+                                  const std::vector<glm::vec3>& targetSamples) {
+    if (targetSamples.empty()) return;
+    for (auto& p : endVerts) {
+        float bestDist = 1e30f;
+        glm::vec3 bestPoint = p;
+        for (const auto& s : targetSamples) {
+            glm::vec3 d = p - s;
+            float dist = glm::dot(d, d);   // squared distance — no sqrt needed
+            if (dist < bestDist) { bestDist = dist; bestPoint = s; }
+        }
+        p = bestPoint;
+    }
+}
+
 // Greedy approximate discrete OT: match each point in ptsA to the nearest
 // unmatched point in ptsB. O(N^2) — fine for N <= 2000 on a single Bake click.
 static std::vector<glm::vec3> GreedyDiscreteOT(
@@ -356,6 +376,12 @@ void Window::ComputeOTAndSpawnParticles() {
         std::vector<glm::vec3> endVerts(verts.size());
         for (size_t i = 0; i < verts.size(); ++i)
             endVerts[i] = OptimalTransport::Apply(*otMap, verts[i]);
+
+        // Phase 2: snap each endpoint to the nearest sampled point on B's surface,
+        // so the morph destination truly sits on the target mesh, not on a linear
+        // warp of the source. sampledB is reused (already computed above for OT).
+        if (snapToTarget)
+            SnapToNearestOnTarget(endVerts, sampledB);
 
         // Hand off to renderer + animator. The animator writes lerp'd positions
         // into meshStartPositions each frame (see idleCallback).
@@ -465,9 +491,15 @@ void Window::DrawMainGUI() {
         // Switching modes disables any active triangle morph; user re-clicks Bake.
         if (renderMode != RenderMode::TriangleMorph) meshMorphActive = false;
     }
-    if (renderMode == RenderMode::TriangleMorph)
+    if (renderMode == RenderMode::TriangleMorph) {
         ImGui::TextColored(ImVec4(0.7f, 0.7f, 0.7f, 1.0f),
                            "  (triangle morph requires both A and B to be meshes)");
+        ImGui::Checkbox("Snap endpoint to target surface", &snapToTarget);
+        ImGui::TextColored(ImVec4(0.6f, 0.6f, 0.6f, 1.0f),
+                           snapToTarget
+                               ? "  endpoint sits on target mesh (Phase 2)"
+                               : "  endpoint = linearly warped source (Phase 1)");
+    }
 
     ImGui::Separator();
 

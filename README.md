@@ -4,6 +4,13 @@
 <img width="2100" height="1247" alt="Screenshot 2026-04-05 005843" src="https://github.com/user-attachments/assets/c7f926b8-0df9-4d66-8b2c-34ff7d3b350e" />
 <img width="1544" height="1029" alt="image" src="https://github.com/user-attachments/assets/dcbf13d9-b03c-4d5f-9efe-094bd0207caf" />
 
+## Update 7/11/26
+### Model Morphing: Triangle mesh rather than particles
+1. loads source triangles → fits Gaussians to both meshes → computes OT map → applies T(v) to every source vertex → initializes both meshRenderer and animator. This allows the model to be "linearly warped (rotation + scale + shear) into another models' Gaussian with lerp. So the source topology is preserved; only the endpoint is approximate.
+
+2. 
+
+
 ## Inspiration
 This project is inspired by the mathematical problem of **Optimal Transport (OT)**, which seeks a mapping between two distributions that minimizes a specified transport cost. 
 

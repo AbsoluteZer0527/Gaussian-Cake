@@ -38,6 +38,9 @@ public:
     static std::vector<glm::vec3>    meshEndPositions;
     static std::vector<unsigned int> meshIndices;
     static bool                      meshMorphActive;
+    // Phase 2: snap OT-mapped endpoints to nearest sampled point on target surface,
+    // so the endpoint sits on the actual target mesh rather than a warped source.
+    static bool                      snapToTarget;
 
     // Gaussian OT pipeline
     static Gaussian* gaussianA;
