@@ -24,6 +24,7 @@ set(
     src/MeshSampler.cpp
     src/OptimalTransport.cpp
     src/TransportAnimator.cpp
+    src/MeshRenderer.cpp
 )
 
 # Add header files

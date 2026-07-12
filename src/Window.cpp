@@ -8,6 +8,7 @@
 
 #include <filesystem>
 #include <algorithm>
+#include <unordered_map>
 
 //Window Properties
 int Window::width;
@@ -19,6 +20,16 @@ Camera* Cam;
 
 //Object particles
 ParticleSystem* Window::particleSystem = nullptr;
+MeshRenderer*   Window::meshRenderer   = nullptr;
+
+//Render mode
+RenderMode Window::renderMode = RenderMode::TriangleMorph;
+
+//Triangle-morph state
+std::vector<glm::vec3>    Window::meshStartPositions;
+std::vector<glm::vec3>    Window::meshEndPositions;
+std::vector<unsigned int> Window::meshIndices;
+bool                      Window::meshMorphActive = false;
 
 //Gaussian OT pipeline
 Gaussian*        Window::gaussianA     = nullptr;
@@ -80,8 +91,18 @@ bool Window::initializeProgram() {
     return true;
 }
 
+// Find the index of a mesh filename in meshNames (returns 0 if not found → "(blob)").
+// meshIndex 0 is the blob sentinel, so real meshes are at index (position_in_meshNames + 1).
+static int FindMeshIndex(const std::string& filename) {
+    for (size_t i = 0; i < Window::meshNames.size(); ++i) {
+        if (Window::meshNames[i] == filename) return (int)i + 1;
+    }
+    return 0;
+}
+
 bool Window::initializeObjects() {
     particleSystem = new ParticleSystem();
+    meshRenderer   = new MeshRenderer();
 
     gaussianA = new Gaussian();
     gaussianB = new Gaussian();
@@ -89,10 +110,12 @@ bool Window::initializeObjects() {
     animator = new TransportAnimator();
     otMapComputed = false;
     particleCount = 3000;
-    meshIndexA = 0;
-    meshIndexB = 0;
 
     ScanMeshes();
+
+    // Defaults: source = Guassian.obj, target = teapot.obj
+    meshIndexA = FindMeshIndex("Guassian.obj");
+    meshIndexB = FindMeshIndex("teapot.obj");
 
     Cam->SetDistance(8.0f);
     Cam->SetIncline(-20.0f);
@@ -107,6 +130,7 @@ bool Window::initializeObjects() {
 
 void Window::cleanUp() {
     delete particleSystem;
+    delete meshRenderer;
     delete gaussianA;
     delete gaussianB;
     delete otMap;
@@ -165,7 +189,12 @@ void Window::idleCallback() {
     deltaTime = glm::min(deltaTime, 0.05f);
     particleSystem->Update(deltaTime);
 
-    if (otMapComputed) {
+    if (meshMorphActive) {
+        // Triangle-morph path: animator writes lerp'd vertex positions into
+        // meshStartPositions each frame, then we push them to the GPU.
+        animator->Update(deltaTime, meshStartPositions);
+        meshRenderer->UpdatePositions(meshStartPositions);
+    } else if (otMapComputed) {
         animator->Update(deltaTime, particleSystem->transportPositions);
         particleSystem->useOTPositions = (animator->state != AnimationState::GAUSSIAN_A);
     }
@@ -186,7 +215,11 @@ void Window::displayCallback(GLFWwindow* window) {
     glLightfv(GL_LIGHT1, GL_POSITION, light1_pos);
     glLightfv(GL_LIGHT1, GL_DIFFUSE, light1_color);
 
-    particleSystem->Draw(Cam->GetViewProjectMtx());
+    if (renderMode == RenderMode::TriangleMorph && meshMorphActive) {
+        meshRenderer->Draw(shaderProgram, Cam->GetViewProjectMtx());
+    } else {
+        particleSystem->Draw(Cam->GetViewProjectMtx());
+    }
 
     ImGui_ImplOpenGL3_NewFrame();
     ImGui_ImplGlfw_NewFrame();
@@ -214,6 +247,49 @@ static bool LoadMeshGaussian(const char* path, int N, Gaussian* g) {
     auto pts = MeshSampler::Sample(tris, N);
     g->FitFromPoints(pts);
     return true;
+}
+
+// Deduplicate vertices from an OBJ triangle soup into a unique-vertex list +
+// triangle index list. Uses exact float equality via bit-hashed vec3 keys.
+// This is required because glDrawElements(GL_TRIANGLES) expects an EBO.
+static void BuildMeshTopology(const std::vector<Triangle>& tris,
+                              std::vector<glm::vec3>& outVerts,
+                              std::vector<unsigned int>& outIndices) {
+    outVerts.clear();
+    outIndices.clear();
+    outIndices.reserve(tris.size() * 3);
+
+    struct Vec3Hash {
+        size_t operator()(const glm::vec3& v) const {
+            // Hash the raw float bits so structurally identical positions collide.
+            auto h = std::hash<float>();
+            size_t a = h(v.x), b = h(v.y), c = h(v.z);
+            return a ^ (b * 0x9E3779B97F4A7C15ULL) ^ (c * 0xBF58476D1CE4E5B9ULL);
+        }
+    };
+    struct Vec3Eq {
+        bool operator()(const glm::vec3& a, const glm::vec3& b) const {
+            return a.x == b.x && a.y == b.y && a.z == b.z;
+        }
+    };
+
+    std::unordered_map<glm::vec3, unsigned int, Vec3Hash, Vec3Eq> lookup;
+    lookup.reserve(tris.size() * 3);
+
+    auto addVertex = [&](const glm::vec3& v) -> unsigned int {
+        auto it = lookup.find(v);
+        if (it != lookup.end()) return it->second;
+        unsigned int idx = (unsigned int)outVerts.size();
+        outVerts.push_back(v);
+        lookup.emplace(v, idx);
+        return idx;
+    };
+
+    for (const auto& t : tris) {
+        outIndices.push_back(addVertex(t.v0));
+        outIndices.push_back(addVertex(t.v1));
+        outIndices.push_back(addVertex(t.v2));
+    }
 }
 
 // Greedy approximate discrete OT: match each point in ptsA to the nearest
@@ -247,6 +323,55 @@ void Window::ComputeOTAndSpawnParticles() {
     bool hasMeshB = (meshIndexB > 0 && meshIndexB <= (int)meshPaths.size());
     const std::string& pathA = hasMeshA ? meshPaths[meshIndexA - 1] : "";
     const std::string& pathB = hasMeshB ? meshPaths[meshIndexB - 1] : "";
+
+    // === Triangle-morph mode (Phase 1 MVP) ===
+    // Uses the source mesh's original triangulation. Each source vertex is
+    // displaced by the Gaussian OT map T(x) = mu_B + A*(x - mu_A). Requires
+    // both A and B to be actual meshes (not blobs).
+    if (renderMode == RenderMode::TriangleMorph && hasMeshA && hasMeshB) {
+        std::vector<Triangle> trisA, trisB;
+        if (!OBJLoader::Load(pathA.c_str(), trisA)) return;
+        if (!OBJLoader::Load(pathB.c_str(), trisB)) return;
+        OBJLoader::Normalize(trisA);
+        OBJLoader::Normalize(trisB);
+
+        // Extract the source mesh's actual vertices + triangle indices.
+        std::vector<glm::vec3>    verts;
+        std::vector<unsigned int> indices;
+        BuildMeshTopology(trisA, verts, indices);
+
+        // Fit Gaussians to both surfaces to build the OT map.
+        // (Sample from A so the source Gaussian reflects A's surface distribution,
+        //  which is what T is applied at.)
+        auto sampledA = MeshSampler::Sample(trisA, sampleCount);
+        auto sampledB = MeshSampler::Sample(trisB, sampleCount);
+        gaussianA->FitFromPoints(sampledA);
+        gaussianB->FitFromPoints(sampledB);
+
+        delete otMap;
+        otMap = new OTMap(OptimalTransport::Compute(*gaussianA, *gaussianB));
+        otMapComputed = true;
+
+        // Compute end positions by applying the OT map to each source vertex.
+        std::vector<glm::vec3> endVerts(verts.size());
+        for (size_t i = 0; i < verts.size(); ++i)
+            endVerts[i] = OptimalTransport::Apply(*otMap, verts[i]);
+
+        // Hand off to renderer + animator. The animator writes lerp'd positions
+        // into meshStartPositions each frame (see idleCallback).
+        meshStartPositions = verts;
+        meshEndPositions   = endVerts;
+        meshIndices        = indices;
+
+        meshRenderer->Initialize(verts, indices);
+        animator->InitializeWithEndPoints(verts, endVerts);
+        animator->StartTransport();
+        meshMorphActive = true;
+        return;
+    }
+
+    // Non-triangle-morph or fallback: use the existing particle pipeline.
+    meshMorphActive = false;
 
     if (hasMeshA && hasMeshB) {
         // === Discrete mesh-to-mesh OT ===
@@ -332,6 +457,20 @@ void Window::DrawMainGUI() {
     ImGui::TextColored(ImVec4(1.0f, 0.4f, 0.7f, 1.0f), "Gaussian Cake");
     ImGui::Separator();
 
+    // Render mode toggle: triangle morph (default) vs legacy particles
+    const char* modeItems[] = { "Triangle Morph", "Particles" };
+    int modeInt = (int)renderMode;
+    if (ImGui::Combo("Mode", &modeInt, modeItems, 2)) {
+        renderMode = (RenderMode)modeInt;
+        // Switching modes disables any active triangle morph; user re-clicks Bake.
+        if (renderMode != RenderMode::TriangleMorph) meshMorphActive = false;
+    }
+    if (renderMode == RenderMode::TriangleMorph)
+        ImGui::TextColored(ImVec4(0.7f, 0.7f, 0.7f, 1.0f),
+                           "  (triangle morph requires both A and B to be meshes)");
+
+    ImGui::Separator();
+
     DrawGaussianSelector("Source (A)", meshIndexA);
     ImGui::Spacing();
     DrawGaussianSelector("Target (B)", meshIndexB);
@@ -361,6 +500,7 @@ void Window::DrawMainGUI() {
         animator->Reset();
         particleSystem->useOTPositions = false;
         particleSystem->particles.clear();
+        meshMorphActive = false;
     }
 
     ImGui::Separator();

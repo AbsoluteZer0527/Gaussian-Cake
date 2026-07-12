@@ -8,9 +8,15 @@
 #include "Gaussian.h"
 #include "OptimalTransport.h"
 #include "TransportAnimator.h"
+#include "MeshRenderer.h"
 
 #include <string>
 #include <vector>
+
+enum class RenderMode {
+    TriangleMorph = 0,  // default: deforming triangle mesh
+    Particles     = 1,  // legacy: floating dot cloud
+};
 
 class Window {
 public:
@@ -21,6 +27,17 @@ public:
 
     // Objects to render
     static ParticleSystem* particleSystem;
+    static MeshRenderer*   meshRenderer;
+
+    // Render mode: triangle-mesh morph (default) or legacy particles
+    static RenderMode renderMode;
+
+    // Triangle-morph state: source-mesh vertex positions and OT-mapped destinations.
+    // These are lerp'd each frame by idleCallback and pushed to meshRenderer.
+    static std::vector<glm::vec3>    meshStartPositions;
+    static std::vector<glm::vec3>    meshEndPositions;
+    static std::vector<unsigned int> meshIndices;
+    static bool                      meshMorphActive;
 
     // Gaussian OT pipeline
     static Gaussian* gaussianA;
