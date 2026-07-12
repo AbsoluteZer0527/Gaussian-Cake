@@ -5,12 +5,17 @@
 <img width="1544" height="1029" alt="image" src="https://github.com/user-attachments/assets/dcbf13d9-b03c-4d5f-9efe-094bd0207caf" />
 
 ## Update 7/11/26
-### Model Morphing: Triangle mesh rather than particles
-1. loads source triangles → fits Gaussians to both meshes → computes OT map → applies T(v) to every source vertex → initializes both meshRenderer and animator. This allows the model to be "linearly warped (rotation + scale + shear) into another models' Gaussian with lerp. So the source topology is preserved; only the endpoint is approximate.
+### Model Morphing: Dual-mesh triangle morph
 
-2. Given a point P and triangle (A, B, C), find Q on the triangle surface (interior or boundary) minimizing ‖P − Q‖. The classic algorithm uses Voronoi regions: the plane containing the triangle is subdivided into 7 regions by the triangle edges' perpendiculars — one for each vertex (P projects to the vertex), one for each edge (P projects to somewhere on the edge), and one for the interior (P projects into the triangle). Which region P falls into is determined by sign tests on ~6 dot products.
-![alt text](image.png)
-Reference: Christer Ericson, Real-Time Collision Detection (2005), §5.1.5 — the standard implementation.
+The particle cloud is replaced by two animated triangle meshes that crossfade as they morph — giving the impression of one solid surface reshaping into another.
+
+Both OBJ files are loaded and normalized to `[-1, 1]³`. Point clouds sampled from each surface are used to fit Gaussians and compute the closed-form Bures/W₂ OT map: `T(x) = μ_B + A(x − μ_A)`. Every source vertex is displaced by `T` to get its morph endpoint. Then it projects each endpoint to the nearest point on any target triangle, giving sub-triangle precision with no collapse artifacts. The algorithm (Ericson, *Real-Time Collision Detection* §5.1.5) classifies the query point into one of 7 Voronoi regions around the triangle using ~6 dot-product sign tests, returning the exact closest point on the surface.
+
+So The idea that it still uses Guassian Sampling + OT, which gives this model morphing effect. However it is still not visually perfect with complex mesh models.
+
+Side Functionalities:
+- Delayed alpha crossfade: Less jarring morphing.
+- More mode toggles (Triangle Morph / Particles), snap mode dropdown (None / Nearest Sample / Nearest Triangle), crossfade start slider, subdivision level, and mesh sample count.
 
 
 ## Inspiration

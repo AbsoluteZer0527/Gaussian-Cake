@@ -18,12 +18,6 @@ enum class RenderMode {
     Particles     = 1,  // legacy: floating dot cloud
 };
 
-// How each source vertex's endpoint is refined after the OT map.
-enum class SnapMode {
-    None            = 0,  // Phase 1: raw OT-warped source
-    NearestSample   = 1,  // Phase 2: snap to nearest sampled point on target
-    NearestTriangle = 2,  // Phase 3 (default): snap to nearest point on any target triangle
-};
 
 class Window {
 public:
@@ -54,9 +48,6 @@ public:
     static std::vector<glm::vec3>    meshTargetEnd;        // actual target vertices
     static std::vector<glm::vec3>    meshTargetCurrent;    // per-frame lerp buffer
     static std::vector<unsigned int> meshTargetIndices;
-    // Post-OT refinement: pull endpoints onto the actual target surface.
-    // Default = NearestTriangle (Phase 3, highest quality).
-    static SnapMode                  snapMode;
 
     // Gaussian OT pipeline
     static Gaussian* gaussianA;
@@ -71,8 +62,9 @@ public:
     static std::vector<std::string> meshPaths;  // full relative paths
     static int meshIndexA;
     static int meshIndexB;
-    static int sampleCount;       // points sampled from mesh surface
-    static int subdivisionLevel;  // midpoint subdivision passes on source mesh (0 = none)
+    static int   sampleCount;       // points sampled from mesh surface
+    static int   subdivisionLevel;  // midpoint subdivision passes on source mesh (0 = none)
+    static float crossfadeStart;    // normalized time [0,1] when the alpha crossfade begins
 
     // Shader Program
     static GLuint shaderProgram;

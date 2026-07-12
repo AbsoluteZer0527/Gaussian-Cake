@@ -31,7 +31,6 @@ std::vector<glm::vec3>    Window::meshStartPositions;
 std::vector<glm::vec3>    Window::meshEndPositions;
 std::vector<unsigned int> Window::meshIndices;
 bool                      Window::meshMorphActive = false;
-SnapMode                  Window::snapMode        = SnapMode::NearestTriangle;  // Phase 3 default
 
 //Dual-mesh (Option B) target-side state
 std::vector<glm::vec3>    Window::meshTargetStart;
@@ -52,6 +51,7 @@ int              Window::meshIndexA    = 0;
 int              Window::meshIndexB    = 0;
 int              Window::sampleCount        = 5000;
 int              Window::subdivisionLevel   = 0;
+float            Window::crossfadeStart     = 0.35f;
 
 //Interaction Variables
 bool LeftDown, RightDown;
@@ -114,9 +114,9 @@ bool Window::initializeObjects() {
     meshRenderer       = new MeshRenderer();
     meshRendererTarget = new MeshRenderer();
 
-    // Distinct diffuse colors so overlapping source/target are visually separable.
-    meshRenderer->diffuseColor       = glm::vec3(0.85f, 0.55f, 0.75f);  // pink (source)
-    meshRendererTarget->diffuseColor = glm::vec3(0.40f, 0.75f, 0.85f);  // teal (target)
+    glm::vec3 meshColor(0.85f, 0.55f, 0.75f);  // shared pink for both meshes
+    meshRenderer->diffuseColor       = meshColor;
+    meshRendererTarget->diffuseColor = meshColor;
 
     gaussianA = new Gaussian();
     gaussianB = new Gaussian();
@@ -240,14 +240,20 @@ void Window::displayCallback(GLFWwindow* window) {
     glLightfv(GL_LIGHT1, GL_DIFFUSE, light1_color);
 
     if (renderMode == RenderMode::TriangleMorph && meshMorphActive) {
-        // Crossfade: source fades out (1→0) as target fades in (0→1).
         float e = animator->ApplyEasing(animator->GetProgress());
-        meshRenderer->alpha       = 1.0f - e;
-        meshRendererTarget->alpha = e;
 
-        // Enable alpha blending. Draw the more-opaque mesh first so it
-        // gets depth priority; draw the less-opaque one with depth-write
-        // disabled so it blends correctly on top without z-fighting.
+        // Delayed crossfade: source stays fully opaque until crossfadeStart,
+        // then both meshes smoothstep-fade across the remaining window.
+        float tail = 1.0f - crossfadeStart;
+        float t = (tail > 1e-4f)
+                ? glm::clamp((e - crossfadeStart) / tail, 0.0f, 1.0f)
+                : (e >= crossfadeStart ? 1.0f : 0.0f);
+        t = t * t * (3.0f - 2.0f * t);  // smoothstep
+        meshRenderer->alpha       = 1.0f - t;
+        meshRendererTarget->alpha = t;
+
+        glEnable(GL_CULL_FACE);
+        glCullFace(GL_BACK);
         glEnable(GL_BLEND);
         glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
 
@@ -265,6 +271,7 @@ void Window::displayCallback(GLFWwindow* window) {
 
         glDepthMask(GL_TRUE);
         glDisable(GL_BLEND);
+        glDisable(GL_CULL_FACE);
     } else {
         particleSystem->Draw(Cam->GetViewProjectMtx());
     }
@@ -430,25 +437,6 @@ static void SnapToNearestOnTriangles(std::vector<glm::vec3>& endVerts,
     }
 }
 
-// Phase 2 snap: pull each OT-mapped endpoint to the nearest sampled point on
-// the target surface. Runs in-place. Brute force O(V*K) — one-time Bake cost.
-// Unlike greedy discrete OT, the same target sample can attract multiple source
-// vertices (may cause local triangle collapse near dense clusters).
-static void SnapToNearestOnTarget(std::vector<glm::vec3>& endVerts,
-                                  const std::vector<glm::vec3>& targetSamples) {
-    if (targetSamples.empty()) return;
-    for (auto& p : endVerts) {
-        float bestDist = 1e30f;
-        glm::vec3 bestPoint = p;
-        for (const auto& s : targetSamples) {
-            glm::vec3 d = p - s;
-            float dist = glm::dot(d, d);   // squared distance — no sqrt needed
-            if (dist < bestDist) { bestDist = dist; bestPoint = s; }
-        }
-        p = bestPoint;
-    }
-}
-
 // Greedy approximate discrete OT: match each point in ptsA to the nearest
 // unmatched point in ptsB. O(N^2) — fine for N <= 2000 on a single Bake click.
 static std::vector<glm::vec3> GreedyDiscreteOT(
@@ -519,21 +507,8 @@ void Window::ComputeOTAndSpawnParticles() {
         for (size_t i = 0; i < verts.size(); ++i)
             endVerts[i] = OptimalTransport::Apply(*otMap, verts[i]);
 
-        // Refine SOURCE endpoints toward target surface.
-        //   None            (Phase 1): no snap — endpoint = OT-warped source
-        //   NearestSample   (Phase 2): snap to closest of the K sampled points
-        //   NearestTriangle (Phase 3): snap to closest point on any target triangle
-        switch (snapMode) {
-            case SnapMode::NearestSample:
-                SnapToNearestOnTarget(endVerts, sampledB);
-                break;
-            case SnapMode::NearestTriangle:
-                SnapToNearestOnTriangles(endVerts, trisB);
-                break;
-            case SnapMode::None:
-            default:
-                break;
-        }
+        // Snap each source endpoint to the nearest point on any target triangle.
+        SnapToNearestOnTriangles(endVerts, trisB);
 
         // === Option B: parallel target-topology mesh ===
         // Extract the target mesh's actual vertices + indices.
@@ -551,19 +526,8 @@ void Window::ComputeOTAndSpawnParticles() {
             tStart[i] = glm::vec3((float)xE.x(), (float)xE.y(), (float)xE.z());
         }
 
-        // Symmetric snap: pull target-start positions onto the source surface,
-        // so at t=0 the target mesh's vertices sit on/near the source.
-        switch (snapMode) {
-            case SnapMode::NearestSample:
-                SnapToNearestOnTarget(tStart, sampledA);
-                break;
-            case SnapMode::NearestTriangle:
-                SnapToNearestOnTriangles(tStart, trisA);
-                break;
-            case SnapMode::None:
-            default:
-                break;
-        }
+        // Snap each target-start position onto the source surface.
+        SnapToNearestOnTriangles(tStart, trisA);
 
         // Hand off to renderers + animator. Source animator drives the timeline;
         // target buffer is manually lerp'd each frame using animator.GetProgress().
@@ -682,21 +646,7 @@ void Window::DrawMainGUI() {
     }
     if (renderMode == RenderMode::TriangleMorph) {
         ImGui::TextColored(ImVec4(0.7f, 0.7f, 0.7f, 1.0f),
-                           "  (triangle morph requires both A and B to be meshes)");
-
-        const char* snapItems[] = {
-            "None (Phase 1: OT warp only)",
-            "Nearest Sample (Phase 2)",
-            "Nearest Triangle (Phase 3)"
-        };
-        int snapInt = (int)snapMode;
-        if (ImGui::Combo("Endpoint Snap", &snapInt, snapItems, 3))
-            snapMode = (SnapMode)snapInt;
-
-        ImGui::TextColored(ImVec4(0.6f, 0.6f, 0.6f, 1.0f),
-            snapMode == SnapMode::NearestTriangle ? "  continuous surface projection"
-          : snapMode == SnapMode::NearestSample   ? "  snap to K sampled points"
-          :                                          "  raw linear OT warp");
+                           "  (requires both A and B to be meshes)");
     }
 
     ImGui::Separator();
@@ -715,6 +665,9 @@ void Window::DrawMainGUI() {
             subdivisionLevel == 1 ? "  1 pass = 4x triangles" :
             subdivisionLevel == 2 ? "  2 passes = 16x triangles" :
                                     "  3 passes = 64x triangles (slow Bake)");
+        ImGui::SliderFloat("Crossfade Start", &crossfadeStart, 0.0f, 1.0f);
+        ImGui::TextColored(ImVec4(0.6f, 0.6f, 0.6f, 1.0f),
+            "  0 = swap immediately, 1 = no crossfade");
     }
 
     ImGui::Spacing();
