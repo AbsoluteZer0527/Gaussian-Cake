@@ -15,9 +15,17 @@
 #include <vector>
 
 enum class RenderMode {
-    TriangleMorph = 0,  // default: deforming triangle mesh
+    TriangleMorph = 0,  // default: one surface morphing A -> B (shared topology or SDF)
     Particles     = 1,  // legacy: floating dot cloud
     Splats        = 2,  // surface-aligned 3D Gaussian splats + mixture OT
+    Crossfade     = 3,  // legacy: two OT-snapped meshes alpha-blended
+};
+
+// How TriangleMorph builds the in-between surfaces.
+enum class MorphMethod {
+    Auto           = 0,  // shared topology when both meshes allow it, else SDF
+    SharedTopology = 1,  // fit the denser mesh onto the other, lerp vertices
+    SDF            = 2,  // OT-aligned distance-field blend, re-meshed per frame
 };
 
 
@@ -42,6 +50,13 @@ public:
     static std::vector<glm::vec3>    meshEndPositions;     // source OT-mapped destinations
     static std::vector<unsigned int> meshIndices;
     static bool                      meshMorphActive;
+
+    // True morph (TriangleMorph mode): one surface, A at t = 0, B at t = 1.
+    static MorphMethod morphMethod;
+    static int         sdfResolution;    // SDF grid points per axis
+    static float       fitStiffness;     // multiplier on the template-fit stiffness schedule
+    static bool        trueMorphActive;
+    static std::string morphStatus;      // which method ran, and why
 
     // Option B (dual mesh): parallel target-topology state.
     // Target mesh animates from OT^-1(target_verts) at t=0 → target_verts at t=1,
@@ -111,6 +126,8 @@ public:
 
     // OT pipeline
     static void ComputeOTAndSpawnParticles();
+    static void BakeTrueMorph(const std::string& pathA, const std::string& pathB);
+    static void UpdateTrueMorph();
     static void BakeSplatMorph(const std::string& pathA, const std::string& pathB);
     static void UpdateSplatPreview();
     static void PollSplatBake();

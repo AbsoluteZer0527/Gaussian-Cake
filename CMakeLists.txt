@@ -25,6 +25,10 @@ set(
     src/OptimalTransport.cpp
     src/TransportAnimator.cpp
     src/MeshRenderer.cpp
+    src/MeshTopology.cpp
+    src/SurfaceQuery.cpp
+    src/MeshFitter.cpp
+    src/SDFMorph.cpp
     src/GaussianMixture.cpp
     src/SplatGenerator.cpp
     src/SplatRenderer.cpp

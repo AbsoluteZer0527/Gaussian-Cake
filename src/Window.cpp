@@ -7,6 +7,10 @@
 #include "MeshSampler.h"
 #include "SplatGenerator.h"
 #include "GaussianMixture.h"
+#include "MeshTopology.h"
+#include "SurfaceQuery.h"
+#include "MeshFitter.h"
+#include "SDFMorph.h"
 
 #include <glm/gtc/quaternion.hpp>
 #include <chrono>
@@ -41,6 +45,23 @@ std::vector<glm::vec3>    Window::meshStartPositions;
 std::vector<glm::vec3>    Window::meshEndPositions;
 std::vector<unsigned int> Window::meshIndices;
 bool                      Window::meshMorphActive = false;
+
+//True morph state
+MorphMethod Window::morphMethod     = MorphMethod::Auto;
+int         Window::sdfResolution   = 64;
+float       Window::fitStiffness    = 1.0f;
+bool        Window::trueMorphActive = false;
+std::string Window::morphStatus;
+
+// Real endpoint meshes (shown exactly at t = 0 and t = 1) and the in-between data.
+static IndexedMesh               g_morphA, g_morphB;
+static bool                      g_morphShared = false;   // shared topology vs SDF
+static std::vector<glm::vec3>    g_sharedStart, g_sharedEnd, g_sharedCurrent;
+static std::vector<unsigned int> g_sharedIndices;
+static SDFMorph                  g_sdfMorph;
+enum class MorphShown { None, A, Blend, B };
+static MorphShown                g_morphShown = MorphShown::None;
+static float                     g_lastSdfT   = -1.0f;
 
 //Dual-mesh (Option B) target-side state
 std::vector<glm::vec3>    Window::meshTargetStart;
@@ -88,6 +109,70 @@ GLuint Window::shaderProgram;
 
 // Default blob: isotropic 3D Gaussian (no color, no named presets)
 static const Eigen::Matrix3d blobCovariance = Eigen::Vector3d(1.0, 1.0, 1.0).asDiagonal();
+
+// ---- Static previews for Particles / Topology modes ----
+// Until a morph is baked, Topology shows mesh A as a solid surface and
+// Particles shows particles sampled on A (or the default blob). Rebuilt only
+// when the source, particle count, mode or g_previewGen changes.
+static MeshRenderer* g_previewMesh = nullptr;
+static int g_previewGen = 0;   // bump to force the preview to rebuild
+
+static void UpdateModePreview() {
+    static int lastIndex = -1, lastCount = -1, lastMode = -1, lastGen = -1;
+    int mode = (int)Window::renderMode;
+    if (lastIndex == Window::meshIndexA && lastCount == Window::particleCount &&
+        lastMode == mode && lastGen == g_previewGen)
+        return;
+    lastIndex = Window::meshIndexA; lastCount = Window::particleCount;
+    lastMode = mode; lastGen = g_previewGen;
+
+    // keep the loaded source so changing the particle count doesn't reload it
+    static std::vector<Triangle> tris;
+    static int loadedIndex = -1;
+    int idx = Window::meshIndexA;
+    bool hasMesh = idx > 0 && idx <= (int)Window::meshPaths.size();
+    if (hasMesh && loadedIndex != idx) {
+        tris.clear();
+        if (OBJLoader::Load(Window::meshPaths[idx - 1].c_str(), tris)) {
+            OBJLoader::Normalize(tris);
+            loadedIndex = idx;
+        } else {
+            hasMesh = false;
+            loadedIndex = -1;
+        }
+    }
+
+    if (Window::renderMode == RenderMode::TriangleMorph && hasMesh) {
+        IndexedMesh m;
+        MeshTopology::Build(tris, m);
+        if (!g_previewMesh) {
+            g_previewMesh = new MeshRenderer();
+            g_previewMesh->diffuseColor = Window::meshRenderer->diffuseColor;
+        }
+        g_previewMesh->alpha = 1.0f;
+        g_previewMesh->Initialize(m.verts, m.indices);
+        return;
+    }
+
+    ParticleSystem* ps = Window::particleSystem;
+    if (hasMesh) {
+        // same samples the mesh-to-mesh particle bake starts from
+        auto pts = MeshSampler::Sample(tris, Window::particleCount);
+        ps->particles.clear();
+        for (const auto& pos : pts) {
+            Particle part(ps->particleRadius);
+            part.position = pos;
+            ps->particles.push_back(part);
+        }
+        ps->transportPositions = pts;
+        ps->useOTPositions = false;
+    } else {
+        Window::gaussianA->mean       = Eigen::Vector3d::Zero();
+        Window::gaussianA->covariance = blobCovariance;
+        ps->SpawnFromGaussian(*Window::gaussianA, Window::particleCount);
+    }
+}
+
 
 // Scan the meshes/ directory and populate Window::meshNames / meshPaths.
 // Index 0 is always the "blob" sentinel (no path).
@@ -175,6 +260,7 @@ void Window::cleanUp() {
     delete meshRenderer;
     delete meshRendererTarget;
     delete splatRenderer;
+    delete g_previewMesh;
     delete gaussianA;
     delete gaussianB;
     delete otMap;
@@ -271,6 +357,10 @@ void Window::idleCallback() {
             s.color   = glm::mix(a.color, b.color, e);
             s.opacity = glm::mix(a.opacity, b.opacity, e);
         }
+    } else if (trueMorphActive) {
+        static std::vector<glm::vec3> unused;
+        animator->Update(deltaTime, unused);
+        UpdateTrueMorph();
     } else if (meshMorphActive) {
         // Source mesh: animator advances the shared timeline and writes
         // lerp'd source-vertex positions into meshStartPositions.
@@ -311,7 +401,11 @@ void Window::displayCallback(GLFWwindow* window) {
     if (renderMode == RenderMode::Splats) {
         if (!splatMorphActive) UpdateSplatPreview();
         splatRenderer->Draw(splatCurrent, Cam->GetViewMtx(), Cam->GetProjectMtx());
-    } else if (renderMode == RenderMode::TriangleMorph && meshMorphActive) {
+    } else if (renderMode == RenderMode::TriangleMorph && trueMorphActive) {
+        // One opaque surface: no crossfade
+        meshRenderer->alpha = 1.0f;
+        meshRenderer->Draw(shaderProgram, Cam->GetViewProjectMtx());
+    } else if (renderMode == RenderMode::Crossfade && meshMorphActive) {
         float e = animator->GetBlend();
 
         // Delayed crossfade: source stays fully opaque until crossfadeStart,
@@ -344,7 +438,14 @@ void Window::displayCallback(GLFWwindow* window) {
         glDepthMask(GL_TRUE);
         glDisable(GL_BLEND);
         glDisable(GL_CULL_FACE);
+    } else if (renderMode == RenderMode::TriangleMorph && !trueMorphActive &&
+               meshIndexA > 0) {
+        // Topology preview: the source mesh as a solid surface
+        UpdateModePreview();
+        if (g_previewMesh && g_previewMesh->isInitialized)
+            g_previewMesh->Draw(shaderProgram, Cam->GetViewProjectMtx());
     } else {
+        if (!particleMorphActive && !meshMorphActive) UpdateModePreview();
         particleSystem->Draw(Cam->GetViewProjectMtx());
     }
 
@@ -374,119 +475,6 @@ static bool LoadMeshGaussian(const char* path, int N, Gaussian* g) {
     auto pts = MeshSampler::Sample(tris, N);
     g->FitFromPoints(pts);
     return true;
-}
-
-// Midpoint subdivision: split every triangle into 4 smaller ones.
-// Increasing levels: 1→4x, 2→16x, 3→64x triangles. Applied to source mesh
-// only to add vertices for better endpoint coverage after surface snapping.
-static void SubdivideTriangles(std::vector<Triangle>& tris, int levels) {
-    for (int l = 0; l < levels; ++l) {
-        std::vector<Triangle> result;
-        result.reserve(tris.size() * 4);
-        for (const auto& t : tris) {
-            glm::vec3 m01 = (t.v0 + t.v1) * 0.5f;
-            glm::vec3 m12 = (t.v1 + t.v2) * 0.5f;
-            glm::vec3 m20 = (t.v2 + t.v0) * 0.5f;
-            result.push_back({t.v0, m01, m20});
-            result.push_back({m01, t.v1, m12});
-            result.push_back({m20, m12, t.v2});
-            result.push_back({m01, m12, m20});
-        }
-        tris = std::move(result);
-    }
-}
-
-// Deduplicate vertices from an OBJ triangle soup into a unique-vertex list +
-// triangle index list. Uses exact float equality via bit-hashed vec3 keys.
-// This is required because glDrawElements(GL_TRIANGLES) expects an EBO.
-static void BuildMeshTopology(const std::vector<Triangle>& tris,
-                              std::vector<glm::vec3>& outVerts,
-                              std::vector<unsigned int>& outIndices) {
-    outVerts.clear();
-    outIndices.clear();
-    outIndices.reserve(tris.size() * 3);
-
-    struct Vec3Hash {
-        size_t operator()(const glm::vec3& v) const {
-            // Hash the raw float bits so structurally identical positions collide.
-            auto h = std::hash<float>();
-            size_t a = h(v.x), b = h(v.y), c = h(v.z);
-            return a ^ (b * 0x9E3779B97F4A7C15ULL) ^ (c * 0xBF58476D1CE4E5B9ULL);
-        }
-    };
-    struct Vec3Eq {
-        bool operator()(const glm::vec3& a, const glm::vec3& b) const {
-            return a.x == b.x && a.y == b.y && a.z == b.z;
-        }
-    };
-
-    std::unordered_map<glm::vec3, unsigned int, Vec3Hash, Vec3Eq> lookup;
-    lookup.reserve(tris.size() * 3);
-
-    auto addVertex = [&](const glm::vec3& v) -> unsigned int {
-        auto it = lookup.find(v);
-        if (it != lookup.end()) return it->second;
-        unsigned int idx = (unsigned int)outVerts.size();
-        outVerts.push_back(v);
-        lookup.emplace(v, idx);
-        return idx;
-    };
-
-    for (const auto& t : tris) {
-        outIndices.push_back(addVertex(t.v0));
-        outIndices.push_back(addVertex(t.v1));
-        outIndices.push_back(addVertex(t.v2));
-    }
-}
-
-// Phase 3: closest point on triangle (a, b, c) to a query point p.
-// Ericson, "Real-Time Collision Detection" §5.1.5 — Voronoi-region test.
-// Returns a point on the triangle surface (interior or boundary edge/vertex).
-static glm::vec3 ClosestPointOnTriangle(const glm::vec3& p,
-                                        const glm::vec3& a,
-                                        const glm::vec3& b,
-                                        const glm::vec3& c) {
-    glm::vec3 ab = b - a;
-    glm::vec3 ac = c - a;
-    glm::vec3 ap = p - a;
-
-    float d1 = glm::dot(ab, ap);
-    float d2 = glm::dot(ac, ap);
-    if (d1 <= 0.0f && d2 <= 0.0f) return a;                   // vertex A region
-
-    glm::vec3 bp = p - b;
-    float d3 = glm::dot(ab, bp);
-    float d4 = glm::dot(ac, bp);
-    if (d3 >= 0.0f && d4 <= d3) return b;                     // vertex B region
-
-    float vc = d1 * d4 - d3 * d2;
-    if (vc <= 0.0f && d1 >= 0.0f && d3 <= 0.0f) {             // edge AB
-        float v = d1 / (d1 - d3);
-        return a + v * ab;
-    }
-
-    glm::vec3 cp = p - c;
-    float d5 = glm::dot(ab, cp);
-    float d6 = glm::dot(ac, cp);
-    if (d6 >= 0.0f && d5 <= d6) return c;                     // vertex C region
-
-    float vb = d5 * d2 - d1 * d6;
-    if (vb <= 0.0f && d2 >= 0.0f && d6 <= 0.0f) {             // edge AC
-        float w = d2 / (d2 - d6);
-        return a + w * ac;
-    }
-
-    float va = d3 * d6 - d5 * d4;
-    if (va <= 0.0f && (d4 - d3) >= 0.0f && (d5 - d6) >= 0.0f) { // edge BC
-        float w = (d4 - d3) / ((d4 - d3) + (d5 - d6));
-        return b + w * (c - b);
-    }
-
-    // Interior projection via barycentric coordinates.
-    float denom = 1.0f / (va + vb + vc);
-    float v = vb * denom;
-    float w = vc * denom;
-    return a + v * ab + w * ac;
 }
 
 // Phase 3 snap: for each endpoint, find the closest point on the target
@@ -1051,6 +1039,7 @@ void Window::PollSplatBake() {
     animator->StartTransport();
     splatMorphActive    = true;
     meshMorphActive     = false;
+    trueMorphActive     = false;
     particleMorphActive = false;
     lastBakeMs          = (float)res.ms;
 
@@ -1107,12 +1096,18 @@ void Window::ComputeOTAndSpawnParticles() {
         return;
     }
     splatMorphActive = false;
+    trueMorphActive  = false;
 
-    // === Triangle-morph mode (Phase 1 MVP) ===
+    if (renderMode == RenderMode::TriangleMorph && hasMeshA && hasMeshB) {
+        BakeTrueMorph(pathA, pathB);
+        return;
+    }
+
+    // === Crossfade mode (legacy dual-mesh morph) ===
     // Uses the source mesh's original triangulation. Each source vertex is
     // displaced by the Gaussian OT map T(x) = mu_B + A*(x - mu_A). Requires
     // both A and B to be actual meshes (not blobs).
-    if (renderMode == RenderMode::TriangleMorph && hasMeshA && hasMeshB) {
+    if (renderMode == RenderMode::Crossfade && hasMeshA && hasMeshB) {
         std::vector<Triangle> trisA, trisB;
         if (!OBJLoader::Load(pathA.c_str(), trisA)) return;
         if (!OBJLoader::Load(pathB.c_str(), trisB)) return;
@@ -1122,12 +1117,13 @@ void Window::ComputeOTAndSpawnParticles() {
         // Optional midpoint subdivision: adds more source vertices so snap
         // endpoints cover the target surface more densely.
         if (subdivisionLevel > 0)
-            SubdivideTriangles(trisA, subdivisionLevel);
+            MeshTopology::Subdivide(trisA, subdivisionLevel);
 
         // Extract the source mesh's actual vertices + triangle indices.
-        std::vector<glm::vec3>    verts;
-        std::vector<unsigned int> indices;
-        BuildMeshTopology(trisA, verts, indices);
+        IndexedMesh meshA;
+        MeshTopology::Build(trisA, meshA);
+        std::vector<glm::vec3>&    verts   = meshA.verts;
+        std::vector<unsigned int>& indices = meshA.indices;
 
         // Fit Gaussians to both surfaces to build the OT map.
         // (Sample from A so the source Gaussian reflects A's surface distribution,
@@ -1151,9 +1147,10 @@ void Window::ComputeOTAndSpawnParticles() {
 
         // === Option B: parallel target-topology mesh ===
         // Extract the target mesh's actual vertices + indices.
-        std::vector<glm::vec3>    tVerts;
-        std::vector<unsigned int> tIndices;
-        BuildMeshTopology(trisB, tVerts, tIndices);
+        IndexedMesh meshB;
+        MeshTopology::Build(trisB, meshB);
+        std::vector<glm::vec3>&    tVerts   = meshB.verts;
+        std::vector<unsigned int>& tIndices = meshB.indices;
 
         // Compute A^-1 once. OT^-1(y) = mu_A + A^-1 * (y - mu_B).
         Eigen::Matrix3d Ainv = otMap->A.inverse();
@@ -1249,7 +1246,200 @@ void Window::ComputeOTAndSpawnParticles() {
     }
 }
 
+// ---- True morph: one surface going from A to B ----
+//
+// Shared topology: the denser mesh is the template. The Gaussian OT map gives
+// a rough affine alignment, then MeshFitter deforms the template onto the
+// other surface, so both shapes have the same vertices and the morph is a
+// per-vertex lerp. This needs both meshes to have the same topology (one
+// part, same genus, same number of holes).
+//
+// SDF: for every other pair, blend OT-aligned signed distance fields and
+// re-mesh each frame. Holes and parts can appear and disappear.
+//
+// Either way the real meshes are shown exactly at t = 0 and t = 1.
+
+static const int kMaxTemplateFaces = 40000;
+
+// Load, normalize, weld, close small holes, orient outward.
+static bool LoadMorphMesh(const std::string& path, IndexedMesh& m, TopologyInfo& info) {
+    std::vector<Triangle> tris;
+    if (!OBJLoader::Load(path.c_str(), tris)) return false;
+    OBJLoader::Normalize(tris);
+    MeshTopology::Build(tris, m);
+    int filled = MeshTopology::FillSmallHoles(m, 40);
+    MeshTopology::OrientOutward(m);
+    info = MeshTopology::Analyze(m);
+    std::cout << "[Morph] " << path << ": " << info.Describe();
+    if (filled) std::cout << " (" << filled << " small holes filled)";
+    std::cout << "\n";
+    return true;
+}
+
+// Empty if the two meshes can share one topology, else the reason they can't.
+static std::string TopologyMismatch(const TopologyInfo& a, const std::string& nameA,
+                                    const TopologyInfo& b, const std::string& nameB) {
+    const TopologyInfo* infos[2] = { &a, &b };
+    const std::string*  names[2] = { &nameA, &nameB };
+    for (int k = 0; k < 2; ++k) {
+        if (infos[k]->parts != 1)
+            return *names[k] + " has " + std::to_string(infos[k]->parts) + " parts";
+        if (infos[k]->nonManifoldEdges > 0)
+            return *names[k] + " has non-manifold edges";
+    }
+    if (a.euler != b.euler)
+        return "different genus (chi " + std::to_string(a.euler) + " vs " + std::to_string(b.euler) + ")";
+    if (a.boundaryLoops != b.boundaryLoops)
+        return "different number of holes (" + std::to_string(a.boundaryLoops) + " vs " +
+               std::to_string(b.boundaryLoops) + ")";
+    return "";
+}
+
+void Window::BakeTrueMorph(const std::string& pathA, const std::string& pathB) {
+    TopologyInfo infoA, infoB;
+    if (!LoadMorphMesh(pathA, g_morphA, infoA)) return;
+    if (!LoadMorphMesh(pathB, g_morphB, infoB)) return;
+    std::string nameA = std::filesystem::path(pathA).filename().string();
+    std::string nameB = std::filesystem::path(pathB).filename().string();
+
+    std::vector<Triangle> trisA = MeshTopology::ToTriangles(g_morphA);
+    std::vector<Triangle> trisB = MeshTopology::ToTriangles(g_morphB);
+
+    std::string mismatch = TopologyMismatch(infoA, nameA, infoB, nameB);
+    bool shared = (morphMethod == MorphMethod::SharedTopology) ||
+                  (morphMethod == MorphMethod::Auto && mismatch.empty());
+
+    gaussianA->FitFromPoints(MeshSampler::Sample(trisA, sampleCount));
+    gaussianB->FitFromPoints(MeshSampler::Sample(trisB, sampleCount));
+    delete otMap;
+    otMap = new OTMap(OptimalTransport::Compute(*gaussianA, *gaussianB));
+    otMapComputed = true;
+
+    char buf[512];
+    if (shared) {
+        // The template is the mesh with more faces, unless it is too big to fit
+        // quickly; then the smaller one is subdivided up to a similar size.
+        bool templateIsA = g_morphA.FaceCount() >= g_morphB.FaceCount();
+        if ((templateIsA ? g_morphA : g_morphB).FaceCount() > kMaxTemplateFaces)
+            templateIsA = !templateIsA;
+        const IndexedMesh& other = templateIsA ? g_morphB : g_morphA;
+
+        IndexedMesh tmpl = templateIsA ? g_morphA : g_morphB;
+        bool subdivided = false;
+        while (tmpl.FaceCount() * 4 <= kMaxTemplateFaces && tmpl.FaceCount() < other.FaceCount()) {
+            std::vector<Triangle> t = MeshTopology::ToTriangles(tmpl);
+            MeshTopology::Subdivide(t, 1);
+            MeshTopology::Build(t, tmpl);
+            subdivided = true;
+        }
+
+        // Rough affine alignment by the Gaussian OT map, template -> target
+        OTMap toTarget = templateIsA ? *otMap
+                                     : OptimalTransport::Compute(*gaussianB, *gaussianA);
+        std::vector<glm::vec3> aligned(tmpl.verts.size());
+        for (size_t i = 0; i < aligned.size(); ++i)
+            aligned[i] = OptimalTransport::Apply(toTarget, tmpl.verts[i]);
+
+        FitParams params;
+        params.stiffnessScale = fitStiffness;
+        FitStats stats;
+        std::vector<glm::vec3> fitted = MeshFitter::Fit(tmpl, aligned,
+                                                        templateIsA ? trisB : trisA, params, &stats);
+
+        g_sharedIndices = tmpl.indices;
+        g_sharedStart   = templateIsA ? tmpl.verts : fitted;
+        g_sharedEnd     = templateIsA ? fitted : tmpl.verts;
+        g_sharedCurrent = g_sharedStart;
+        g_morphShared   = true;
+
+        snprintf(buf, sizeof(buf),
+                 "Shared topology: %s (%d tris%s) fitted onto %s in %.0f ms. "
+                 "Mean error %.4f, %d folded tris.%s%s",
+                 (templateIsA ? nameA : nameB).c_str(), tmpl.FaceCount(),
+                 subdivided ? ", subdivided" : "", (templateIsA ? nameB : nameA).c_str(),
+                 stats.ms, stats.meanDist, stats.flipped,
+                 mismatch.empty() ? "" : " Warning: ", mismatch.c_str());
+    } else {
+        g_sdfMorph.Build(trisA, trisB, *otMap, sdfResolution);
+        g_morphShared = false;
+        snprintf(buf, sizeof(buf), "SDF morph (%d^3 grid) built in %.0f ms%s%s",
+                 sdfResolution, g_sdfMorph.buildMs,
+                 mismatch.empty() ? "" : ": ", mismatch.c_str());
+    }
+    morphStatus = buf;
+    std::cout << "[Morph] " << morphStatus << "\n";
+
+    // The animator only provides the timeline (easing, duration, state)
+    animator->InitializeWithEndPoints({}, {});
+    animator->StartTransport();
+    g_morphShown        = MorphShown::None;
+    g_lastSdfT          = -1.0f;
+    trueMorphActive     = true;
+    meshMorphActive     = false;
+    particleMorphActive = false;
+    UpdateTrueMorph();
+}
+
+// Pushes this frame's surface to meshRenderer: the real A or B mesh at the
+// ends of the timeline, the in-between surface everywhere else.
+void Window::UpdateTrueMorph() {
+    float e = animator->GetBlend();
+
+    MorphShown want = MorphShown::Blend;
+    if (e <= 0.0f && !animator->IsTransporting())
+        want = MorphShown::A;
+    else if (e >= 1.0f && !animator->IsTransporting())
+        want = MorphShown::B;
+
+    if (want != MorphShown::Blend) {
+        if (g_morphShown != want) {
+            const IndexedMesh& m = (want == MorphShown::A) ? g_morphA : g_morphB;
+            meshRenderer->Initialize(m.verts, m.indices);
+            g_morphShown = want;
+        }
+        return;
+    }
+
+    if (g_morphShared) {
+        for (size_t i = 0; i < g_sharedCurrent.size(); ++i)
+            g_sharedCurrent[i] = g_sharedStart[i] + e * (g_sharedEnd[i] - g_sharedStart[i]);
+        if (g_morphShown != MorphShown::Blend) {
+            meshRenderer->Initialize(g_sharedCurrent, g_sharedIndices);
+            g_morphShown = MorphShown::Blend;
+        } else {
+            meshRenderer->UpdatePositions(g_sharedCurrent);
+        }
+    } else {
+        // re-mesh only when t moved (bounce easing can overshoot; clamp it)
+        float t = glm::clamp(e, 0.0f, 1.0f);
+        if (g_morphShown == MorphShown::Blend && t == g_lastSdfT) return;
+        std::vector<glm::vec3> verts;
+        std::vector<unsigned int> indices;
+        g_sdfMorph.Extract(t, verts, indices);
+        if (!indices.empty()) meshRenderer->Initialize(verts, indices);
+        g_morphShown = MorphShown::Blend;
+        g_lastSdfT   = t;
+    }
+}
+
 // Draw a mesh selector combo: first entry is the blob default, rest are scanned .obj files.
+// Stop every morph and any splat bake still running, so the display goes back
+// to the static preview of the current source. Used by Clear, mode switches
+// and source changes.
+static void StopAllMorphs() {
+    Window::animator->Reset();
+    Window::particleSystem->useOTPositions = false;
+    Window::meshMorphActive     = false;
+    Window::trueMorphActive     = false;
+    Window::particleMorphActive = false;
+    g_splatBakeEpoch++;   // a bake still running is discarded
+    if (Window::splatMorphActive) {
+        Window::splatMorphActive = false;
+        splatPreviewGen++;
+    }
+    g_previewGen++;
+}
+
 static void DrawGaussianSelector(const char* label, int& meshIndex) {
     ImGui::Text("%s:", label);
     ImGui::PushID(label);
@@ -1281,31 +1471,28 @@ void Window::DrawMainGUI() {
     // Render mode: all three choices visible as radio buttons
     int modeInt = (int)renderMode;
     bool modeChanged = false;
-    modeChanged |= ImGui::RadioButton("Triangle Morph##mode", &modeInt, (int)RenderMode::TriangleMorph);
-    ImGui::SameLine();
     modeChanged |= ImGui::RadioButton("Particles##mode", &modeInt, (int)RenderMode::Particles);
+    ImGui::SameLine();
+    modeChanged |= ImGui::RadioButton("Topology##mode", &modeInt, (int)RenderMode::TriangleMorph);
     ImGui::SameLine();
     modeChanged |= ImGui::RadioButton("Splats##mode", &modeInt, (int)RenderMode::Splats);
     if (modeChanged && modeInt != (int)renderMode) {
         renderMode = (RenderMode)modeInt;
-        // Switching modes disables any active morph; user re-clicks Bake.
-        if (renderMode != RenderMode::TriangleMorph) meshMorphActive = false;
-        if (renderMode != RenderMode::Splats) {
-            g_splatBakeEpoch++;   // discard a bake still running
-            if (splatMorphActive) {
-                splatMorphActive = false;
-                splatPreviewGen++;
-            }
-        }
+        // Switching modes stops any active morph and shows the new mode's
+        // preview of the source; user re-clicks Bake.
+        StopAllMorphs();
     }
-    if (renderMode == RenderMode::TriangleMorph || renderMode == RenderMode::Splats) {
+    if (renderMode != RenderMode::Particles) {
         ImGui::TextColored(ImVec4(0.7f, 0.7f, 0.7f, 1.0f),
                            "  (requires both A and B to be meshes)");
     }
 
     ImGui::Separator();
 
+    int prevSourceA = meshIndexA;
     DrawGaussianSelector("Source (A)", meshIndexA);
+    if (meshIndexA != prevSourceA)
+        StopAllMorphs();   // show the newly selected source right away
     ImGui::Spacing();
     DrawGaussianSelector("Target (B)", meshIndexB);
 
@@ -1313,15 +1500,17 @@ void Window::DrawMainGUI() {
     ImGui::SliderInt("Particles",    &particleCount, 100, 10000);
     ImGui::SliderInt("Mesh Samples", &sampleCount,   500, 20000);
     if (renderMode == RenderMode::TriangleMorph) {
-        ImGui::SliderInt("Subdivide Source", &subdivisionLevel, 0, 3);
+        const char* methods[] = { "Auto", "Shared Topology", "SDF" };
+        int m = (int)morphMethod;
+        if (ImGui::Combo("Method", &m, methods, 3)) morphMethod = (MorphMethod)m;
         ImGui::TextColored(ImVec4(0.6f, 0.6f, 0.6f, 1.0f),
-            subdivisionLevel == 0 ? "  no subdivision (original mesh)" :
-            subdivisionLevel == 1 ? "  1 pass = 4x triangles" :
-            subdivisionLevel == 2 ? "  2 passes = 16x triangles" :
-                                    "  3 passes = 64x triangles (slow Bake)");
-        ImGui::SliderFloat("Crossfade Start", &crossfadeStart, 0.0f, 1.0f);
-        ImGui::TextColored(ImVec4(0.6f, 0.6f, 0.6f, 1.0f),
-            "  0 = swap immediately, 1 = no crossfade");
+            morphMethod == MorphMethod::Auto ? "  shared topology if both meshes match, else SDF" :
+            morphMethod == MorphMethod::SharedTopology ? "  fit the denser mesh onto the other" :
+                                                         "  distance-field blend, any genus / parts");
+        ImGui::SliderFloat("Fit Stiffness", &fitStiffness, 0.1f, 10.0f, "%.2f", ImGuiSliderFlags_Logarithmic);
+        ImGui::SliderInt("SDF Resolution", &sdfResolution, 32, 128);
+        if (!morphStatus.empty())
+            ImGui::TextWrapped("%s", morphStatus.c_str());
     }
     if (renderMode == RenderMode::Splats) {
         ImGui::SliderInt("Splats", &splatCount, 1000, 50000);
@@ -1367,18 +1556,8 @@ void Window::DrawMainGUI() {
     if (ImGui::Button("Revert"))
         animator->ReverseTransport();
     ImGui::SameLine();
-    if (ImGui::Button("Clear")) {
-        animator->Reset();
-        particleSystem->useOTPositions = false;
-        particleSystem->particles.clear();
-        meshMorphActive     = false;
-        particleMorphActive = false;
-        g_splatBakeEpoch++;   // a bake still running is discarded
-        if (splatMorphActive) {
-            splatMorphActive = false;
-            splatPreviewGen++;
-        }
-    }
+    if (ImGui::Button("Clear"))
+        StopAllMorphs();
 
     ImGui::Separator();
     ImGui::SliderFloat("Particle Radius", &particleSystem->particleRadius, 0.01f, 1.0f);
