@@ -38,7 +38,12 @@ bool OBJLoader::Load(const std::string& filepath, std::vector<Triangle>& outTria
             while (ss >> faceToken) {
                 // Take only the part before the first '/'
                 std::string idxStr = faceToken.substr(0, faceToken.find('/'));
-                int idx = std::stoi(idxStr);
+                int idx;
+                try {
+                    idx = std::stoi(idxStr);
+                } catch (const std::exception&) {
+                    continue;   // malformed index: skip it instead of crashing
+                }
                 // OBJ is 1-based; negative means relative to end
                 if (idx < 0)
                     idx = (int)verts.size() + idx;

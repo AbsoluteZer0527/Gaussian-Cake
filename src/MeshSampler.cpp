@@ -12,8 +12,21 @@ float MeshSampler:: TriangleArea(const Triangle& t){
     return 0.5f * glm::length(glm::cross(edge1, edge2));
 }
 
+float MeshSampler::TotalArea(const std::vector<Triangle>& triangles){
+    float total = 0.0f;
+    for (const auto& t : triangles) total += TriangleArea(t);
+    return total;
+}
+
 std::vector<glm::vec3> MeshSampler::Sample(const std::vector<Triangle>& triangles, int N, unsigned int seed){
+    std::vector<int> unused;
+    return Sample(triangles, N, seed, unused);
+}
+
+std::vector<glm::vec3> MeshSampler::Sample(const std::vector<Triangle>& triangles, int N, unsigned int seed,
+                                           std::vector<int>& outTriIndices){
     std::vector<glm::vec3> result;
+    outTriIndices.clear();
     if (triangles.empty() || N <= 0) return result;
 
     //get all the triangle areas.
@@ -37,6 +50,7 @@ std::vector<glm::vec3> MeshSampler::Sample(const std::vector<Triangle>& triangle
     std::uniform_real_distribution<float> dist(0.0f, 1.0f);
 
     result.reserve(N);
+    outTriIndices.reserve(N);
     for (int i = 0; i < N; i++) {
         // Pick a triangle via CDF
         float r = dist(rng);
@@ -52,6 +66,7 @@ std::vector<glm::vec3> MeshSampler::Sample(const std::vector<Triangle>& triangle
         float t = u2 * std::sqrt(1.0f - u1);
         glm::vec3 point = (1.0f - s - t) * tri.v0 + s * tri.v1 + t * tri.v2;
         result.push_back(point);
+        outTriIndices.push_back(triIdx);
     }
     return result;
 }

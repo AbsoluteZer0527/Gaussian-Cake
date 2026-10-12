@@ -8,7 +8,7 @@ Gaussian::Gaussian() {
     covariance = Eigen::Matrix3d::Identity();
 }
 
-void Gaussian::FitFromPoints(const std::vector<glm::vec3>& points){
+void Gaussian::FitFromPoints(const std::vector<glm::vec3>& points, bool verbose){
     if(points.empty()) return;
 
     int N = (int)points.size();
@@ -34,6 +34,8 @@ void Gaussian::FitFromPoints(const std::vector<glm::vec3>& points){
     // Ridge: prevents singular covariance for flat/degenerate point clouds
     cov += 1e-6 * Eigen::Matrix3d::Identity();
     covariance = cov;
+
+    if (!verbose) return;
 
     //testing
     std::cout << "[Gaussian] Mean: ("

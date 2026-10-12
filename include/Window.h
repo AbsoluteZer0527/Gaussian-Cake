@@ -9,6 +9,7 @@
 #include "OptimalTransport.h"
 #include "TransportAnimator.h"
 #include "MeshRenderer.h"
+#include "SplatRenderer.h"
 
 #include <string>
 #include <vector>
@@ -16,6 +17,7 @@
 enum class RenderMode {
     TriangleMorph = 0,  // default: deforming triangle mesh
     Particles     = 1,  // legacy: floating dot cloud
+    Splats        = 2,  // surface-aligned 3D Gaussian splats + mixture OT
 };
 
 
@@ -49,12 +51,29 @@ public:
     static std::vector<glm::vec3>    meshTargetCurrent;    // per-frame lerp buffer
     static std::vector<unsigned int> meshTargetIndices;
 
+    // Splat mode: one splat set travels from A's surface to B's surface.
+    // splatStart[i] (on A) is matched one-to-one with splatEnd[i] (on B), so
+    // both ends are fully covered without a crossfade.
+    static SplatRenderer*     splatRenderer;
+    static std::vector<Splat> splatStart, splatEnd, splatCurrent;
+    static std::vector<glm::vec3> splatSmoothDisp;   // neighbour-averaged displacement per splat
+    static float splatCohesion;      // 0 = straight lines, 1 = neighbours move as chunks
+    static bool  splatMorphActive;
+    static bool  splatBaking;        // a background bake is running
+    static float lastBakeMs;         // duration of the last finished bake
+    static int   splatCount;
+    static float splatSizeMul;
+    static int   mixtureK;           // Gaussian-mixture components (1 = original single map)
+    static float sinkhornEps;        // relative entropic regularization
+    static float posteriorTemp;      // softness of the per-splat component blend
+
     // Gaussian OT pipeline
     static Gaussian* gaussianA;
     static Gaussian* gaussianB;
     static OTMap* otMap;
     static TransportAnimator* animator;
     static bool otMapComputed;
+    static bool particleMorphActive;   // particle transport owns the animator
     static int particleCount;
 
     // Mesh selection: index 0 = blob, indices 1..N = entries in meshPaths
@@ -92,5 +111,8 @@ public:
 
     // OT pipeline
     static void ComputeOTAndSpawnParticles();
+    static void BakeSplatMorph(const std::string& pathA, const std::string& pathB);
+    static void UpdateSplatPreview();
+    static void PollSplatBake();
     static void DrawMainGUI();
 };

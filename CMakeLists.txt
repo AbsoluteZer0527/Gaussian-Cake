@@ -25,6 +25,9 @@ set(
     src/OptimalTransport.cpp
     src/TransportAnimator.cpp
     src/MeshRenderer.cpp
+    src/GaussianMixture.cpp
+    src/SplatGenerator.cpp
+    src/SplatRenderer.cpp
 )
 
 # Add header files

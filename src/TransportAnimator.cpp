@@ -7,6 +7,7 @@ TransportAnimator::TransportAnimator() {
     state = AnimationState::GAUSSIAN_A;
     transportDuration = 3.0f;
     transportProgress = 0.0f;
+    direction = 1.0f;
     easingMode = EasingMode::EASE_IN_OUT;
 }
 
@@ -22,28 +23,29 @@ void TransportAnimator::Initialize(const std::vector<glm::vec3>& startPositions,
 
     state = AnimationState::GAUSSIAN_A;
     transportProgress = 0.0f;
+    direction = 1.0f;
 }
 
 void TransportAnimator::Update(float deltaTime, std::vector<glm::vec3>& outPositions) {
     if (state != AnimationState::BAKING) return;
 
-    transportProgress += deltaTime / transportDuration;
+    transportProgress += direction * deltaTime / transportDuration;
 
-    //once the animation finish, update state to B.
+    //reaching either end of the timeline settles into that state
     if (transportProgress >= 1.0f) {
         transportProgress = 1.0f;
-        outPositions = destPos;
         state = AnimationState::GAUSSIAN_B;
-        return;
+    } else if (transportProgress <= 0.0f) {
+        transportProgress = 0.0f;
+        state = AnimationState::GAUSSIAN_A;
     }
 
-    float t = ApplyEasing(transportProgress);
+    float t = GetBlend();
 
     outPositions.resize(startPos.size());
     for (int i = 0; i < (int)startPos.size(); i++){
         outPositions[i] = glm::mix(startPos[i], destPos[i], t);
     }
-
 }
 
 void TransportAnimator::InitializeWithEndPoints(const std::vector<glm::vec3>& start,
@@ -52,25 +54,28 @@ void TransportAnimator::InitializeWithEndPoints(const std::vector<glm::vec3>& st
     destPos  = end;
     state = AnimationState::GAUSSIAN_A;
     transportProgress = 0.0f;
+    direction = 1.0f;
 }
 
 void TransportAnimator::StartTransport() {
     if (state != AnimationState::GAUSSIAN_A) return;
     transportProgress = 0.0f;
+    direction = 1.0f;
     state = AnimationState::BAKING;
 }
 
 void TransportAnimator::ReverseTransport() {
     if (state != AnimationState::GAUSSIAN_B) return;
-    //reverse animation by swapping start/dest
-    std::swap(startPos, destPos);
-    transportProgress = 0.0f;
+    //play the same timeline backwards; endpoints stay A -> B
+    transportProgress = 1.0f;
+    direction = -1.0f;
     state = AnimationState::BAKING;
 }
 
 void TransportAnimator::Reset() {
     state = AnimationState::GAUSSIAN_A;
     transportProgress = 0.0f;
+    direction = 1.0f;
 }
 
 float TransportAnimator::ApplyEasing(float t) const {
@@ -104,10 +109,11 @@ void TransportAnimator::DrawGUI() {
     ImGui::Separator();
     ImGui::Text("Transport State: %s",
         state == AnimationState::GAUSSIAN_A ? "Gaussian A" :
-        state == AnimationState::BAKING ? "Baking...":"Gaussian B");
+        state == AnimationState::BAKING ? (IsReversing() ? "Reverting..." : "Baking...") : "Gaussian B");
 
     if (state == AnimationState::BAKING){
-        ImGui::ProgressBar(transportProgress, ImVec2(-1, 0), "Baking...");
+        ImGui::ProgressBar(transportProgress, ImVec2(-1, 0),
+                           IsReversing() ? "Reverting..." : "Baking...");
     }
 
     ImGui::SliderFloat("Duration", &transportDuration, 0.5f, 10.0f);

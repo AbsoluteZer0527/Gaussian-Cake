@@ -29,6 +29,8 @@ public:
     float GetIncline() { return Incline; }
 
     const glm::mat4 &GetViewProjectMtx() { return ViewProjectMtx; }
+    const glm::mat4 &GetViewMtx() { return ViewMtx; }
+    const glm::mat4 &GetProjectMtx() { return ProjectMtx; }
 
 private:
     // Perspective controls
@@ -44,4 +46,6 @@ private:
 
     // Computed data
     glm::mat4 ViewProjectMtx;
+    glm::mat4 ViewMtx;
+    glm::mat4 ProjectMtx;
 };

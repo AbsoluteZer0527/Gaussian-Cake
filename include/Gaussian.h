@@ -10,7 +10,7 @@ public:
     Gaussian();
 
     //find mean and covariance from the point cloud.
-    void FitFromPoints(const std::vector<glm::vec3>& points);
+    void FitFromPoints(const std::vector<glm::vec3>& points, bool verbose = true);
 
     //sample N points from N(mean, covariance)
     //cholesky decomposition
