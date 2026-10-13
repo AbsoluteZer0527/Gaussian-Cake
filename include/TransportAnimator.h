@@ -51,7 +51,11 @@ public:
     // their own buffers in sync with this animator's timeline.
     float ApplyEasing(float t) const;
 
-    void DrawGUI();
+    // Duration + easing controls.
+    void DrawParamsGUI();
+
+    // Timeline position bar: A ... B, with what the animation is doing.
+    void DrawStatusGUI();
 
 private:
     std::vector<glm::vec3> startPos;

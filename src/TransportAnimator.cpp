@@ -105,22 +105,20 @@ float TransportAnimator::ApplyEasing(float t) const {
     return t;
 }
 
-void TransportAnimator::DrawGUI() {
-    ImGui::Separator();
-    ImGui::Text("Transport State: %s",
-        state == AnimationState::GAUSSIAN_A ? "Gaussian A" :
-        state == AnimationState::BAKING ? (IsReversing() ? "Reverting..." : "Baking...") : "Gaussian B");
-
-    if (state == AnimationState::BAKING){
-        ImGui::ProgressBar(transportProgress, ImVec2(-1, 0),
-                           IsReversing() ? "Reverting..." : "Baking...");
-    }
-
-    ImGui::SliderFloat("Duration", &transportDuration, 0.5f, 10.0f);
+void TransportAnimator::DrawParamsGUI() {
+    ImGui::SliderFloat("Duration (s)", &transportDuration, 0.5f, 10.0f, "%.1f");
 
     const char* modes[] = {"Linear", "Ease In/Out", "Bounce"};
     int modeIdx = (int)easingMode;
     if (ImGui::Combo("Easing", &modeIdx, modes, 3))
         easingMode = (EasingMode)modeIdx;
+}
 
+void TransportAnimator::DrawStatusGUI() {
+    //one bar for the whole A -> B timeline, filled to the current position
+    const char* label =
+        state == AnimationState::GAUSSIAN_A ? "At A" :
+        state == AnimationState::GAUSSIAN_B ? "At B" :
+        IsReversing() ? "Reverting to A..." : "Morphing to B...";
+    ImGui::ProgressBar(transportProgress, ImVec2(-1, 0), label);
 }

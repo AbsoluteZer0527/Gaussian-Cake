@@ -16,7 +16,12 @@ out vec4 fragColor;
 
 void main()
 {
-	vec3 irradiance  = AmbientColor + LightColor * max(0, dot(LightDirection, fragNormal));
+	// Two-sided lighting: back faces use the flipped normal, so open sheets
+	// and meshes with inverted winding still shade on the side being viewed.
+	vec3 n = normalize(fragNormal);
+	if (!gl_FrontFacing) n = -n;
+
+	vec3 irradiance  = AmbientColor + LightColor * max(0, dot(LightDirection, n));
 	vec3 reflectance = irradiance * DiffuseColor;
 	fragColor = vec4(sqrt(reflectance), alpha);
 }

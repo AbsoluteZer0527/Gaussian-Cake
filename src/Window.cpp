@@ -38,7 +38,7 @@ MeshRenderer*   Window::meshRenderer       = nullptr;
 MeshRenderer*   Window::meshRendererTarget = nullptr;
 
 //Render mode
-RenderMode Window::renderMode = RenderMode::TriangleMorph;
+RenderMode Window::renderMode = RenderMode::Particles;
 
 //Triangle-morph state
 std::vector<glm::vec3>    Window::meshStartPositions;
@@ -227,7 +227,7 @@ bool Window::initializeObjects() {
     splatRenderer      = new SplatRenderer();
     if (!splatRenderer->Initialize()) return false;
 
-    glm::vec3 meshColor(0.85f, 0.55f, 0.75f);  // shared pink for both meshes
+    glm::vec3 meshColor(0.72f, 0.72f, 0.74f);  // shared neutral gray for both meshes
     meshRenderer->diffuseColor       = meshColor;
     meshRendererTarget->diffuseColor = meshColor;
 
@@ -1440,35 +1440,29 @@ static void StopAllMorphs() {
     g_previewGen++;
 }
 
-static void DrawGaussianSelector(const char* label, int& meshIndex) {
-    ImGui::Text("%s:", label);
-    ImGui::PushID(label);
-
-    // Build list: "(blob)" + mesh filenames
+// Source / target picker: entry 0 is the default Gaussian blob, the rest are
+// the .obj files found in meshes/.
+static bool DrawShapeCombo(const char* label, int& meshIndex) {
     int total = 1 + (int)Window::meshNames.size();
     auto getter = [](void* data, int idx, const char** out) -> bool {
         auto* names = static_cast<std::vector<std::string>*>(data);
-        if (idx == 0) { *out = "Show Gaussian"; return true; }
+        if (idx == 0) { *out = "Gaussian blob"; return true; }
         if (idx - 1 < (int)names->size()) { *out = (*names)[idx - 1].c_str(); return true; }
         return false;
     };
-    ImGui::Combo("##mesh", &meshIndex, getter, &Window::meshNames, total);
+    return ImGui::Combo(label, &meshIndex, getter, &Window::meshNames, total);
+}
 
-    if (meshIndex > 0)
-        ImGui::TextColored(ImVec4(0.4f, 1.0f, 0.6f, 1.0f), "  mesh selected");
-    else
-        ImGui::TextColored(ImVec4(0.8f, 0.8f, 0.8f, 1.0f), "  Show Gaussian(default)");
-
-    ImGui::PopID();
+static void HintText(const char* text) {
+    ImGui::TextDisabled("%s", text);
 }
 
 void Window::DrawMainGUI() {
     ImGui::Begin("Gaussian Cake");
+    ImGui::PushItemWidth(ImGui::GetFontSize() * -9.0f);   // room for labels on the right
 
-    ImGui::TextColored(ImVec4(1.0f, 0.4f, 0.7f, 1.0f), "Gaussian Cake");
-    ImGui::Separator();
-
-    // Render mode: all three choices visible as radio buttons
+    // ---- 1. Type ----
+    ImGui::SeparatorText("Type");
     int modeInt = (int)renderMode;
     bool modeChanged = false;
     modeChanged |= ImGui::RadioButton("Particles##mode", &modeInt, (int)RenderMode::Particles);
@@ -1482,86 +1476,109 @@ void Window::DrawMainGUI() {
         // preview of the source; user re-clicks Bake.
         StopAllMorphs();
     }
-    if (renderMode != RenderMode::Particles) {
-        ImGui::TextColored(ImVec4(0.7f, 0.7f, 0.7f, 1.0f),
-                           "  (requires both A and B to be meshes)");
-    }
+    HintText(renderMode == RenderMode::Particles     ? "Point cloud carried from A to B by optimal transport" :
+             renderMode == RenderMode::TriangleMorph ? "One solid surface reshaped from A into B" :
+                                                       "Gaussian splats, each matched from A to a spot on B");
 
-    ImGui::Separator();
-
-    int prevSourceA = meshIndexA;
-    DrawGaussianSelector("Source (A)", meshIndexA);
-    if (meshIndexA != prevSourceA)
+    // ---- 2. Shapes ----
+    ImGui::SeparatorText("Shapes");
+    if (DrawShapeCombo("Source (A)", meshIndexA))
         StopAllMorphs();   // show the newly selected source right away
-    ImGui::Spacing();
-    DrawGaussianSelector("Target (B)", meshIndexB);
+    DrawShapeCombo("Target (B)", meshIndexB);
 
-    ImGui::Separator();
-    ImGui::SliderInt("Particles",    &particleCount, 100, 10000);
-    ImGui::SliderInt("Mesh Samples", &sampleCount,   500, 20000);
-    if (renderMode == RenderMode::TriangleMorph) {
-        const char* methods[] = { "Auto", "Shared Topology", "SDF" };
-        int m = (int)morphMethod;
-        if (ImGui::Combo("Method", &m, methods, 3)) morphMethod = (MorphMethod)m;
-        ImGui::TextColored(ImVec4(0.6f, 0.6f, 0.6f, 1.0f),
-            morphMethod == MorphMethod::Auto ? "  shared topology if both meshes match, else SDF" :
-            morphMethod == MorphMethod::SharedTopology ? "  fit the denser mesh onto the other" :
-                                                         "  distance-field blend, any genus / parts");
-        ImGui::SliderFloat("Fit Stiffness", &fitStiffness, 0.1f, 10.0f, "%.2f", ImGuiSliderFlags_Logarithmic);
-        ImGui::SliderInt("SDF Resolution", &sdfResolution, 32, 128);
-        if (!morphStatus.empty())
-            ImGui::TextWrapped("%s", morphStatus.c_str());
-    }
-    if (renderMode == RenderMode::Splats) {
-        ImGui::SliderInt("Splats", &splatCount, 1000, 50000);
-        ImGui::SliderFloat("Splat Size", &splatSizeMul, 0.3f, 3.0f);
-        ImGui::SliderInt("Mixture K", &mixtureK, 1, 128);
-        ImGui::TextColored(ImVec4(0.6f, 0.6f, 0.6f, 1.0f),
-            mixtureK == 1 ? "  1 = original single-Gaussian map"
-                          : "  Gaussians per shape (mixture OT)");
-        ImGui::SliderFloat("Sinkhorn eps", &sinkhornEps, 0.005f, 0.5f, "%.3f", ImGuiSliderFlags_Logarithmic);
-        ImGui::SliderFloat("Blend Temp", &posteriorTemp, 0.25f, 8.0f, "%.2f", ImGuiSliderFlags_Logarithmic);
-        ImGui::SliderFloat("Cohesion", &splatCohesion, 0.0f, 1.0f);
-        ImGui::TextColored(ImVec4(0.6f, 0.6f, 0.6f, 1.0f),
-            "  0 = straight lines, 1 = move as chunks");
-        ImGui::Text("%.1f FPS", ImGui::GetIO().Framerate);
-    }
+    bool hasA = meshIndexA > 0, hasB = meshIndexB > 0;
+    bool needsMeshes = renderMode != RenderMode::Particles;
+    bool canBake = !splatBaking && (!needsMeshes || (hasA && hasB));
 
+    // ---- 3. Transport ----
+    ImGui::SeparatorText("Transport");
+    animator->DrawParamsGUI();
+
+    // Bake | Revert | Clear on one row
     ImGui::Spacing();
+    float spacing = ImGui::GetStyle().ItemSpacing.x;
+    float smallW  = ImGui::CalcTextSize("Revert").x + ImGui::GetStyle().FramePadding.x * 4.0f;
+    float bakeW   = ImGui::GetContentRegionAvail().x - 2.0f * (smallW + spacing);
+
     ImGui::PushStyleColor(ImGuiCol_Button,        ImVec4(1.0f, 0.4f, 0.7f, 1.0f));
     ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImVec4(1.0f, 0.6f, 0.8f, 1.0f));
     ImGui::PushStyleColor(ImGuiCol_ButtonActive,  ImVec4(0.8f, 0.2f, 0.5f, 1.0f));
-    ImGui::BeginDisabled(splatBaking);
-    if (ImGui::Button(splatBaking ? "Baking..." : "Bake It!", ImVec2(-1, 0)))
+    ImGui::BeginDisabled(!canBake);
+    if (ImGui::Button(splatBaking ? "Baking..." : "Bake It!", ImVec2(bakeW, 0)))
         ComputeOTAndSpawnParticles();
     ImGui::EndDisabled();
     ImGui::PopStyleColor(3);
 
+    ImGui::SameLine();
+    ImGui::BeginDisabled(animator->state != AnimationState::GAUSSIAN_B);
+    if (ImGui::Button("Revert", ImVec2(smallW, 0)))
+        animator->ReverseTransport();
+    ImGui::EndDisabled();
+    ImGui::SetItemTooltip("Play the morph back from B to A");
+
+    ImGui::SameLine();
+    if (ImGui::Button("Clear", ImVec2(smallW, 0)))
+        StopAllMorphs();
+    ImGui::SetItemTooltip("Stop and show the source again");
+
+    if (needsMeshes && !(hasA && hasB))
+        ImGui::TextColored(ImVec4(1.0f, 0.55f, 0.4f, 1.0f), "Pick a mesh for both A and B to bake.");
+
+    // Status: bake progress while baking, then the timeline position
     if (splatBaking) {
         int stage = g_bakeStage.load();
         float frac = (float)g_bakeDone.load() / (float)g_bakeTotal.load();
         char label[64];
         snprintf(label, sizeof(label), "%s (%d/6)", kBakeStageNames[stage], std::min(stage + 1, 6));
         ImGui::ProgressBar(glm::clamp(frac, 0.0f, 1.0f), ImVec2(-1, 0), label);
-    } else if (renderMode == RenderMode::Splats && lastBakeMs >= 0.0f) {
-        ImGui::TextColored(ImVec4(0.6f, 0.6f, 0.6f, 1.0f), "  last bake: %.0f ms", lastBakeMs);
+    } else {
+        animator->DrawStatusGUI();
+    }
+    if (renderMode == RenderMode::Splats && lastBakeMs >= 0.0f && !splatBaking)
+        HintText(("Last bake: " + std::to_string((int)lastBakeMs) + " ms").c_str());
+    if (renderMode == RenderMode::TriangleMorph && !morphStatus.empty()) {
+        ImGui::PushStyleColor(ImGuiCol_Text, ImGui::GetStyleColorVec4(ImGuiCol_TextDisabled));
+        ImGui::TextWrapped("%s", morphStatus.c_str());
+        ImGui::PopStyleColor();
+    }
+
+    // ---- 4. Settings for the selected type ----
+    ImGui::Spacing();
+    if (ImGui::CollapsingHeader("Settings", ImGuiTreeNodeFlags_DefaultOpen)) {
+        if (renderMode == RenderMode::Particles) {
+            ImGui::SliderInt("Particles", &particleCount, 100, 10000);
+            ImGui::SliderFloat("Particle Radius", &particleSystem->particleRadius, 0.01f, 1.0f);
+        } else if (renderMode == RenderMode::TriangleMorph) {
+            const char* methods[] = { "Auto", "Shared Topology", "SDF" };
+            int m = (int)morphMethod;
+            if (ImGui::Combo("Method", &m, methods, 3)) morphMethod = (MorphMethod)m;
+            HintText(morphMethod == MorphMethod::Auto ? "Shared topology if both meshes match, else SDF" :
+                     morphMethod == MorphMethod::SharedTopology ? "Fit the denser mesh onto the other" :
+                                                                  "Distance-field blend: any genus / parts");
+            ImGui::SliderFloat("Fit Stiffness", &fitStiffness, 0.1f, 10.0f, "%.2f", ImGuiSliderFlags_Logarithmic);
+            ImGui::SetItemTooltip("Shared topology: how stiffly the template keeps its shape while fitting");
+            ImGui::SliderInt("SDF Resolution", &sdfResolution, 32, 128);
+            ImGui::SetItemTooltip("SDF: grid points per axis (higher = finer, slower)");
+        } else {
+            ImGui::SliderInt("Splats", &splatCount, 1000, 50000);
+            ImGui::SliderFloat("Splat Size", &splatSizeMul, 0.3f, 3.0f);
+            ImGui::SliderFloat("Cohesion", &splatCohesion, 0.0f, 1.0f);
+            ImGui::SetItemTooltip("0 = every splat flies straight\n1 = neighbours move together as chunks");
+            ImGui::SliderInt("Mixture K", &mixtureK, 1, 128);
+            ImGui::SetItemTooltip("Gaussians fitted per shape for the OT map\n1 = original single-Gaussian map");
+            ImGui::SliderFloat("Sinkhorn eps", &sinkhornEps, 0.005f, 0.5f, "%.3f", ImGuiSliderFlags_Logarithmic);
+            ImGui::SetItemTooltip("Softness of the cluster-to-cluster transport plan");
+            ImGui::SliderFloat("Blend Temp", &posteriorTemp, 0.25f, 8.0f, "%.2f", ImGuiSliderFlags_Logarithmic);
+            ImGui::SetItemTooltip("How smoothly each splat blends between nearby clusters");
+        }
+        ImGui::SliderInt("Mesh Samples", &sampleCount, 500, 20000);
+        ImGui::SetItemTooltip("Surface points used to fit the Gaussians for the OT map");
     }
 
     ImGui::Spacing();
-    animator->DrawGUI();
+    ImGui::TextDisabled("%.0f FPS", ImGui::GetIO().Framerate);
 
-    ImGui::Spacing();
-    ImGui::Separator();
-
-    if (ImGui::Button("Revert"))
-        animator->ReverseTransport();
-    ImGui::SameLine();
-    if (ImGui::Button("Clear"))
-        StopAllMorphs();
-
-    ImGui::Separator();
-    ImGui::SliderFloat("Particle Radius", &particleSystem->particleRadius, 0.01f, 1.0f);
-
+    ImGui::PopItemWidth();
     ImGui::End();
 }
 

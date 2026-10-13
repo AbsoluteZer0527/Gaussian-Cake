@@ -2,8 +2,8 @@
 #include "MeshSampler.h"
 #include <cmath>
 
-// same pink as the triangle-morph meshes
-glm::vec3 SplatGenerator::baseColor = glm::vec3(0.85f, 0.55f, 0.75f);
+// same gray as the triangle-morph meshes
+glm::vec3 SplatGenerator::baseColor = glm::vec3(0.72f, 0.72f, 0.74f);
 
 float SplatGenerator::BaseSigma(const std::vector<Triangle>& tris, int N) {
     if (N <= 0) return 0.01f;

@@ -4,7 +4,7 @@
 #include <iostream>
 
 MeshRenderer::MeshRenderer()
-    : diffuseColor(0.85f, 0.55f, 0.75f),  // default pink
+    : diffuseColor(0.72f, 0.72f, 0.74f),  // default neutral gray
       alpha(1.0f),
       isInitialized(false), vao(0), vboPos(0), vboNorm(0), ebo(0),
       vertexCount(0), indexCount(0) {}
