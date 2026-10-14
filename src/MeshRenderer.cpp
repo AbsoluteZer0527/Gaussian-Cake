@@ -105,8 +105,6 @@ void MeshRenderer::Draw(GLuint shaderProgram, const glm::mat4& viewProj) {
     if (locDiff  >= 0) glUniform3fv(locDiff, 1, glm::value_ptr(diffuseColor));
     if (locAlpha >= 0) glUniform1f(locAlpha, alpha);
 
-    // Fixed-function lighting doesn't affect shader path, but disable it to be safe.
-    glDisable(GL_LIGHTING);
     glEnable(GL_DEPTH_TEST);
 
     glBindVertexArray(vao);

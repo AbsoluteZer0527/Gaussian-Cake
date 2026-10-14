@@ -33,18 +33,11 @@ const char* Window::windowTitle = "Gaussian Cake";
 Camera* Cam;
 
 //Object particles
-ParticleSystem* Window::particleSystem     = nullptr;
-MeshRenderer*   Window::meshRenderer       = nullptr;
-MeshRenderer*   Window::meshRendererTarget = nullptr;
+ParticleSystem* Window::particleSystem = nullptr;
+MeshRenderer*   Window::meshRenderer   = nullptr;
 
 //Render mode
 RenderMode Window::renderMode = RenderMode::Particles;
-
-//Triangle-morph state
-std::vector<glm::vec3>    Window::meshStartPositions;
-std::vector<glm::vec3>    Window::meshEndPositions;
-std::vector<unsigned int> Window::meshIndices;
-bool                      Window::meshMorphActive = false;
 
 //True morph state
 MorphMethod Window::morphMethod     = MorphMethod::Auto;
@@ -62,12 +55,6 @@ static SDFMorph                  g_sdfMorph;
 enum class MorphShown { None, A, Blend, B };
 static MorphShown                g_morphShown = MorphShown::None;
 static float                     g_lastSdfT   = -1.0f;
-
-//Dual-mesh (Option B) target-side state
-std::vector<glm::vec3>    Window::meshTargetStart;
-std::vector<glm::vec3>    Window::meshTargetEnd;
-std::vector<glm::vec3>    Window::meshTargetCurrent;
-std::vector<unsigned int> Window::meshTargetIndices;
 
 //Splat mode state
 SplatRenderer*     Window::splatRenderer = nullptr;
@@ -89,16 +76,13 @@ Gaussian*        Window::gaussianA     = nullptr;
 Gaussian*        Window::gaussianB     = nullptr;
 OTMap*           Window::otMap         = nullptr;
 TransportAnimator* Window::animator    = nullptr;
-bool             Window::otMapComputed = false;
 bool             Window::particleMorphActive = false;
-int              Window::particleCount = 5000;
+int              Window::particleCount = 3000;
 std::vector<std::string> Window::meshNames;
 std::vector<std::string> Window::meshPaths;
 int              Window::meshIndexA    = 0;
 int              Window::meshIndexB    = 0;
-int              Window::sampleCount        = 5000;
-int              Window::subdivisionLevel   = 0;
-float            Window::crossfadeStart     = 0.35f;
+int              Window::sampleCount   = 5000;
 
 //Interaction Variables
 bool LeftDown, RightDown;
@@ -107,8 +91,18 @@ int MouseX, MouseY;
 //The shader program id
 GLuint Window::shaderProgram;
 
-// Default blob: isotropic 3D Gaussian (no color, no named presets)
-static const Eigen::Matrix3d blobCovariance = Eigen::Vector3d(1.0, 1.0, 1.0).asDiagonal();
+// Default blob: isotropic unit 3D Gaussian at the origin
+static void SetBlob(Gaussian& g) {
+    g.mean       = Eigen::Vector3d::Zero();
+    g.covariance = Eigen::Matrix3d::Identity();
+}
+
+// Load an OBJ and normalize it to [-1, 1]^3. Returns false on failure.
+static bool LoadNormalized(const std::string& path, std::vector<Triangle>& tris) {
+    if (!OBJLoader::Load(path, tris)) return false;
+    OBJLoader::Normalize(tris);
+    return true;
+}
 
 // ---- Static previews for Particles / Topology modes ----
 // Until a morph is baked, Topology shows mesh A as a solid surface and
@@ -132,9 +126,7 @@ static void UpdateModePreview() {
     int idx = Window::meshIndexA;
     bool hasMesh = idx > 0 && idx <= (int)Window::meshPaths.size();
     if (hasMesh && loadedIndex != idx) {
-        tris.clear();
-        if (OBJLoader::Load(Window::meshPaths[idx - 1].c_str(), tris)) {
-            OBJLoader::Normalize(tris);
+        if (LoadNormalized(Window::meshPaths[idx - 1], tris)) {
             loadedIndex = idx;
         } else {
             hasMesh = false;
@@ -154,22 +146,12 @@ static void UpdateModePreview() {
         return;
     }
 
-    ParticleSystem* ps = Window::particleSystem;
     if (hasMesh) {
         // same samples the mesh-to-mesh particle bake starts from
-        auto pts = MeshSampler::Sample(tris, Window::particleCount);
-        ps->particles.clear();
-        for (const auto& pos : pts) {
-            Particle part(ps->particleRadius);
-            part.position = pos;
-            ps->particles.push_back(part);
-        }
-        ps->transportPositions = pts;
-        ps->useOTPositions = false;
+        Window::particleSystem->SpawnAt(MeshSampler::Sample(tris, Window::particleCount));
     } else {
-        Window::gaussianA->mean       = Eigen::Vector3d::Zero();
-        Window::gaussianA->covariance = blobCovariance;
-        ps->SpawnFromGaussian(*Window::gaussianA, Window::particleCount);
+        SetBlob(*Window::gaussianA);
+        Window::particleSystem->SpawnFromGaussian(*Window::gaussianA, Window::particleCount);
     }
 }
 
@@ -221,22 +203,14 @@ static int FindMeshIndex(const std::string& filename) {
 }
 
 bool Window::initializeObjects() {
-    particleSystem     = new ParticleSystem();
-    meshRenderer       = new MeshRenderer();
-    meshRendererTarget = new MeshRenderer();
-    splatRenderer      = new SplatRenderer();
+    particleSystem = new ParticleSystem();
+    meshRenderer   = new MeshRenderer();
+    splatRenderer  = new SplatRenderer();
     if (!splatRenderer->Initialize()) return false;
-
-    glm::vec3 meshColor(0.72f, 0.72f, 0.74f);  // shared neutral gray for both meshes
-    meshRenderer->diffuseColor       = meshColor;
-    meshRendererTarget->diffuseColor = meshColor;
 
     gaussianA = new Gaussian();
     gaussianB = new Gaussian();
-    otMap = nullptr;
-    animator = new TransportAnimator();
-    otMapComputed = false;
-    particleCount = 3000;
+    animator  = new TransportAnimator();
 
     ScanMeshes();
 
@@ -248,8 +222,7 @@ bool Window::initializeObjects() {
     Cam->SetIncline(-20.0f);
 
     // Spawn initial blob so the scene isn't empty on startup
-    gaussianA->mean       = Eigen::Vector3d::Zero();
-    gaussianA->covariance = blobCovariance;
+    SetBlob(*gaussianA);
     particleSystem->SpawnFromGaussian(*gaussianA, particleCount);
 
     return true;
@@ -258,7 +231,6 @@ bool Window::initializeObjects() {
 void Window::cleanUp() {
     delete particleSystem;
     delete meshRenderer;
-    delete meshRendererTarget;
     delete splatRenderer;
     delete g_previewMesh;
     delete gaussianA;
@@ -361,20 +333,6 @@ void Window::idleCallback() {
         static std::vector<glm::vec3> unused;
         animator->Update(deltaTime, unused);
         UpdateTrueMorph();
-    } else if (meshMorphActive) {
-        // Source mesh: animator advances the shared timeline and writes
-        // lerp'd source-vertex positions into meshStartPositions.
-        animator->Update(deltaTime, meshStartPositions);
-        meshRenderer->UpdatePositions(meshStartPositions);
-
-        // Target mesh: manually lerp using the same easing curve so it stays
-        // perfectly in sync with the source.
-        if (!meshTargetCurrent.empty()) {
-            float e = animator->GetBlend();
-            for (size_t i = 0; i < meshTargetCurrent.size(); ++i)
-                meshTargetCurrent[i] = glm::mix(meshTargetStart[i], meshTargetEnd[i], e);
-            meshRendererTarget->UpdatePositions(meshTargetCurrent);
-        }
     } else if (particleMorphActive) {
         animator->Update(deltaTime, particleSystem->transportPositions);
     }
@@ -384,68 +342,20 @@ void Window::idleCallback() {
 }
 
 void Window::displayCallback(GLFWwindow* window) {
-    glClearColor(1.0f, 1.0f, 1.0f, 1.0f);
-    // glClearColor(83/255.0f, 203/255.0f, 243/255.0f, 1.0f);
     glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
-
-    GLfloat light0_pos[] = {10.0f, 10.0f, 10.0f, 1.0f};
-    GLfloat light0_color[] = {1.0f, 0.8f, 0.8f, 1.0f};
-    glLightfv(GL_LIGHT0, GL_POSITION, light0_pos);
-    glLightfv(GL_LIGHT0, GL_DIFFUSE, light0_color);
-
-    GLfloat light1_pos[] = {-10.0f, 5.0f, -10.0f, 1.0f};
-    GLfloat light1_color[] = {0.8f, 0.8f, 1.0f, 1.0f};
-    glLightfv(GL_LIGHT1, GL_POSITION, light1_pos);
-    glLightfv(GL_LIGHT1, GL_DIFFUSE, light1_color);
 
     if (renderMode == RenderMode::Splats) {
         if (!splatMorphActive) UpdateSplatPreview();
         splatRenderer->Draw(splatCurrent, Cam->GetViewMtx(), Cam->GetProjectMtx());
     } else if (renderMode == RenderMode::TriangleMorph && trueMorphActive) {
-        // One opaque surface: no crossfade
-        meshRenderer->alpha = 1.0f;
         meshRenderer->Draw(shaderProgram, Cam->GetViewProjectMtx());
-    } else if (renderMode == RenderMode::Crossfade && meshMorphActive) {
-        float e = animator->GetBlend();
-
-        // Delayed crossfade: source stays fully opaque until crossfadeStart,
-        // then both meshes smoothstep-fade across the remaining window.
-        float tail = 1.0f - crossfadeStart;
-        float t = (tail > 1e-4f)
-                ? glm::clamp((e - crossfadeStart) / tail, 0.0f, 1.0f)
-                : (e >= crossfadeStart ? 1.0f : 0.0f);
-        t = t * t * (3.0f - 2.0f * t);  // smoothstep
-        meshRenderer->alpha       = 1.0f - t;
-        meshRendererTarget->alpha = t;
-
-        glEnable(GL_CULL_FACE);
-        glCullFace(GL_BACK);
-        glEnable(GL_BLEND);
-        glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
-
-        if (meshRenderer->alpha >= meshRendererTarget->alpha) {
-            glDepthMask(GL_TRUE);
-            meshRenderer->Draw(shaderProgram, Cam->GetViewProjectMtx());
-            glDepthMask(GL_FALSE);
-            meshRendererTarget->Draw(shaderProgram, Cam->GetViewProjectMtx());
-        } else {
-            glDepthMask(GL_TRUE);
-            meshRendererTarget->Draw(shaderProgram, Cam->GetViewProjectMtx());
-            glDepthMask(GL_FALSE);
-            meshRenderer->Draw(shaderProgram, Cam->GetViewProjectMtx());
-        }
-
-        glDepthMask(GL_TRUE);
-        glDisable(GL_BLEND);
-        glDisable(GL_CULL_FACE);
-    } else if (renderMode == RenderMode::TriangleMorph && !trueMorphActive &&
-               meshIndexA > 0) {
+    } else if (renderMode == RenderMode::TriangleMorph && meshIndexA > 0) {
         // Topology preview: the source mesh as a solid surface
         UpdateModePreview();
         if (g_previewMesh && g_previewMesh->isInitialized)
             g_previewMesh->Draw(shaderProgram, Cam->GetViewProjectMtx());
     } else {
-        if (!particleMorphActive && !meshMorphActive) UpdateModePreview();
+        if (!particleMorphActive) UpdateModePreview();
         particleSystem->Draw(Cam->GetViewProjectMtx());
     }
 
@@ -468,19 +378,12 @@ void Window::displayCallback(GLFWwindow* window) {
 // OT pipeline
 
 // Load an OBJ and fit a Gaussian to its surface. Returns false on failure.
-static bool LoadMeshGaussian(const char* path, int N, Gaussian* g) {
+static bool LoadMeshGaussian(const std::string& path, int N, Gaussian* g) {
     std::vector<Triangle> tris;
-    if (!OBJLoader::Load(path, tris)) return false;
-    OBJLoader::Normalize(tris);
-    auto pts = MeshSampler::Sample(tris, N);
-    g->FitFromPoints(pts);
+    if (!LoadNormalized(path, tris)) return false;
+    g->FitFromPoints(MeshSampler::Sample(tris, N));
     return true;
 }
-
-// Phase 3 snap: for each endpoint, find the closest point on the target
-// surface. Uses the SurfaceGrid below instead of testing every triangle.
-static void SnapToNearestOnTriangles(std::vector<glm::vec3>& endVerts,
-                                     const std::vector<Triangle>& tris);
 
 // Greedy approximate discrete OT: match each point in ptsA to the nearest
 // unmatched point in ptsB. O(N^2) — fine for N <= 2000 on a single Bake click.
@@ -505,136 +408,6 @@ static std::vector<glm::vec3> GreedyDiscreteOT(
         used[bestJ] = true;
     }
     return result;
-}
-
-// Uniform grid over dense surface samples, for fast approximate closest-point
-// queries on large meshes (the brute-force snap is O(points * triangles)).
-// Each query finds the nearest sample, then projects exactly onto that
-// sample's triangle.
-struct SurfaceGrid {
-    std::vector<glm::vec3> pts;
-    std::vector<int>       tri;        // triangle each sample came from
-    std::vector<int>       cellStart;  // CSR layout: cellStart[c]..cellStart[c+1]
-    std::vector<int>       cellItems;
-    glm::vec3 lo = glm::vec3(0.0f);
-    float cell = 1.0f;
-    int nx = 1, ny = 1, nz = 1;
-
-    void Build(const std::vector<Triangle>& tris, int M) {
-        std::vector<glm::vec3> samples = MeshSampler::Sample(tris, M, 7u, tri);
-        // ~2 sample spacings per cell
-        BuildFromPoints(samples, 2.0f * std::sqrt(MeshSampler::TotalArea(tris) / (float)M));
-    }
-
-    // Grid over arbitrary points; cellSize is capped so the grid stays small.
-    void BuildFromPoints(const std::vector<glm::vec3>& points, float cellSize) {
-        pts = points;
-        lo = glm::vec3(1e30f);
-        glm::vec3 hi(-1e30f);
-        for (const auto& p : pts) { lo = glm::min(lo, p); hi = glm::max(hi, p); }
-
-        cell = std::max(1e-4f, cellSize);
-        glm::vec3 ext = hi - lo;
-        cell = std::max(cell, std::max(ext.x, std::max(ext.y, ext.z)) / 128.0f);
-        nx = (int)(ext.x / cell) + 1;
-        ny = (int)(ext.y / cell) + 1;
-        nz = (int)(ext.z / cell) + 1;
-
-        std::vector<int> count(nx * ny * nz + 1, 0);
-        std::vector<int> cellOf(pts.size());
-        for (size_t i = 0; i < pts.size(); ++i) {
-            cellOf[i] = CellIndex(pts[i]);
-            count[cellOf[i] + 1]++;
-        }
-        for (size_t c = 1; c < count.size(); ++c) count[c] += count[c - 1];
-        cellStart = count;
-        cellItems.resize(pts.size());
-        std::vector<int> fill(cellStart.begin(), cellStart.end() - 1);
-        for (size_t i = 0; i < pts.size(); ++i) cellItems[fill[cellOf[i]]++] = (int)i;
-    }
-
-    glm::ivec3 Cell(const glm::vec3& p) const {
-        glm::ivec3 c = glm::ivec3(glm::floor((p - lo) / cell));
-        return glm::clamp(c, glm::ivec3(0), glm::ivec3(nx - 1, ny - 1, nz - 1));
-    }
-    int CellIndex(const glm::vec3& p) const {
-        glm::ivec3 c = Cell(p);
-        return (c.z * ny + c.y) * nx + c.x;
-    }
-
-    // Index of the nearest sample. Searches shells of cells outward and stops
-    // once the next shell can't contain anything closer.
-    int Nearest(const glm::vec3& q) const {
-        glm::ivec3 c0 = Cell(q);
-        // distance from q to the grid box (q may lie outside it)
-        glm::vec3 hiBox = lo + cell * glm::vec3((float)nx, (float)ny, (float)nz);
-        float outside = glm::length(glm::max(glm::vec3(0.0f), glm::max(lo - q, q - hiBox)));
-
-        int best = 0;
-        float bestD = 1e30f;
-        int maxR = std::max(nx, std::max(ny, nz));
-        for (int r = 0; r <= maxR; ++r) {
-            for (int z = c0.z - r; z <= c0.z + r; ++z) {
-                if (z < 0 || z >= nz) continue;
-                for (int y = c0.y - r; y <= c0.y + r; ++y) {
-                    if (y < 0 || y >= ny) continue;
-                    for (int x = c0.x - r; x <= c0.x + r; ++x) {
-                        if (x < 0 || x >= nx) continue;
-                        // only the shell of this ring
-                        int ring = std::max(std::abs(x - c0.x), std::max(std::abs(y - c0.y), std::abs(z - c0.z)));
-                        if (ring != r) continue;
-                        int c = (z * ny + y) * nx + x;
-                        for (int k = cellStart[c]; k < cellStart[c + 1]; ++k) {
-                            glm::vec3 d = pts[cellItems[k]] - q;
-                            float dd = glm::dot(d, d);
-                            if (dd < bestD) { bestD = dd; best = cellItems[k]; }
-                        }
-                    }
-                }
-            }
-            // anything in shell r+1 is at least sqrt(outside^2 + (r*cell)^2) away
-            float reach2 = outside * outside + (r * cell) * (r * cell);
-            if (bestD < 1e29f && bestD <= reach2) break;
-        }
-        return best;
-    }
-};
-
-// Closest point on the surface near p: find the nearest dense sample, then
-// project exactly onto every triangle sampled in the 3x3x3 cells around it.
-static glm::vec3 SnapPoint(const SurfaceGrid& g, const std::vector<Triangle>& tris,
-                           const glm::vec3& p, int* outTri = nullptr) {
-    int s0 = g.Nearest(p);
-    int bestTri = g.tri[s0];
-    const Triangle& t0 = tris[bestTri];
-    glm::vec3 best = ClosestPointOnTriangle(p, t0.v0, t0.v1, t0.v2);
-    float bestD = glm::dot(best - p, best - p);
-
-    glm::ivec3 c0 = g.Cell(g.pts[s0]);
-    for (int z = std::max(0, c0.z - 1); z <= std::min(g.nz - 1, c0.z + 1); ++z)
-        for (int y = std::max(0, c0.y - 1); y <= std::min(g.ny - 1, c0.y + 1); ++y)
-            for (int x = std::max(0, c0.x - 1); x <= std::min(g.nx - 1, c0.x + 1); ++x) {
-                int c = (z * g.ny + y) * g.nx + x;
-                for (int k = g.cellStart[c]; k < g.cellStart[c + 1]; ++k) {
-                    int ti = g.tri[g.cellItems[k]];
-                    if (ti == bestTri) continue;
-                    const Triangle& t = tris[ti];
-                    glm::vec3 q = ClosestPointOnTriangle(p, t.v0, t.v1, t.v2);
-                    float d = glm::dot(q - p, q - p);
-                    if (d < bestD) { bestD = d; best = q; bestTri = ti; }
-                }
-            }
-    if (outTri) *outTri = bestTri;
-    return best;
-}
-
-static void SnapToNearestOnTriangles(std::vector<glm::vec3>& endVerts,
-                                     const std::vector<Triangle>& tris) {
-    if (tris.empty() || endVerts.empty()) return;
-    SurfaceGrid grid;
-    grid.Build(tris, std::clamp(8 * (int)endVerts.size(), 50000, 400000));
-    std::for_each(std::execution::par, endVerts.begin(), endVerts.end(),
-                  [&](glm::vec3& p) { p = SnapPoint(grid, tris, p); });
 }
 
 // Rotation with local z = n (flipped to face the same side as ref's z) and
@@ -708,8 +481,7 @@ static SplatMeshCache* GetMeshCache(const std::string& path) {
     auto it = g_meshCache.find(path);
     if (it != g_meshCache.end()) return &it->second;
     SplatMeshCache c;
-    if (!OBJLoader::Load(path.c_str(), c.tris)) return nullptr;
-    OBJLoader::Normalize(c.tris);
+    if (!LoadNormalized(path, c.tris)) return nullptr;
     return &g_meshCache.emplace(path, std::move(c)).first->second;
 }
 
@@ -798,8 +570,8 @@ static std::vector<int> MedianSplitMatch(const std::vector<glm::vec3>& y,
 static int RefineMatch(const std::vector<glm::vec3>& y, const std::vector<glm::vec3>& b,
                        std::vector<int>& perm, float cellSize, int maxPasses) {
     const int n = (int)y.size();
-    SurfaceGrid grid;
-    grid.BuildFromPoints(b, cellSize);
+    PointGrid grid;
+    grid.Build(b, cellSize);
 
     std::vector<int> owner(n);
     for (int i = 0; i < n; ++i) owner[perm[i]] = i;
@@ -808,25 +580,18 @@ static int RefineMatch(const std::vector<glm::vec3>& y, const std::vector<glm::v
     for (; pass < maxPasses; ++pass) {
         int swaps = 0;
         for (int i = 0; i < n; ++i) {
-            glm::ivec3 c0 = grid.Cell(y[i]);
-            for (int z = std::max(0, c0.z - 1); z <= std::min(grid.nz - 1, c0.z + 1); ++z)
-            for (int yy = std::max(0, c0.y - 1); yy <= std::min(grid.ny - 1, c0.y + 1); ++yy)
-            for (int x = std::max(0, c0.x - 1); x <= std::min(grid.nx - 1, c0.x + 1); ++x) {
-                int c = (z * grid.ny + yy) * grid.nx + x;
-                for (int k = grid.cellStart[c]; k < grid.cellStart[c + 1]; ++k) {
-                    int j2 = grid.cellItems[k];       // candidate b point
-                    int i2 = owner[j2];               // its current partner
-                    int j  = perm[i];
-                    if (i2 == i) continue;
-                    float before = Dist2(y[i], b[j])  + Dist2(y[i2], b[j2]);
-                    float after  = Dist2(y[i], b[j2]) + Dist2(y[i2], b[j]);
-                    if (after < before - 1e-12f) {
-                        perm[i] = j2;  perm[i2] = j;
-                        owner[j2] = i; owner[j] = i2;
-                        ++swaps;
-                    }
+            grid.ForEachNear(y[i], [&](int j2) {   // candidate b point
+                int i2 = owner[j2];                // its current partner
+                int j  = perm[i];
+                if (i2 == i) return;
+                float before = Dist2(y[i], b[j])  + Dist2(y[i2], b[j2]);
+                float after  = Dist2(y[i], b[j2]) + Dist2(y[i2], b[j]);
+                if (after < before - 1e-12f) {
+                    perm[i] = j2;  perm[i2] = j;
+                    owner[j2] = i; owner[j] = i2;
+                    ++swaps;
                 }
-            }
+            });
         }
         g_bakeDone++;
         if (swaps == 0) { ++pass; break; }
@@ -889,8 +654,8 @@ static SplatBakeResult RunSplatBake(SplatBakeSettings st) {
     // Lower bound for reference: every mapped point to its nearest b point,
     // ignoring the one-to-one constraint.
     {
-        SurfaceGrid g;
-        g.BuildFromPoints(bPos, cell);
+        PointGrid g;
+        g.Build(bPos, cell);
         std::vector<int> idx(n);
         std::iota(idx.begin(), idx.end(), 0);
         double nn = std::transform_reduce(std::execution::par, idx.begin(), idx.end(), 0.0,
@@ -920,21 +685,14 @@ static SplatBakeResult RunSplatBake(SplatBakeSettings st) {
     {
         std::vector<glm::vec3> aPos(n);
         for (int i = 0; i < n; ++i) aPos[i] = res.start[i].mean;
-        SurfaceGrid g;
-        g.BuildFromPoints(aPos, 2.0f * st.sizeMul * SplatGenerator::BaseSigma(A->tris, n));
+        PointGrid g;
+        g.Build(aPos, 2.0f * st.sizeMul * SplatGenerator::BaseSigma(A->tris, n));
 
         std::for_each(std::execution::par, idx.begin(), idx.end(), [&](int i) {
             std::vector<std::pair<float, int>> cand;
-            glm::ivec3 c0 = g.Cell(aPos[i]);
-            for (int z = std::max(0, c0.z - 1); z <= std::min(g.nz - 1, c0.z + 1); ++z)
-            for (int yy = std::max(0, c0.y - 1); yy <= std::min(g.ny - 1, c0.y + 1); ++yy)
-            for (int x = std::max(0, c0.x - 1); x <= std::min(g.nx - 1, c0.x + 1); ++x) {
-                int c = (z * g.ny + yy) * g.nx + x;
-                for (int k = g.cellStart[c]; k < g.cellStart[c + 1]; ++k) {
-                    int j = g.cellItems[k];
-                    if (j != i) cand.push_back({ Dist2(aPos[i], aPos[j]), j });
-                }
-            }
+            g.ForEachNear(aPos[i], [&](int j) {
+                if (j != i) cand.push_back({ Dist2(aPos[i], aPos[j]), j });
+            });
             int m = std::min(kNN, (int)cand.size());
             std::partial_sort(cand.begin(), cand.begin() + m, cand.end());
             for (int k = 0; k < m; ++k) res.knn[(size_t)i * kNN + k] = cand[k].second;
@@ -1038,7 +796,6 @@ void Window::PollSplatBake() {
     animator->InitializeWithEndPoints({}, {});
     animator->StartTransport();
     splatMorphActive    = true;
-    meshMorphActive     = false;
     trueMorphActive     = false;
     particleMorphActive = false;
     lastBakeMs          = (float)res.ms;
@@ -1063,16 +820,15 @@ void Window::UpdateSplatPreview() {
         static std::vector<Triangle> tris;
         static int loadedIndex = -1;
         if (loadedIndex != meshIndexA) {
-            tris.clear();
-            if (!OBJLoader::Load(meshPaths[meshIndexA - 1].c_str(), tris)) return;
-            OBJLoader::Normalize(tris);
+            loadedIndex = -1;
+            if (!LoadNormalized(meshPaths[meshIndexA - 1], tris)) return;
             loadedIndex = meshIndexA;
         }
         splatCurrent = SplatGenerator::FromTriangles(tris, splatCount, splatSizeMul, 42u);
     } else {
         // Blob: round splats sampled from the default isotropic Gaussian
         Gaussian blob;
-        blob.covariance = blobCovariance;
+        SetBlob(blob);
         auto pts = blob.Sample(splatCount);
         splatCurrent.assign(pts.size(), Splat());
         for (size_t i = 0; i < pts.size(); ++i) {
@@ -1103,101 +859,14 @@ void Window::ComputeOTAndSpawnParticles() {
         return;
     }
 
-    // === Crossfade mode (legacy dual-mesh morph) ===
-    // Uses the source mesh's original triangulation. Each source vertex is
-    // displaced by the Gaussian OT map T(x) = mu_B + A*(x - mu_A). Requires
-    // both A and B to be actual meshes (not blobs).
-    if (renderMode == RenderMode::Crossfade && hasMeshA && hasMeshB) {
-        std::vector<Triangle> trisA, trisB;
-        if (!OBJLoader::Load(pathA.c_str(), trisA)) return;
-        if (!OBJLoader::Load(pathB.c_str(), trisB)) return;
-        OBJLoader::Normalize(trisA);
-        OBJLoader::Normalize(trisB);
-
-        // Optional midpoint subdivision: adds more source vertices so snap
-        // endpoints cover the target surface more densely.
-        if (subdivisionLevel > 0)
-            MeshTopology::Subdivide(trisA, subdivisionLevel);
-
-        // Extract the source mesh's actual vertices + triangle indices.
-        IndexedMesh meshA;
-        MeshTopology::Build(trisA, meshA);
-        std::vector<glm::vec3>&    verts   = meshA.verts;
-        std::vector<unsigned int>& indices = meshA.indices;
-
-        // Fit Gaussians to both surfaces to build the OT map.
-        // (Sample from A so the source Gaussian reflects A's surface distribution,
-        //  which is what T is applied at.)
-        auto sampledA = MeshSampler::Sample(trisA, sampleCount);
-        auto sampledB = MeshSampler::Sample(trisB, sampleCount);
-        gaussianA->FitFromPoints(sampledA);
-        gaussianB->FitFromPoints(sampledB);
-
-        delete otMap;
-        otMap = new OTMap(OptimalTransport::Compute(*gaussianA, *gaussianB));
-        otMapComputed = true;
-
-        // Compute end positions by applying the OT map to each source vertex.
-        std::vector<glm::vec3> endVerts(verts.size());
-        for (size_t i = 0; i < verts.size(); ++i)
-            endVerts[i] = OptimalTransport::Apply(*otMap, verts[i]);
-
-        // Snap each source endpoint to the nearest point on any target triangle.
-        SnapToNearestOnTriangles(endVerts, trisB);
-
-        // === Option B: parallel target-topology mesh ===
-        // Extract the target mesh's actual vertices + indices.
-        IndexedMesh meshB;
-        MeshTopology::Build(trisB, meshB);
-        std::vector<glm::vec3>&    tVerts   = meshB.verts;
-        std::vector<unsigned int>& tIndices = meshB.indices;
-
-        // Compute A^-1 once. OT^-1(y) = mu_A + A^-1 * (y - mu_B).
-        Eigen::Matrix3d Ainv = otMap->A.inverse();
-
-        std::vector<glm::vec3> tStart(tVerts.size());
-        for (size_t i = 0; i < tVerts.size(); ++i) {
-            Eigen::Vector3d yE((double)tVerts[i].x, (double)tVerts[i].y, (double)tVerts[i].z);
-            Eigen::Vector3d xE = otMap->muA + Ainv * (yE - otMap->muB);
-            tStart[i] = glm::vec3((float)xE.x(), (float)xE.y(), (float)xE.z());
-        }
-
-        // Snap each target-start position onto the source surface.
-        SnapToNearestOnTriangles(tStart, trisA);
-
-        // Hand off to renderers + animator. Source animator drives the timeline;
-        // target buffer is manually lerp'd each frame using animator.GetProgress().
-        meshStartPositions = verts;
-        meshEndPositions   = endVerts;
-        meshIndices        = indices;
-
-        meshTargetStart   = tStart;
-        meshTargetEnd     = tVerts;
-        meshTargetCurrent = tStart;       // t=0 initial state
-        meshTargetIndices = tIndices;
-
-        meshRenderer->Initialize(verts, indices);
-        meshRendererTarget->Initialize(tStart, tIndices);
-
-        animator->InitializeWithEndPoints(verts, endVerts);
-        animator->StartTransport();
-        meshMorphActive     = true;
-        particleMorphActive = false;
-        return;
-    }
-
-    // Non-triangle-morph or fallback: use the existing particle pipeline.
-    meshMorphActive = false;
-
+    // === Particles ===
     if (hasMeshA && hasMeshB) {
         // === Discrete mesh-to-mesh OT ===
         // Particles start exactly on mesh A surface, end exactly on mesh B surface.
         // The Gaussian OT map is not used — the greedy matching IS the transport.
         std::vector<Triangle> trisA, trisB;
-        if (!OBJLoader::Load(pathA.c_str(), trisA)) return;
-        if (!OBJLoader::Load(pathB.c_str(), trisB)) return;
-        OBJLoader::Normalize(trisA);
-        OBJLoader::Normalize(trisB);
+        if (!LoadNormalized(pathA, trisA)) return;
+        if (!LoadNormalized(pathB, trisB)) return;
 
         auto ptsA = MeshSampler::Sample(trisA, particleCount);
         auto ptsB = MeshSampler::Sample(trisB, particleCount);
@@ -1205,13 +874,7 @@ void Window::ComputeOTAndSpawnParticles() {
         auto endPts = GreedyDiscreteOT(ptsA, ptsB);
 
         // Place particles directly at mesh A surface positions
-        particleSystem->particles.clear();
-        particleSystem->transportPositions = ptsA;
-        for (const auto& pos : ptsA) {
-            Particle p(particleSystem->particleRadius);
-            p.position = pos;
-            particleSystem->particles.push_back(p);
-        }
+        particleSystem->SpawnAt(ptsA);
 
         animator->InitializeWithEndPoints(ptsA, endPts);
         particleSystem->useOTPositions = true;
@@ -1221,22 +884,19 @@ void Window::ComputeOTAndSpawnParticles() {
     } else {
         // === Gaussian OT (mesh → Gaussian or blob → blob) ===
         if (hasMeshA) {
-            if (!LoadMeshGaussian(pathA.c_str(), sampleCount, gaussianA)) return;
+            if (!LoadMeshGaussian(pathA, sampleCount, gaussianA)) return;
         } else {
-            gaussianA->mean       = Eigen::Vector3d::Zero();
-            gaussianA->covariance = blobCovariance;
+            SetBlob(*gaussianA);
         }
 
         if (hasMeshB) {
-            if (!LoadMeshGaussian(pathB.c_str(), sampleCount, gaussianB)) return;
+            if (!LoadMeshGaussian(pathB, sampleCount, gaussianB)) return;
         } else {
-            gaussianB->mean       = Eigen::Vector3d::Zero();
-            gaussianB->covariance = blobCovariance;
+            SetBlob(*gaussianB);
         }
 
         delete otMap;
-        otMap         = new OTMap(OptimalTransport::Compute(*gaussianA, *gaussianB));
-        otMapComputed = true;
+        otMap = new OTMap(OptimalTransport::Compute(*gaussianA, *gaussianB));
 
         particleSystem->SpawnFromGaussian(*gaussianA, particleCount);
         animator->Initialize(particleSystem->transportPositions, *otMap);
@@ -1264,8 +924,7 @@ static const int kMaxTemplateFaces = 40000;
 // Load, normalize, weld, close small holes, orient outward.
 static bool LoadMorphMesh(const std::string& path, IndexedMesh& m, TopologyInfo& info) {
     std::vector<Triangle> tris;
-    if (!OBJLoader::Load(path.c_str(), tris)) return false;
-    OBJLoader::Normalize(tris);
+    if (!LoadNormalized(path, tris)) return false;
     MeshTopology::Build(tris, m);
     int filled = MeshTopology::FillSmallHoles(m, 40);
     MeshTopology::OrientOutward(m);
@@ -1313,7 +972,6 @@ void Window::BakeTrueMorph(const std::string& pathA, const std::string& pathB) {
     gaussianB->FitFromPoints(MeshSampler::Sample(trisB, sampleCount));
     delete otMap;
     otMap = new OTMap(OptimalTransport::Compute(*gaussianA, *gaussianB));
-    otMapComputed = true;
 
     char buf[512];
     if (shared) {
@@ -1375,7 +1033,6 @@ void Window::BakeTrueMorph(const std::string& pathA, const std::string& pathB) {
     g_morphShown        = MorphShown::None;
     g_lastSdfT          = -1.0f;
     trueMorphActive     = true;
-    meshMorphActive     = false;
     particleMorphActive = false;
     UpdateTrueMorph();
 }
@@ -1422,14 +1079,12 @@ void Window::UpdateTrueMorph() {
     }
 }
 
-// Draw a mesh selector combo: first entry is the blob default, rest are scanned .obj files.
 // Stop every morph and any splat bake still running, so the display goes back
 // to the static preview of the current source. Used by Clear, mode switches
 // and source changes.
 static void StopAllMorphs() {
     Window::animator->Reset();
     Window::particleSystem->useOTPositions = false;
-    Window::meshMorphActive     = false;
     Window::trueMorphActive     = false;
     Window::particleMorphActive = false;
     g_splatBakeEpoch++;   // a bake still running is discarded
@@ -1605,16 +1260,11 @@ void Window::keyCallback(GLFWwindow* window, int key, int scancode, int action, 
 }
 
 void Window::mouse_callback(GLFWwindow* window, int button, int action, int mods) {
-    if (button == GLFW_MOUSE_BUTTON_LEFT) {
-        if(!ImGui::GetIO().WantCaptureMouse){
-            LeftDown = (action == GLFW_PRESS);
-        }
-    }
-    if (button == GLFW_MOUSE_BUTTON_RIGHT) {
-        if(!ImGui::GetIO().WantCaptureMouse){
-            RightDown = (action == GLFW_PRESS);
-        }
-    }
+    // Only start a drag outside the GUI, but always end it, even when the
+    // button is released over a GUI window.
+    bool down = (action == GLFW_PRESS) && !ImGui::GetIO().WantCaptureMouse;
+    if (button == GLFW_MOUSE_BUTTON_LEFT)  LeftDown  = down;
+    if (button == GLFW_MOUSE_BUTTON_RIGHT) RightDown = down;
 }
 
 void Window::cursor_callback(GLFWwindow* window, double currX, double currY) {

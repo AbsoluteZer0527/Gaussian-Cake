@@ -38,21 +38,23 @@ GLuint LoadSingleShader(const char* shaderFilePath, ShaderType type) {
     glShaderSource(shaderID, 1, &sourcePointer, NULL);
     glCompileShader(shaderID);
 
-    // Check Shader.
+    // Check Shader. A non-empty log can be just warnings, so the status decides.
     glGetShaderiv(shaderID, GL_COMPILE_STATUS, &Result);
     glGetShaderiv(shaderID, GL_INFO_LOG_LENGTH, &InfoLogLength);
-    if (InfoLogLength > 0) {
+    if (InfoLogLength > 1) {
         std::vector<char> shaderErrorMessage(InfoLogLength + 1);
         glGetShaderInfoLog(shaderID, InfoLogLength, NULL, shaderErrorMessage.data());
-        std::string msg(shaderErrorMessage.begin(), shaderErrorMessage.end());
-        std::cerr << msg << std::endl;
-        return 0;
-    } else {
-        if (type == vertex)
-            printf("Successfully compiled vertex shader!\n");
-        else if (type == fragment)
-            printf("Successfully compiled fragment shader!\n");
+        std::cerr << shaderErrorMessage.data() << std::endl;
     }
+    if (Result != GL_TRUE) {
+        glDeleteShader(shaderID);
+        return 0;
+    }
+
+    if (type == vertex)
+        printf("Successfully compiled vertex shader!\n");
+    else if (type == fragment)
+        printf("Successfully compiled fragment shader!\n");
 
     return shaderID;
 }
@@ -63,7 +65,11 @@ GLuint LoadShaders(const char* vertexFilePath, const char* fragmentFilePath) {
     GLuint fragmentShaderID = LoadSingleShader(fragmentFilePath, fragment);
 
     // Check both shaders.
-    if (vertexShaderID == 0 || fragmentShaderID == 0) return 0;
+    if (vertexShaderID == 0 || fragmentShaderID == 0) {
+        if (vertexShaderID)   glDeleteShader(vertexShaderID);
+        if (fragmentShaderID) glDeleteShader(fragmentShaderID);
+        return 0;
+    }
 
     GLint Result = GL_FALSE;
     int InfoLogLength;
@@ -78,15 +84,10 @@ GLuint LoadShaders(const char* vertexFilePath, const char* fragmentFilePath) {
     // Check the program.
     glGetProgramiv(programID, GL_LINK_STATUS, &Result);
     glGetProgramiv(programID, GL_INFO_LOG_LENGTH, &InfoLogLength);
-    if (InfoLogLength > 0) {
+    if (InfoLogLength > 1) {
         std::vector<char> ProgramErrorMessage(InfoLogLength + 1);
         glGetProgramInfoLog(programID, InfoLogLength, NULL, ProgramErrorMessage.data());
-        std::string msg(ProgramErrorMessage.begin(), ProgramErrorMessage.end());
-        std::cerr << msg << std::endl;
-        glDeleteProgram(programID);
-        return 0;
-    } else {
-        printf("Successfully linked program!\n");
+        std::cerr << ProgramErrorMessage.data() << std::endl;
     }
 
     // Detach and delete the shaders as they are no longer needed.
@@ -94,6 +95,12 @@ GLuint LoadShaders(const char* vertexFilePath, const char* fragmentFilePath) {
     glDetachShader(programID, fragmentShaderID);
     glDeleteShader(vertexShaderID);
     glDeleteShader(fragmentShaderID);
+
+    if (Result != GL_TRUE) {
+        glDeleteProgram(programID);
+        return 0;
+    }
+    printf("Successfully linked program!\n");
 
     return programID;
 }

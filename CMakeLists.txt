@@ -7,7 +7,6 @@ set(
     SOURCES
     main.cpp
     src/Camera.cpp
-    src/Cube.cpp
     src/Shader.cpp
     src/Window.cpp
     src/imgui_widgets.cpp
@@ -39,7 +38,6 @@ set(
     HEADERS
     include/core.h
     include/Camera.h
-    include/Cube.h
     include/Shader.h
     include/Window.h
 )
@@ -81,5 +79,3 @@ if(EXISTS "${CMAKE_SOURCE_DIR}/meshes")
     )
     add_dependencies(${PROJECT_NAME} CopyMeshes)
 endif()
-
-add_dependencies(menv CopyMeshes)

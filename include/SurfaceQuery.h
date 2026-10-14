@@ -1,6 +1,7 @@
 #pragma once
 #include "core.h"
 #include "OBJLoader.h"
+#include <algorithm>
 #include <vector>
 
 // Closest point on triangle (a, b, c) to p.
@@ -55,6 +56,18 @@ class PointGrid {
 public:
     void Build(const std::vector<glm::vec3>& points, float cellSize);
     int  Nearest(const glm::vec3& q) const;   // index into the points, -1 if empty
+
+    // Calls f(i) for every point in the 3x3x3 block of cells around q's cell.
+    template <typename F>
+    void ForEachNear(const glm::vec3& q, F f) const {
+        glm::ivec3 c0 = Cell(q);
+        for (int z = std::max(0, c0.z - 1); z <= std::min(nz - 1, c0.z + 1); ++z)
+        for (int y = std::max(0, c0.y - 1); y <= std::min(ny - 1, c0.y + 1); ++y)
+        for (int x = std::max(0, c0.x - 1); x <= std::min(nx - 1, c0.x + 1); ++x) {
+            int c = (z * ny + y) * nx + x;
+            for (int k = cellStart[c]; k < cellStart[c + 1]; ++k) f(cellItems[k]);
+        }
+    }
 
 private:
     std::vector<glm::vec3> pts;

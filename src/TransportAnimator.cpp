@@ -85,7 +85,7 @@ float TransportAnimator::ApplyEasing(float t) const {
             return t;
 
         case EasingMode::EASE_IN_OUT:
-            // Smoothstep: slow start, fast middle, slow end
+            // Quadratic ease-in-out: slow start, fast middle, slow end
             return t < 0.5f
                 ? 2.0f * t * t
                 : 1.0f - std::pow(-2.0f * t + 2.0f, 2.0f) / 2.0f;

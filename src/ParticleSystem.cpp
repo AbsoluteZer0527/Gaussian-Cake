@@ -1,24 +1,24 @@
 #include "ParticleSystem.h"
 #include <glm/gtc/type_ptr.hpp>
-#include "imgui.h"
 
 ParticleSystem::ParticleSystem() {
     particleRadius = 0.03f;
     useOTPositions = false;
 }
 
-void ParticleSystem::SpawnFromGaussian(const Gaussian& g, int N, unsigned int seed) {
+void ParticleSystem::SpawnAt(const std::vector<glm::vec3>& points) {
     particles.clear();
-    transportPositions.clear();
-
-    auto pts = g.Sample(N, seed);
-    for (const auto& pos : pts) {
+    for (const auto& pos : points) {
         Particle p(particleRadius);
         p.position = pos;
         particles.push_back(p);
-        transportPositions.push_back(pos);
     }
+    transportPositions = points;
     useOTPositions = false;
+}
+
+void ParticleSystem::SpawnFromGaussian(const Gaussian& g, int N, unsigned int seed) {
+    SpawnAt(g.Sample(N, seed));
 }
 
 void ParticleSystem::Update(float deltaTime) {
@@ -28,36 +28,22 @@ void ParticleSystem::Update(float deltaTime) {
     }
 }
 
-// DrawSphere has been completely removed.
-
+// Fixed-function points; the projection matrix stays identity, so the whole
+// view-projection goes on the modelview stack.
 void ParticleSystem::Draw(glm::mat4 viewProjection) {
-    // 1. Disable lighting to save calculation time
-    glDisable(GL_LIGHTING);
     glEnable(GL_DEPTH_TEST);
 
-    // 2. Load the matrix ONCE, not per-particle
     glMatrixMode(GL_MODELVIEW);
-    glLoadMatrixf(glm::value_ptr(viewProjection)); 
+    glLoadMatrixf(glm::value_ptr(viewProjection));
 
-    // Set color once
-    glColor3f(0.0f, 0.0f, 0.0f); // warm golden-orange
+    glColor3f(0.0f, 0.0f, 0.0f);
 
-    // 3. Map your world-space radius to pixel-space point size. 
-    // You may need to adjust the multiplier (e.g., 100.0f) depending on your window size.
-    glPointSize(particleRadius * 100.0f); 
+    // world-space radius -> pixel point size (rough, independent of distance)
+    glPointSize(particleRadius * 100.0f);
 
-    // 4. Draw all particles in a single batch
     glBegin(GL_POINTS);
     for (const Particle& p : particles) {
         glVertex3f(p.position.x, p.position.y, p.position.z);
     }
     glEnd();
-}
-
-void ParticleSystem::DrawGUI() {
-    ImGui::Begin("Particle System");
-    ImGui::Text("Active Particles: %d", (int)particles.size());
-    // Adjusted the slider max slightly so the points don't get too massive in pixel space
-    ImGui::SliderFloat("Particle Radius", &particleRadius, 0.01f, 0.5f); 
-    ImGui::End();
 }

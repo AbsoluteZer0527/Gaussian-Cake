@@ -1,7 +1,6 @@
 #pragma once
 
 #include "Camera.h"
-#include "Cube.h"
 #include "Shader.h"
 #include "core.h"
 #include "ParticleSystem.h"
@@ -15,10 +14,9 @@
 #include <vector>
 
 enum class RenderMode {
-    TriangleMorph = 0,  // default: one surface morphing A -> B (shared topology or SDF)
-    Particles     = 1,  // legacy: floating dot cloud
+    TriangleMorph = 0,  // one surface morphing A -> B (shared topology or SDF)
+    Particles     = 1,  // point cloud carried by Gaussian / greedy discrete OT
     Splats        = 2,  // surface-aligned 3D Gaussian splats + mixture OT
-    Crossfade     = 3,  // legacy: two OT-snapped meshes alpha-blended
 };
 
 // How TriangleMorph builds the in-between surfaces.
@@ -38,18 +36,9 @@ public:
 
     // Objects to render
     static ParticleSystem* particleSystem;
-    static MeshRenderer*   meshRenderer;         // source-topology mesh
-    static MeshRenderer*   meshRendererTarget;   // target-topology mesh (Option B)
+    static MeshRenderer*   meshRenderer;
 
-    // Render mode: triangle-mesh morph (default) or legacy particles
     static RenderMode renderMode;
-
-    // Triangle-morph state: source-mesh vertex positions and OT-mapped destinations.
-    // These are lerp'd each frame by idleCallback and pushed to meshRenderer.
-    static std::vector<glm::vec3>    meshStartPositions;   // source per-frame buffer
-    static std::vector<glm::vec3>    meshEndPositions;     // source OT-mapped destinations
-    static std::vector<unsigned int> meshIndices;
-    static bool                      meshMorphActive;
 
     // True morph (TriangleMorph mode): one surface, A at t = 0, B at t = 1.
     static MorphMethod morphMethod;
@@ -57,14 +46,6 @@ public:
     static float       fitStiffness;     // multiplier on the template-fit stiffness schedule
     static bool        trueMorphActive;
     static std::string morphStatus;      // which method ran, and why
-
-    // Option B (dual mesh): parallel target-topology state.
-    // Target mesh animates from OT^-1(target_verts) at t=0 → target_verts at t=1,
-    // in sync with the source mesh's animation timeline.
-    static std::vector<glm::vec3>    meshTargetStart;      // T^-1 mapped target verts
-    static std::vector<glm::vec3>    meshTargetEnd;        // actual target vertices
-    static std::vector<glm::vec3>    meshTargetCurrent;    // per-frame lerp buffer
-    static std::vector<unsigned int> meshTargetIndices;
 
     // Splat mode: one splat set travels from A's surface to B's surface.
     // splatStart[i] (on A) is matched one-to-one with splatEnd[i] (on B), so
@@ -87,7 +68,6 @@ public:
     static Gaussian* gaussianB;
     static OTMap* otMap;
     static TransportAnimator* animator;
-    static bool otMapComputed;
     static bool particleMorphActive;   // particle transport owns the animator
     static int particleCount;
 
@@ -96,9 +76,7 @@ public:
     static std::vector<std::string> meshPaths;  // full relative paths
     static int meshIndexA;
     static int meshIndexB;
-    static int   sampleCount;       // points sampled from mesh surface
-    static int   subdivisionLevel;  // midpoint subdivision passes on source mesh (0 = none)
-    static float crossfadeStart;    // normalized time [0,1] when the alpha crossfade begins
+    static int sampleCount;       // points sampled from mesh surface
 
     // Shader Program
     static GLuint shaderProgram;

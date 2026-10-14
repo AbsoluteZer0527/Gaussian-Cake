@@ -81,22 +81,3 @@ std::vector<glm::vec3> Gaussian::Sample(int N, unsigned int seed) const {
 
     return result;
 }
-
-void Gaussian::GetEigenDecomposition(Eigen::Vector3d& eigenvalues, Eigen::Matrix3d& eigenvectors) const{
-    Eigen::SelfAdjointEigenSolver<Eigen::Matrix3d> solver(covariance);
-    eigenvalues=solver.eigenvalues();
-    eigenvectors=solver.eigenvectors();
-}
-
-glm::vec3 Gaussian::GetMeanGLM() const {
-    return glm::vec3((float)mean(0), (float)mean(1), (float)mean(2));
-}
-
-
-glm::mat3 Gaussian::GetCovarianceGLM() const {
-    glm::mat3 m;
-    for (int col = 0; col < 3; col++)
-        for (int row = 0; row < 3; row++)
-            m[col][row] = (float)covariance(row, col);
-    return m;
-}

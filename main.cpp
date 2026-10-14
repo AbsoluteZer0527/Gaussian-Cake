@@ -31,18 +31,8 @@ void setup_opengl_settings() {
     glDepthFunc(GL_LEQUAL);
     // Set polygon drawing mode to fill front and back of each polygon.
     glPolygonMode(GL_FRONT_AND_BACK, GL_FILL);
-    // Set clear color to black.
-    glClearColor(0.0, 0.0, 0.0, 0.0);
-    //ligihting
-    glEnable(GL_PROGRAM_POINT_SIZE); // allow vertex shader to set gl_PointSize
-    glEnable(GL_LIGHTING);
-    glEnable(GL_LIGHT0);
-    glEnable(GL_LIGHT1);        
-    glEnable(GL_COLOR_MATERIAL);
-    glColorMaterial(GL_FRONT_AND_BACK, GL_AMBIENT_AND_DIFFUSE); 
-    glShadeModel(GL_SMOOTH);    
-
-    glLightModeli(GL_LIGHT_MODEL_TWO_SIDE, GL_TRUE);
+    // Set clear color to white.
+    glClearColor(1.0f, 1.0f, 1.0f, 1.0f);
 }
 
 void print_versions() {
