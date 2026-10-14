@@ -8,9 +8,15 @@
 ### Model Morphing: Shared Topology & Gaussian Splatting
 Two new OT morphing mode were building on top of the Original Gaussian Cake.
 
+
+https://github.com/user-attachments/assets/98e52f4b-2f6b-402d-9be6-54df5fd2eb13
+
+
 **Topology Mode**: We first check whether the two models have the sharing topology first, then we uses OT to determine the path for the two mesh's triangle topology and morph into another shape. It uses mesh with more faces as the template, and fits that topology to the other model and show the morph animation.If they don't share the same topology, such as mismatch or different number of genus, it will use the SDF path instead.
 
 SDF: in-between shapes are aligned by two lerp: M_t = (1−t)·I + t·T, making each model a signed distance field and match the surfaces.
+
+https://github.com/user-attachments/assets/53793805-99b7-4744-a415-52867123ba84
 
 **Splats Mode**: Each Particles is getting replaced by 3D Gaussian blobs, it stores a center, covariance, color and opacity. Then we applies OT between the mixtures of the two models: we first estimate the moving cost for each blob(Bures cost), and matches them after (Sinkhorn), where it shifts and streches each of those blobs to the other location. At the end, we simulate morphing animation and show the cooking.
 
