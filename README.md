@@ -4,19 +4,22 @@
 <img width="2100" height="1247" alt="Screenshot 2026-04-05 005843" src="https://github.com/user-attachments/assets/c7f926b8-0df9-4d66-8b2c-34ff7d3b350e" />
 <img width="1544" height="1029" alt="image" src="https://github.com/user-attachments/assets/dcbf13d9-b03c-4d5f-9efe-094bd0207caf" />
 
-## Update 7/11/26
-### Model Morphing: Dual-mesh triangle morph
+## Update 10/13/26
+### Model Morphing: Shared Topology & Gaussian Splatting
+Two new OT morphing mode were building on top of the Original Gaussian Cake.
 
-The particle cloud is replaced by two animated triangle meshes that crossfade as they morph — giving the impression of one solid surface reshaping into another.
+**Topology Mode**: We first check whether the two models have the sharing topology first, then we uses OT to determine the path for the two mesh's triangle topology and morph into another shape. It uses mesh with more faces as the template, and fits that topology to the other model and show the morph animation.If they don't share the same topology, such as mismatch or different number of genus, it will use the SDF path instead.
 
-Both OBJ files are loaded and normalized to `[-1, 1]³`. Point clouds sampled from each surface are used to fit Gaussians and compute the closed-form Bures/W₂ OT map: `T(x) = μ_B + A(x − μ_A)`. Every source vertex is displaced by `T` to get its morph endpoint. Then it projects each endpoint to the nearest point on any target triangle, giving sub-triangle precision with no collapse artifacts. The algorithm (Ericson, *Real-Time Collision Detection* §5.1.5) classifies the query point into one of 7 Voronoi regions around the triangle using ~6 dot-product sign tests, returning the exact closest point on the surface.
+SDF: in-between shapes are aligned by two lerp: M_t = (1−t)·I + t·T, making each model a signed distance field and match the surfaces.
 
-So The idea that it still uses Guassian Sampling + OT, which gives this model morphing effect. However it is still not visually perfect with complex mesh models.
+**Splats Mode**: Each Particles is getting replaced by 3D Gaussian blobs, it stores a center, covariance, color and opacity. Then we applies OT between the mixtures of the two models: we first estimate the moving cost for each blob(Bures cost), and matches them after (Sinkhorn), where it shifts and streches each of those blobs to the other location. At the end, we simulate morphing animation and show the cooking.
 
-Side Functionalities:
-- Delayed alpha crossfade: Less jarring morphing.
-- More mode toggles (Triangle Morph / Particles), snap mode dropdown (None / Nearest Sample / Nearest Triangle), crossfade start slider, subdivision level, and mesh sample count.
+References: 
+Chen, Georgiou, Tannenbaum 2019, Optimal Transport for Gaussian Mixture Models. arXiv:1710.07876
 
+Dowson & Landau 1982, The Fréchet distance between multivariate normal distributions doi:10.1016/0047-259X(82)90077-X 
+
+Peyré & Cuturi 2019, Computational Optimal Transport. arXiv:1803.00567
 
 ## Inspiration
 This project is inspired by the mathematical problem of **Optimal Transport (OT)**, which seeks a mapping between two distributions that minimizes a specified transport cost. 
