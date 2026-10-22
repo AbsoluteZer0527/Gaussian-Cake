@@ -1,0 +1,13 @@
+#version 430
+// Pass 4 (a single thread): turn the index counter into the draw command.
+// Slots past the buffer end were skipped, and the written ones are exactly
+// the first floor(indexCap / 6) quads, so clamp to that.
+layout(local_size_x = 1) in;
+
+void main() {
+    drawCount     = min(indexCount, (indexCap / 6u) * 6u);
+    instanceCount = 1u;
+    firstIndex    = 0u;
+    baseVertex    = 0;
+    baseInstance  = 0u;
+}

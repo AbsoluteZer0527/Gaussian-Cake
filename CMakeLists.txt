@@ -31,6 +31,8 @@ set(
     src/GaussianMixture.cpp
     src/SplatGenerator.cpp
     src/SplatRenderer.cpp
+    src/GpuSDFMorph.cpp
+    src/PlyLoader.cpp
 )
 
 # Add header files

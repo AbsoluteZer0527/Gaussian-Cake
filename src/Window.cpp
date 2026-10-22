@@ -11,6 +11,8 @@
 #include "SurfaceQuery.h"
 #include "MeshFitter.h"
 #include "SDFMorph.h"
+#include "GpuSDFMorph.h"
+#include "GpuTimer.h"
 
 #include <glm/gtc/quaternion.hpp>
 #include <chrono>
@@ -44,17 +46,47 @@ MorphMethod Window::morphMethod     = MorphMethod::Auto;
 int         Window::sdfResolution   = 64;
 float       Window::fitStiffness    = 1.0f;
 bool        Window::trueMorphActive = false;
+bool        Window::morphBaking     = false;
 std::string Window::morphStatus;
+
+//GPU playback
+bool Window::gpuAvailable = false;
+bool Window::useGpu       = false;
 
 // Real endpoint meshes (shown exactly at t = 0 and t = 1) and the in-between data.
 static IndexedMesh               g_morphA, g_morphB;
 static bool                      g_morphShared = false;   // shared topology vs SDF
-static std::vector<glm::vec3>    g_sharedStart, g_sharedEnd, g_sharedCurrent;
+static std::vector<glm::vec3>    g_sharedStart, g_sharedEnd;
+static std::vector<glm::vec3>    g_sharedCurrent;         // CPU path only
 static std::vector<unsigned int> g_sharedIndices;
 static SDFMorph                  g_sdfMorph;
+static GpuSDFMorph*              g_gpuSdf   = nullptr;    // GPU copy of g_sdfMorph
+static bool                      g_sdfOnGpu = false;      // the in-between SDF surface lives on the GPU
 enum class MorphShown { None, A, Blend, B };
 static MorphShown                g_morphShown = MorphShown::None;
 static float                     g_lastSdfT   = -1.0f;
+
+// Performance readout: smoothed CPU times (ms) and GPU timers
+static double    g_cpuUpdateMs = -1.0;   // idleCallback
+static double    g_cpuDrawMs   = -1.0;   // submitting this frame's scene draw
+static GpuTimer* g_morphTimer  = nullptr;   // SDF extraction on the GPU
+static GpuTimer* g_drawTimer   = nullptr;   // the scene draw (except GPU splats, timed by the renderer)
+static std::string g_verifyText;
+
+static void SmoothMs(double& avg, double sample) {
+    avg = (avg < 0.0) ? sample : 0.9 * avg + 0.1 * sample;
+}
+
+static double MsSince(std::chrono::steady_clock::time_point t0) {
+    return std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+}
+
+// Splat attributes for this frame on the GPU path (computed in idleCallback)
+static float g_splatE = 0.0f, g_splatG = 0.0f, g_splatGrow = 1.0f;
+
+static bool SplatsOnGpu() {
+    return Window::useGpu && Window::gpuAvailable && Window::splatRenderer->HasKeyframes();
+}
 
 //Splat mode state
 SplatRenderer*     Window::splatRenderer = nullptr;
@@ -90,6 +122,7 @@ int MouseX, MouseY;
 
 //The shader program id
 GLuint Window::shaderProgram;
+GLuint Window::morphProgram = 0;
 
 // Default blob: isotropic unit 3D Gaussian at the origin
 static void SetBlob(Gaussian& g) {
@@ -184,8 +217,9 @@ static void ScanMeshes() {
 // Constructors and desctructors
 bool Window::initializeProgram() {
     shaderProgram = LoadShaders("shaders/shader.vert", "shaders/shader.frag");
+    morphProgram  = LoadShaders("shaders/morph.vert", "shaders/shader.frag");
 
-    if (!shaderProgram) {
+    if (!shaderProgram || !morphProgram) {
         std::cerr << "Failed to initialize shader program" << std::endl;
         return false;
     }
@@ -207,6 +241,16 @@ bool Window::initializeObjects() {
     meshRenderer   = new MeshRenderer();
     splatRenderer  = new SplatRenderer();
     if (!splatRenderer->Initialize()) return false;
+
+    // GPU playback needs compute shaders (OpenGL 4.3); without them every
+    // mode stays on its CPU path.
+    g_gpuSdf      = new GpuSDFMorph();
+    g_morphTimer  = new GpuTimer();
+    g_drawTimer   = new GpuTimer();
+    gpuAvailable  = GpuComputeAvailable() && g_gpuSdf->Init() && splatRenderer->InitializeGpu();
+    useGpu        = gpuAvailable;
+    std::cout << "[GPU] compute playback "
+              << (gpuAvailable ? "available" : "unavailable (needs OpenGL 4.3), using the CPU paths") << "\n";
 
     gaussianA = new Gaussian();
     gaussianB = new Gaussian();
@@ -233,11 +277,15 @@ void Window::cleanUp() {
     delete meshRenderer;
     delete splatRenderer;
     delete g_previewMesh;
+    delete g_gpuSdf;
+    delete g_morphTimer;
+    delete g_drawTimer;
     delete gaussianA;
     delete gaussianB;
     delete otMap;
     delete animator;
     glDeleteProgram(shaderProgram);
+    glDeleteProgram(morphProgram);
 }
 
 //window settings
@@ -292,7 +340,9 @@ void Window::idleCallback() {
 
     deltaTime = glm::min(deltaTime, 0.05f);
 
+    auto cpuStart = std::chrono::steady_clock::now();
     PollSplatBake();
+    PollTrueMorphBake();
 
     if (splatMorphActive) {
         // Animator only drives the timeline here; splat attributes are
@@ -314,7 +364,13 @@ void Window::idleCallback() {
         float g = std::pow(std::max(e, 0.0f), 1.0f + 4.0f * splatCohesion);
         bool smooth = splatSmoothDisp.size() == splatCurrent.size();
 
-        for (size_t i = 0; i < splatCurrent.size(); ++i) {
+        // GPU path: splat_prep.comp runs the loop below for every splat
+        g_splatE = e;
+        g_splatG = g;
+        g_splatGrow = grow;
+        size_t cpuCount = SplatsOnGpu() ? 0 : splatCurrent.size();
+
+        for (size_t i = 0; i < cpuCount; ++i) {
             const Splat& a = splatStart[i];
             const Splat& b = splatEnd[i];
             Splat& s = splatCurrent[i];
@@ -339,16 +395,29 @@ void Window::idleCallback() {
 
     // after the animator, so particles show this frame's transport positions
     particleSystem->Update(deltaTime);
+    SmoothMs(g_cpuUpdateMs, MsSince(cpuStart));
 }
 
 void Window::displayCallback(GLFWwindow* window) {
     glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
 
+    // GPU splats time their own passes (timer queries can't nest)
+    bool gpuSplats = renderMode == RenderMode::Splats && splatMorphActive && SplatsOnGpu();
+    auto cpuStart = std::chrono::steady_clock::now();
+    if (!gpuSplats) g_drawTimer->Begin();
+
     if (renderMode == RenderMode::Splats) {
         if (!splatMorphActive) UpdateSplatPreview();
-        splatRenderer->Draw(splatCurrent, Cam->GetViewMtx(), Cam->GetProjectMtx());
+        if (gpuSplats)
+            splatRenderer->DrawMorph(g_splatE, g_splatG, g_splatGrow, Cam->GetViewMtx(), Cam->GetProjectMtx());
+        else
+            splatRenderer->Draw(splatCurrent, Cam->GetViewMtx(), Cam->GetProjectMtx());
     } else if (renderMode == RenderMode::TriangleMorph && trueMorphActive) {
-        meshRenderer->Draw(shaderProgram, Cam->GetViewProjectMtx());
+        if (g_sdfOnGpu && g_morphShown == MorphShown::Blend)
+            g_gpuSdf->Draw(shaderProgram, Cam->GetViewProjectMtx(), meshRenderer->diffuseColor);
+        else
+            meshRenderer->Draw(meshRenderer->IsMorphTarget() ? morphProgram : shaderProgram,
+                               Cam->GetViewProjectMtx());
     } else if (renderMode == RenderMode::TriangleMorph && meshIndexA > 0) {
         // Topology preview: the source mesh as a solid surface
         UpdateModePreview();
@@ -358,6 +427,9 @@ void Window::displayCallback(GLFWwindow* window) {
         if (!particleMorphActive) UpdateModePreview();
         particleSystem->Draw(Cam->GetViewProjectMtx());
     }
+
+    if (!gpuSplats) g_drawTimer->End();
+    SmoothMs(g_cpuDrawMs, MsSince(cpuStart));
 
     ImGui_ImplOpenGL3_NewFrame();
     ImGui_ImplGlfw_NewFrame();
@@ -439,6 +511,12 @@ static const char* kBakeStageNames[] = {
     "Loading meshes", "Fitting mixtures", "Solving OT plan",
     "Mapping splats", "Matching splats", "Smoothing paths", "Done"
 };
+static const char* kMorphStageNames[] = {
+    "Loading meshes", "Fitting Gaussians", "Building the morph", "Done"
+};
+// Progress labels of the bake that is running (splat or topology)
+static const char* const* g_stageNames = kBakeStageNames;
+static int g_stageCount = 6;
 static const int kSplatNeighbors = 8;   // k for the cohesion smoothing graph
 static std::atomic<int> g_bakeStage{0};
 static std::atomic<int> g_bakeDone{0};
@@ -744,11 +822,11 @@ static SplatBakeResult RunSplatBake(SplatBakeSettings st) {
 }
 
 static std::future<SplatBakeResult> g_bakeFuture;
-static int g_splatBakeEpoch  = 0;   // bumped by Clear / leaving Splats mode
+static int g_bakeEpoch  = 0;   // bumped by Clear / mode switches; a running bake is then dropped
 static int g_bakeLaunchEpoch = 0;   // epoch when the running bake started
 
 void Window::BakeSplatMorph(const std::string& pathA, const std::string& pathB) {
-    if (splatBaking) return;
+    if (splatBaking || morphBaking) return;
 
     SplatBakeSettings st;
     st.pathA         = pathA;
@@ -760,9 +838,11 @@ void Window::BakeSplatMorph(const std::string& pathA, const std::string& pathB) 
     st.sinkhornEps   = sinkhornEps;
     st.posteriorTemp = posteriorTemp;
 
+    g_stageNames = kBakeStageNames;
+    g_stageCount = 6;
     SetBakeStage(0, 1);
     splatBaking  = true;
-    g_bakeLaunchEpoch = g_splatBakeEpoch;
+    g_bakeLaunchEpoch = g_bakeEpoch;
     g_bakeFuture = std::async(std::launch::async, RunSplatBake, st);
 }
 
@@ -785,12 +865,15 @@ void Window::PollSplatBake() {
         return;
     }
     // user pressed Clear or left Splats mode while the bake was running
-    if (g_bakeLaunchEpoch != g_splatBakeEpoch || renderMode != RenderMode::Splats) return;
+    if (g_bakeLaunchEpoch != g_bakeEpoch || renderMode != RenderMode::Splats) return;
 
     splatStart   = std::move(res.start);
     splatEnd        = std::move(res.end);
     splatSmoothDisp = std::move(res.smoothDisp);
     splatCurrent    = splatStart;
+
+    // GPU path: the keyframes go up once; each frame then only sends the time
+    if (gpuAvailable) splatRenderer->UploadKeyframes(splatStart, splatEnd, splatSmoothDisp);
 
     // The animator only provides the timeline (easing, duration, state)
     animator->InitializeWithEndPoints({}, {});
@@ -954,35 +1037,66 @@ static std::string TopologyMismatch(const TopologyInfo& a, const std::string& na
     return "";
 }
 
-void Window::BakeTrueMorph(const std::string& pathA, const std::string& pathB) {
-    TopologyInfo infoA, infoB;
-    if (!LoadMorphMesh(pathA, g_morphA, infoA)) return;
-    if (!LoadMorphMesh(pathB, g_morphB, infoB)) return;
-    std::string nameA = std::filesystem::path(pathA).filename().string();
-    std::string nameB = std::filesystem::path(pathB).filename().string();
+// Everything a topology bake needs, copied when Bake is clicked so GUI
+// changes during the bake can't affect it.
+struct TrueMorphSettings {
+    std::string pathA, pathB;
+    MorphMethod method;
+    int   sdfResolution, sampleCount;
+    float fitStiffness;
+};
 
-    std::vector<Triangle> trisA = MeshTopology::ToTriangles(g_morphA);
-    std::vector<Triangle> trisB = MeshTopology::ToTriangles(g_morphB);
+struct TrueMorphResult {
+    bool ok = false;
+    IndexedMesh a, b;                    // cleaned endpoint meshes
+    bool shared = false;
+    std::vector<unsigned int> sharedIndices;
+    std::vector<glm::vec3>    sharedStart, sharedEnd;
+    SDFMorph sdf;
+    int sdfVertCap = 0, sdfIndexCap = 0; // GPU buffer sizes that fit every frame (with room)
+    Gaussian gA, gB;
+    OTMap map;
+    std::string status;
+};
+
+// The slow part of a topology bake. Runs on a background thread, so it only
+// touches its own data (no GL, no Window state).
+static TrueMorphResult RunTrueMorphBake(TrueMorphSettings st) {
+    TrueMorphResult res;
+    auto t0 = std::chrono::steady_clock::now();
+
+    SetBakeStage(0, 2);
+    TopologyInfo infoA, infoB;
+    if (!LoadMorphMesh(st.pathA, res.a, infoA)) return res;
+    g_bakeDone++;
+    if (!LoadMorphMesh(st.pathB, res.b, infoB)) return res;
+    g_bakeDone++;
+    std::string nameA = std::filesystem::path(st.pathA).filename().string();
+    std::string nameB = std::filesystem::path(st.pathB).filename().string();
+
+    std::vector<Triangle> trisA = MeshTopology::ToTriangles(res.a);
+    std::vector<Triangle> trisB = MeshTopology::ToTriangles(res.b);
 
     std::string mismatch = TopologyMismatch(infoA, nameA, infoB, nameB);
-    bool shared = (morphMethod == MorphMethod::SharedTopology) ||
-                  (morphMethod == MorphMethod::Auto && mismatch.empty());
+    res.shared = (st.method == MorphMethod::SharedTopology) ||
+                 (st.method == MorphMethod::Auto && mismatch.empty());
 
-    gaussianA->FitFromPoints(MeshSampler::Sample(trisA, sampleCount));
-    gaussianB->FitFromPoints(MeshSampler::Sample(trisB, sampleCount));
-    delete otMap;
-    otMap = new OTMap(OptimalTransport::Compute(*gaussianA, *gaussianB));
+    SetBakeStage(1, 1);
+    res.gA.FitFromPoints(MeshSampler::Sample(trisA, st.sampleCount));
+    res.gB.FitFromPoints(MeshSampler::Sample(trisB, st.sampleCount));
+    res.map = OptimalTransport::Compute(res.gA, res.gB);
 
+    SetBakeStage(2, 1);
     char buf[512];
-    if (shared) {
+    if (res.shared) {
         // The template is the mesh with more faces, unless it is too big to fit
         // quickly; then the smaller one is subdivided up to a similar size.
-        bool templateIsA = g_morphA.FaceCount() >= g_morphB.FaceCount();
-        if ((templateIsA ? g_morphA : g_morphB).FaceCount() > kMaxTemplateFaces)
+        bool templateIsA = res.a.FaceCount() >= res.b.FaceCount();
+        if ((templateIsA ? res.a : res.b).FaceCount() > kMaxTemplateFaces)
             templateIsA = !templateIsA;
-        const IndexedMesh& other = templateIsA ? g_morphB : g_morphA;
+        const IndexedMesh& other = templateIsA ? res.b : res.a;
 
-        IndexedMesh tmpl = templateIsA ? g_morphA : g_morphB;
+        IndexedMesh tmpl = templateIsA ? res.a : res.b;
         bool subdivided = false;
         while (tmpl.FaceCount() * 4 <= kMaxTemplateFaces && tmpl.FaceCount() < other.FaceCount()) {
             std::vector<Triangle> t = MeshTopology::ToTriangles(tmpl);
@@ -992,23 +1106,20 @@ void Window::BakeTrueMorph(const std::string& pathA, const std::string& pathB) {
         }
 
         // Rough affine alignment by the Gaussian OT map, template -> target
-        OTMap toTarget = templateIsA ? *otMap
-                                     : OptimalTransport::Compute(*gaussianB, *gaussianA);
+        OTMap toTarget = templateIsA ? res.map : OptimalTransport::Compute(res.gB, res.gA);
         std::vector<glm::vec3> aligned(tmpl.verts.size());
         for (size_t i = 0; i < aligned.size(); ++i)
             aligned[i] = OptimalTransport::Apply(toTarget, tmpl.verts[i]);
 
         FitParams params;
-        params.stiffnessScale = fitStiffness;
+        params.stiffnessScale = st.fitStiffness;
         FitStats stats;
         std::vector<glm::vec3> fitted = MeshFitter::Fit(tmpl, aligned,
                                                         templateIsA ? trisB : trisA, params, &stats);
 
-        g_sharedIndices = tmpl.indices;
-        g_sharedStart   = templateIsA ? tmpl.verts : fitted;
-        g_sharedEnd     = templateIsA ? fitted : tmpl.verts;
-        g_sharedCurrent = g_sharedStart;
-        g_morphShared   = true;
+        res.sharedIndices = tmpl.indices;
+        res.sharedStart   = templateIsA ? tmpl.verts : fitted;
+        res.sharedEnd     = templateIsA ? fitted : tmpl.verts;
 
         snprintf(buf, sizeof(buf),
                  "Shared topology: %s (%d tris%s) fitted onto %s in %.0f ms. "
@@ -1018,29 +1129,119 @@ void Window::BakeTrueMorph(const std::string& pathA, const std::string& pathB) {
                  stats.ms, stats.meanDist, stats.flipped,
                  mismatch.empty() ? "" : " Warning: ", mismatch.c_str());
     } else {
-        g_sdfMorph.Build(trisA, trisB, *otMap, sdfResolution);
-        g_morphShared = false;
+        res.sdf.Build(trisA, trisB, res.map, st.sdfResolution);
+
+        // Size the GPU buffers from a few CPU extractions, with room to spare
+        size_t maxVerts = 0, maxIndices = 0;
+        for (float t : { 0.0f, 0.5f, 1.0f }) {
+            std::vector<glm::vec3> v;
+            std::vector<unsigned int> idx;
+            res.sdf.Extract(t, v, idx);
+            maxVerts   = std::max(maxVerts, v.size());
+            maxIndices = std::max(maxIndices, idx.size());
+        }
+        res.sdfVertCap  = (int)(2 * maxVerts + 1024);
+        res.sdfIndexCap = (int)(2 * maxIndices + 6 * 1024);
+
         snprintf(buf, sizeof(buf), "SDF morph (%d^3 grid) built in %.0f ms%s%s",
-                 sdfResolution, g_sdfMorph.buildMs,
+                 st.sdfResolution, res.sdf.buildMs,
                  mismatch.empty() ? "" : ": ", mismatch.c_str());
     }
-    morphStatus = buf;
-    std::cout << "[Morph] " << morphStatus << "\n";
+    res.status = buf;
+    SetBakeStage(3, 1);
+    std::cout << "[Morph] " << res.status << " (bake " << (int)MsSince(t0) << " ms)\n";
+    res.ok = true;
+    return res;
+}
+
+static std::future<TrueMorphResult> g_morphFuture;
+
+// Starts the topology bake on a background thread; PollTrueMorphBake picks
+// up the result, so the UI keeps running meanwhile.
+void Window::BakeTrueMorph(const std::string& pathA, const std::string& pathB) {
+    if (splatBaking || morphBaking) return;
+
+    TrueMorphSettings st;
+    st.pathA         = pathA;
+    st.pathB         = pathB;
+    st.method        = morphMethod;
+    st.sdfResolution = sdfResolution;
+    st.sampleCount   = sampleCount;
+    st.fitStiffness  = fitStiffness;
+
+    g_stageNames = kMorphStageNames;
+    g_stageCount = 3;
+    SetBakeStage(0, 1);
+    morphBaking       = true;
+    trueMorphActive   = false;
+    g_bakeLaunchEpoch = g_bakeEpoch;
+    g_morphFuture     = std::async(std::launch::async, RunTrueMorphBake, st);
+}
+
+// Called every frame: when the topology bake has finished, take its result,
+// upload what the GPU path needs and start the animation (main thread only,
+// since it makes GL calls).
+void Window::PollTrueMorphBake() {
+    if (!morphBaking || !g_morphFuture.valid()) return;
+    if (g_morphFuture.wait_for(std::chrono::seconds(0)) != std::future_status::ready) return;
+
+    morphBaking = false;
+    TrueMorphResult res;
+    try {
+        res = g_morphFuture.get();
+    } catch (const std::exception& ex) {
+        morphStatus = std::string("Bake failed: ") + ex.what();
+        std::cerr << "[Morph] " << morphStatus << "\n";
+        return;
+    }
+    if (!res.ok) {
+        morphStatus = "Bake failed: could not load meshes";
+        return;
+    }
+    // user pressed Clear or left Topology mode while the bake was running
+    if (g_bakeLaunchEpoch != g_bakeEpoch || renderMode != RenderMode::TriangleMorph) return;
+
+    g_morphA       = std::move(res.a);
+    g_morphB       = std::move(res.b);
+    g_morphShared  = res.shared;
+    g_sharedIndices = std::move(res.sharedIndices);
+    g_sharedStart   = std::move(res.sharedStart);
+    g_sharedEnd     = std::move(res.sharedEnd);
+    g_sharedCurrent = g_sharedStart;
+    if (!res.shared) {
+        g_sdfMorph = std::move(res.sdf);
+        if (gpuAvailable) g_gpuSdf->Upload(g_sdfMorph, res.sdfVertCap, res.sdfIndexCap);
+    }
+    *gaussianA = res.gA;
+    *gaussianB = res.gB;
+    delete otMap;
+    otMap = new OTMap(res.map);
+    morphStatus = res.status;
 
     // The animator only provides the timeline (easing, duration, state)
     animator->InitializeWithEndPoints({}, {});
     animator->StartTransport();
     g_morphShown        = MorphShown::None;
     g_lastSdfT          = -1.0f;
+    g_sdfOnGpu          = false;
     trueMorphActive     = true;
     particleMorphActive = false;
     UpdateTrueMorph();
 }
 
-// Pushes this frame's surface to meshRenderer: the real A or B mesh at the
-// ends of the timeline, the in-between surface everywhere else.
+// Gets this frame's surface ready to draw: the real A or B mesh at the ends
+// of the timeline, the in-between surface everywhere else.
+//   Shared topology, GPU: both shapes are uploaded once, the vertex shader
+//     blends them (morph.vert); per frame only morphT changes.
+//   SDF, GPU: GpuSDFMorph re-meshes in compute shaders, drawn indirectly.
+//   CPU paths (useGpu off or no GL 4.3): the original lerp / surface nets.
 void Window::UpdateTrueMorph() {
     float e = animator->GetBlend();
+    bool gpu = useGpu && gpuAvailable;
+
+    // counts from a few frames ago; re-mesh if the GPU buffers had to grow
+    if (!g_morphShared && g_gpuSdf->IsReady() && g_gpuSdf->PollStats())
+        g_lastSdfT = -1.0f;
 
     MorphShown want = MorphShown::Blend;
     if (e <= 0.0f && !animator->IsTransporting())
@@ -1058,28 +1259,82 @@ void Window::UpdateTrueMorph() {
     }
 
     if (g_morphShared) {
+        if (gpu) {
+            if (g_morphShown != MorphShown::Blend || !meshRenderer->IsMorphTarget()) {
+                meshRenderer->InitializeMorph(g_sharedStart, g_sharedEnd, g_sharedIndices);
+                g_morphShown = MorphShown::Blend;
+            }
+            meshRenderer->morphT = e;
+            return;
+        }
         for (size_t i = 0; i < g_sharedCurrent.size(); ++i)
             g_sharedCurrent[i] = g_sharedStart[i] + e * (g_sharedEnd[i] - g_sharedStart[i]);
-        if (g_morphShown != MorphShown::Blend) {
+        if (g_morphShown != MorphShown::Blend || meshRenderer->IsMorphTarget()) {
             meshRenderer->Initialize(g_sharedCurrent, g_sharedIndices);
             g_morphShown = MorphShown::Blend;
         } else {
             meshRenderer->UpdatePositions(g_sharedCurrent);
         }
+        return;
+    }
+
+    // SDF: re-mesh only when t moved (bounce easing can overshoot; clamp it)
+    float t = glm::clamp(e, 0.0f, 1.0f);
+    bool onGpu = gpu && g_gpuSdf->IsReady();
+    if (g_morphShown == MorphShown::Blend && t == g_lastSdfT && onGpu == g_sdfOnGpu) return;
+    if (onGpu) {
+        g_morphTimer->Begin();
+        g_gpuSdf->Extract(t);
+        g_morphTimer->End();
     } else {
-        // re-mesh only when t moved (bounce easing can overshoot; clamp it)
-        float t = glm::clamp(e, 0.0f, 1.0f);
-        if (g_morphShown == MorphShown::Blend && t == g_lastSdfT) return;
         std::vector<glm::vec3> verts;
         std::vector<unsigned int> indices;
         g_sdfMorph.Extract(t, verts, indices);
         if (!indices.empty()) meshRenderer->Initialize(verts, indices);
-        g_morphShown = MorphShown::Blend;
-        g_lastSdfT   = t;
     }
+    g_sdfOnGpu   = onGpu;
+    g_morphShown = MorphShown::Blend;
+    g_lastSdfT   = t;
 }
 
-// Stop every morph and any splat bake still running, so the display goes back
+// Checks the GPU path against the CPU one at the current state (reads GPU
+// results back, so it stalls; only for the Verify button).
+static void VerifyGpuAgainstCpu() {
+    char buf[256];
+    if (Window::renderMode == RenderMode::TriangleMorph && Window::trueMorphActive) {
+        if (g_morphShared) {
+            g_verifyText = "Shared topology: both paths compute start + t (end - start) per vertex "
+                           "(GPU in morph.vert), nothing to read back.";
+            return;
+        }
+        if (!g_gpuSdf->IsReady()) { g_verifyText = "GPU SDF not uploaded."; return; }
+        float t = (g_lastSdfT >= 0.0f) ? g_lastSdfT : 0.5f;
+        g_gpuSdf->Extract(t);
+        int gv, gt;
+        bool overflow;
+        g_gpuSdf->ReadCountsNow(gv, gt, overflow);
+        std::vector<glm::vec3> verts;
+        std::vector<unsigned int> indices;
+        g_sdfMorph.Extract(t, verts, indices);
+        int cv = (int)verts.size(), ct = (int)indices.size() / 3;
+        snprintf(buf, sizeof(buf), "SDF t=%.3f: GPU %d verts / %d tris, CPU %d / %d (%+.2f%% tris)%s",
+                 t, gv, gt, cv, ct, ct ? 100.0 * (gt - ct) / ct : 0.0,
+                 overflow ? ", GPU overflowed" : "");
+        g_lastSdfT = -1.0f;   // re-extract normally next frame
+    } else if (Window::renderMode == RenderMode::Splats && Window::splatMorphActive && SplatsOnGpu()) {
+        std::vector<uint32_t> keys;
+        bool ok = Window::splatRenderer->CheckGpuSortOrder(&keys);
+        size_t culled = std::count(keys.begin(), keys.end(), 0xFFFFFFFFu);
+        snprintf(buf, sizeof(buf), "GPU sort %s: %zu splats, back to front, each once (%zu culled)",
+                 ok ? "OK" : "FAILED", keys.size(), culled);
+    } else {
+        snprintf(buf, sizeof(buf), "Bake a Topology (SDF) or Splats morph with GPU playback on first.");
+    }
+    g_verifyText = buf;
+    std::cout << "[Verify] " << g_verifyText << "\n";
+}
+
+// Stop every morph and drop any bake still running, so the display goes back
 // to the static preview of the current source. Used by Clear, mode switches
 // and source changes.
 static void StopAllMorphs() {
@@ -1087,7 +1342,7 @@ static void StopAllMorphs() {
     Window::particleSystem->useOTPositions = false;
     Window::trueMorphActive     = false;
     Window::particleMorphActive = false;
-    g_splatBakeEpoch++;   // a bake still running is discarded
+    g_bakeEpoch++;   // a bake still running is discarded
     if (Window::splatMorphActive) {
         Window::splatMorphActive = false;
         splatPreviewGen++;
@@ -1143,7 +1398,8 @@ void Window::DrawMainGUI() {
 
     bool hasA = meshIndexA > 0, hasB = meshIndexB > 0;
     bool needsMeshes = renderMode != RenderMode::Particles;
-    bool canBake = !splatBaking && (!needsMeshes || (hasA && hasB));
+    bool baking  = splatBaking || morphBaking;
+    bool canBake = !baking && (!needsMeshes || (hasA && hasB));
 
     // ---- 3. Transport ----
     ImGui::SeparatorText("Transport");
@@ -1159,7 +1415,7 @@ void Window::DrawMainGUI() {
     ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImVec4(1.0f, 0.6f, 0.8f, 1.0f));
     ImGui::PushStyleColor(ImGuiCol_ButtonActive,  ImVec4(0.8f, 0.2f, 0.5f, 1.0f));
     ImGui::BeginDisabled(!canBake);
-    if (ImGui::Button(splatBaking ? "Baking..." : "Bake It!", ImVec2(bakeW, 0)))
+    if (ImGui::Button(baking ? "Baking..." : "Bake It!", ImVec2(bakeW, 0)))
         ComputeOTAndSpawnParticles();
     ImGui::EndDisabled();
     ImGui::PopStyleColor(3);
@@ -1180,11 +1436,12 @@ void Window::DrawMainGUI() {
         ImGui::TextColored(ImVec4(1.0f, 0.55f, 0.4f, 1.0f), "Pick a mesh for both A and B to bake.");
 
     // Status: bake progress while baking, then the timeline position
-    if (splatBaking) {
+    if (baking) {
         int stage = g_bakeStage.load();
         float frac = (float)g_bakeDone.load() / (float)g_bakeTotal.load();
         char label[64];
-        snprintf(label, sizeof(label), "%s (%d/6)", kBakeStageNames[stage], std::min(stage + 1, 6));
+        snprintf(label, sizeof(label), "%s (%d/%d)", g_stageNames[stage],
+                 std::min(stage + 1, g_stageCount), g_stageCount);
         ImGui::ProgressBar(glm::clamp(frac, 0.0f, 1.0f), ImVec2(-1, 0), label);
     } else {
         animator->DrawStatusGUI();
@@ -1212,10 +1469,10 @@ void Window::DrawMainGUI() {
                                                                   "Distance-field blend: any genus / parts");
             ImGui::SliderFloat("Fit Stiffness", &fitStiffness, 0.1f, 10.0f, "%.2f", ImGuiSliderFlags_Logarithmic);
             ImGui::SetItemTooltip("Shared topology: how stiffly the template keeps its shape while fitting");
-            ImGui::SliderInt("SDF Resolution", &sdfResolution, 32, 128);
+            ImGui::SliderInt("SDF Resolution", &sdfResolution, 32, 160);
             ImGui::SetItemTooltip("SDF: grid points per axis (higher = finer, slower)");
         } else {
-            ImGui::SliderInt("Splats", &splatCount, 1000, 50000);
+            ImGui::SliderInt("Splats", &splatCount, 1000, 500000, "%d", ImGuiSliderFlags_Logarithmic);
             ImGui::SliderFloat("Splat Size", &splatSizeMul, 0.3f, 3.0f);
             ImGui::SliderFloat("Cohesion", &splatCohesion, 0.0f, 1.0f);
             ImGui::SetItemTooltip("0 = every splat flies straight\n1 = neighbours move together as chunks");
@@ -1228,6 +1485,58 @@ void Window::DrawMainGUI() {
         }
         ImGui::SliderInt("Mesh Samples", &sampleCount, 500, 20000);
         ImGui::SetItemTooltip("Surface points used to fit the Gaussians for the OT map");
+    }
+
+    // ---- 5. Performance ----
+    if (ImGui::CollapsingHeader("Performance")) {
+        ImGui::BeginDisabled(!gpuAvailable);
+        if (ImGui::Checkbox("GPU playback", &useGpu)) {
+            g_morphShown = MorphShown::None;   // rebuild the current frame on the other path
+            g_lastSdfT   = -1.0f;
+        }
+        ImGui::EndDisabled();
+        ImGui::SetItemTooltip(gpuAvailable
+            ? "On: per-frame morph work runs on the GPU (vertex/compute shaders).\nOff: the CPU path, for comparison."
+            : "Needs OpenGL 4.3 (compute shaders)");
+
+        auto ms = [](double v) {
+            static char buf[4][32];
+            static int k = 0;
+            k = (k + 1) % 4;
+            if (v < 0.0) snprintf(buf[k], sizeof(buf[k]), "-");
+            else         snprintf(buf[k], sizeof(buf[k]), "%.3f ms", v);
+            return buf[k];
+        };
+        ImGui::Text("Frame        %.2f ms (%.0f FPS)", 1000.0f / ImGui::GetIO().Framerate,
+                    ImGui::GetIO().Framerate);
+        ImGui::Text("CPU update   %s", ms(g_cpuUpdateMs));
+        ImGui::Text("CPU draw     %s", ms(g_cpuDrawMs));
+        bool gpuSplats = renderMode == RenderMode::Splats && splatMorphActive && SplatsOnGpu();
+        if (gpuSplats) {
+            ImGui::Text("GPU prep+sort %s", ms(splatRenderer->PrepSortMs()));
+            ImGui::Text("GPU draw     %s", ms(splatRenderer->DrawMs()));
+        } else {
+            if (renderMode == RenderMode::TriangleMorph && trueMorphActive && !g_morphShared)
+                ImGui::Text("GPU re-mesh  %s", g_sdfOnGpu ? ms(g_morphTimer->Ms()) : "- (CPU)");
+            ImGui::Text("GPU draw     %s", ms(g_drawTimer->Ms()));
+        }
+        if (renderMode == RenderMode::TriangleMorph && trueMorphActive) {
+            bool gpuMesh = g_sdfOnGpu && g_morphShown == MorphShown::Blend;
+            ImGui::Text("Surface      %d verts, %d tris",
+                        gpuMesh ? g_gpuSdf->LastVertexCount() : meshRenderer->VertexCount(),
+                        gpuMesh ? g_gpuSdf->LastTriangleCount() : meshRenderer->TriangleCount());
+        } else if (renderMode == RenderMode::Splats) {
+            ImGui::Text("Splats       %d", gpuSplats ? (int)splatStart.size() : (int)splatCurrent.size());
+        }
+
+        if (ImGui::Button("Verify GPU vs CPU")) VerifyGpuAgainstCpu();
+        ImGui::SetItemTooltip("Topology (SDF): compare GPU and CPU mesh sizes at this t\n"
+                              "Splats: check the GPU depth sort");
+        if (!g_verifyText.empty()) {
+            ImGui::PushStyleColor(ImGuiCol_Text, ImGui::GetStyleColorVec4(ImGuiCol_TextDisabled));
+            ImGui::TextWrapped("%s", g_verifyText.c_str());
+            ImGui::PopStyleColor();
+        }
     }
 
     ImGui::Spacing();

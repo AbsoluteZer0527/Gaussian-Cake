@@ -1,0 +1,18 @@
+#version 430
+// Radix step 1, histogram: each block counts how many of its keys have each
+// digit value (256 "mail bins").
+layout(local_size_x = 256) in;
+
+shared uint sCount[kRadix];
+
+void main() {
+    uint tid = gl_LocalInvocationID.x, block = gl_WorkGroupID.x;
+    sCount[tid] = 0u;
+    barrier();
+    for (uint c = 0u; c < kItems; ++c) {
+        uint i = block * kBlock + c * kThreads + tid;
+        if (i < count) atomicAdd(sCount[Digit(keysIn[i])], 1u);
+    }
+    barrier();
+    hist[tid * numBlocks + block] = sCount[tid];
+}

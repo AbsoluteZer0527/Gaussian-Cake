@@ -5,15 +5,26 @@
 
 MeshRenderer::MeshRenderer()
     : diffuseColor(0.72f, 0.72f, 0.74f),  // default neutral gray
-      alpha(1.0f),
-      isInitialized(false), vao(0), vboPos(0), vboNorm(0), ebo(0),
-      vertexCount(0), indexCount(0) {}
+      alpha(1.0f), morphT(0.0f),
+      isInitialized(false), vao(0), vboPos(0), vboNorm(0), vboPosEnd(0), vboNormEnd(0), ebo(0),
+      vertexCount(0), indexCount(0), morphTarget(false) {}
 
 MeshRenderer::~MeshRenderer() {
-    if (vao)     glDeleteVertexArrays(1, &vao);
-    if (vboPos)  glDeleteBuffers(1, &vboPos);
-    if (vboNorm) glDeleteBuffers(1, &vboNorm);
-    if (ebo)     glDeleteBuffers(1, &ebo);
+    if (vao)        glDeleteVertexArrays(1, &vao);
+    if (vboPos)     glDeleteBuffers(1, &vboPos);
+    if (vboNorm)    glDeleteBuffers(1, &vboNorm);
+    if (vboPosEnd)  glDeleteBuffers(1, &vboPosEnd);
+    if (vboNormEnd) glDeleteBuffers(1, &vboNormEnd);
+    if (ebo)        glDeleteBuffers(1, &ebo);
+}
+
+// Upload one vec3 attribute buffer and bind it to a vertex attribute location
+// (the VAO must be bound).
+void MeshRenderer::Upload(GLuint vbo, GLuint location, const std::vector<glm::vec3>& data) {
+    glBindBuffer(GL_ARRAY_BUFFER, vbo);
+    glBufferData(GL_ARRAY_BUFFER, data.size() * sizeof(glm::vec3), data.data(), GL_DYNAMIC_DRAW);
+    glEnableVertexAttribArray(location);
+    glVertexAttribPointer(location, 3, GL_FLOAT, GL_FALSE, sizeof(glm::vec3), (void*)0);
 }
 
 void MeshRenderer::Initialize(const std::vector<glm::vec3>& positions,
@@ -26,6 +37,7 @@ void MeshRenderer::Initialize(const std::vector<glm::vec3>& positions,
     vertexCount = (int)positions.size();
     indexCount  = (int)indices.size();
     triIndices  = indices;
+    morphTarget = false;
 
     // Lazy allocation on first use — safe because GL context now exists.
     if (!vao) {
@@ -37,26 +49,13 @@ void MeshRenderer::Initialize(const std::vector<glm::vec3>& positions,
 
     glBindVertexArray(vao);
 
-    // Position buffer at location = 0
-    glBindBuffer(GL_ARRAY_BUFFER, vboPos);
-    glBufferData(GL_ARRAY_BUFFER,
-                 vertexCount * sizeof(glm::vec3),
-                 positions.data(),
-                 GL_DYNAMIC_DRAW);
-    glEnableVertexAttribArray(0);
-    glVertexAttribPointer(0, 3, GL_FLOAT, GL_FALSE, sizeof(glm::vec3), (void*)0);
-
-    // Normal buffer at location = 1 (initialized zero, filled by UpdatePositions)
-    std::vector<glm::vec3> initialNormals(vertexCount, glm::vec3(0.0f, 1.0f, 0.0f));
-    ComputeNormals(positions, initialNormals);
-
-    glBindBuffer(GL_ARRAY_BUFFER, vboNorm);
-    glBufferData(GL_ARRAY_BUFFER,
-                 vertexCount * sizeof(glm::vec3),
-                 initialNormals.data(),
-                 GL_DYNAMIC_DRAW);
-    glEnableVertexAttribArray(1);
-    glVertexAttribPointer(1, 3, GL_FLOAT, GL_FALSE, sizeof(glm::vec3), (void*)0);
+    // Position buffer at location = 0, normals at location = 1
+    std::vector<glm::vec3> normals(vertexCount);
+    ComputeNormals(positions, normals);
+    Upload(vboPos, 0, positions);
+    Upload(vboNorm, 1, normals);
+    glDisableVertexAttribArray(2);
+    glDisableVertexAttribArray(3);
 
     // Triangle indices (topology stays fixed for the entire morph)
     glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, ebo);
@@ -67,6 +66,31 @@ void MeshRenderer::Initialize(const std::vector<glm::vec3>& positions,
 
     glBindVertexArray(0);
     isInitialized = true;
+}
+
+void MeshRenderer::InitializeMorph(const std::vector<glm::vec3>& startPositions,
+                                   const std::vector<glm::vec3>& endPositions,
+                                   const std::vector<unsigned int>& indices) {
+    if (startPositions.size() != endPositions.size()) {
+        std::cerr << "MeshRenderer::InitializeMorph: start/end vertex counts differ\n";
+        return;
+    }
+    Initialize(startPositions, indices);
+    if (!isInitialized) return;
+
+    if (!vboPosEnd) {
+        glGenBuffers(1, &vboPosEnd);
+        glGenBuffers(1, &vboNormEnd);
+    }
+    std::vector<glm::vec3> normals(vertexCount);
+    ComputeNormals(endPositions, normals);
+
+    // End shape at locations 2 (position) and 3 (normal)
+    glBindVertexArray(vao);
+    Upload(vboPosEnd, 2, endPositions);
+    Upload(vboNormEnd, 3, normals);
+    glBindVertexArray(0);
+    morphTarget = true;
 }
 
 void MeshRenderer::UpdatePositions(const std::vector<glm::vec3>& positions) {
@@ -99,11 +123,13 @@ void MeshRenderer::Draw(GLuint shaderProgram, const glm::mat4& viewProj) {
     GLint locM     = glGetUniformLocation(shaderProgram, "model");
     GLint locDiff  = glGetUniformLocation(shaderProgram, "DiffuseColor");
     GLint locAlpha = glGetUniformLocation(shaderProgram, "alpha");
+    GLint locMorph = glGetUniformLocation(shaderProgram, "morphT");
 
     if (locVP    >= 0) glUniformMatrix4fv(locVP,  1, GL_FALSE, glm::value_ptr(viewProj));
     if (locM     >= 0) glUniformMatrix4fv(locM,   1, GL_FALSE, glm::value_ptr(model));
     if (locDiff  >= 0) glUniform3fv(locDiff, 1, glm::value_ptr(diffuseColor));
     if (locAlpha >= 0) glUniform1f(locAlpha, alpha);
+    if (locMorph >= 0) glUniform1f(locMorph, morphT);
 
     glEnable(GL_DEPTH_TEST);
 

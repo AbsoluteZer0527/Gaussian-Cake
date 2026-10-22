@@ -45,7 +45,14 @@ public:
     static int         sdfResolution;    // SDF grid points per axis
     static float       fitStiffness;     // multiplier on the template-fit stiffness schedule
     static bool        trueMorphActive;
+    static bool        morphBaking;      // a background Topology bake is running
     static std::string morphStatus;      // which method ran, and why
+
+    // GPU playback: per-frame morph work in compute shaders (OpenGL 4.3).
+    // gpuAvailable is detected at startup; useGpu can be turned off to
+    // compare against the CPU paths.
+    static bool gpuAvailable;
+    static bool useGpu;
 
     // Splat mode: one splat set travels from A's surface to B's surface.
     // splatStart[i] (on A) is matched one-to-one with splatEnd[i] (on B), so
@@ -80,6 +87,7 @@ public:
 
     // Shader Program
     static GLuint shaderProgram;
+    static GLuint morphProgram;   // morph.vert + shader.frag: GPU blend of two shapes
 
     // Act as Constructors and desctructors
     static bool initializeProgram();
@@ -105,6 +113,7 @@ public:
     // OT pipeline
     static void ComputeOTAndSpawnParticles();
     static void BakeTrueMorph(const std::string& pathA, const std::string& pathB);
+    static void PollTrueMorphBake();
     static void UpdateTrueMorph();
     static void BakeSplatMorph(const std::string& pathA, const std::string& pathB);
     static void UpdateSplatPreview();

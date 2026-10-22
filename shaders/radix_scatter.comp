@@ -1,0 +1,48 @@
+#version 430
+// Radix step 3, scatter: every key moves to its digit's next free slot. The
+// pass must be stable (equal digits keep their order), so the keys of a
+// block go in 4 chunks of 256, and within a chunk each key's rank is the
+// number of earlier keys with the same digit.
+layout(local_size_x = 256) in;
+
+shared uint sOffset[kRadix];   // next free output slot per digit, for this block
+shared uint sDigit[kThreads];
+
+void ScatterChunk(uint c, uint tid, uint block) {
+    uint i = block * kBlock + c * kThreads + tid;
+    bool valid = i < count;
+    uint key = valid ? keysIn[i] : 0u;
+    uint d = valid ? Digit(key) : kRadix;   // kRadix never matches a real digit
+    sDigit[tid] = d;
+    barrier();
+
+    // every thread reads the same sDigit[j] at the same time (a broadcast)
+    uint rank = 0u, same = 0u;
+    for (uint j = 0u; j < kThreads; ++j) {
+        if (sDigit[j] == d) {
+            ++same;
+            if (j < tid) ++rank;
+        }
+    }
+    uint dst = valid ? sOffset[min(d, kRadix - 1u)] + rank : 0u;
+    barrier();   // all reads of sOffset happen before the update below
+
+    if (valid) {
+        keysOut[dst] = key;
+        valsOut[dst] = valsIn[i];
+        if (rank == same - 1u) sOffset[d] += same;   // the last one moves the bin on
+    }
+    barrier();
+}
+
+void main() {
+    uint tid = gl_LocalInvocationID.x, block = gl_WorkGroupID.x;
+    sOffset[tid] = hist[tid * numBlocks + block];
+    barrier();
+
+    // kItems = 4 chunks, written out (some compilers reject barrier() in loops)
+    ScatterChunk(0u, tid, block);
+    ScatterChunk(1u, tid, block);
+    ScatterChunk(2u, tid, block);
+    ScatterChunk(3u, tid, block);
+}

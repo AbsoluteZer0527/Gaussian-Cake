@@ -5,6 +5,15 @@
 #include "imgui_impl_glfw.h"
 #include "imgui_impl_opengl3.h"
 
+#ifdef _WIN32
+// On laptops with two GPUs, ask the NVIDIA / AMD driver to run this program on
+// the discrete GPU instead of the integrated one (the same exports games use).
+extern "C" {
+    __declspec(dllexport) unsigned long NvOptimusEnablement = 1;
+    __declspec(dllexport) int AmdPowerXpressRequestHighPerformance = 1;
+}
+#endif
+
 void error_callback(int error, const char* description) {
     // Print error.
     std::cerr << description << std::endl;

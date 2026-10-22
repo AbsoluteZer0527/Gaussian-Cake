@@ -1,0 +1,39 @@
+#version 430
+// Radix step 2, exclusive prefix sum over the whole histogram (one workgroup):
+// count -> "the first slot this (digit, block) writes to". Each thread sums a
+// run of entries, the 1024 run totals are scanned in shared memory, then each
+// thread writes its run's offsets.
+layout(local_size_x = 1024) in;
+
+shared uint sPart[1024];
+
+// One Hillis-Steele step: add the total `off` places to the left. Written out
+// (not looped) because some compilers reject barrier() inside loops.
+#define SCAN_STEP(off) { \
+    uint v = (tid >= (off)) ? sPart[tid - (off)] : 0u; \
+    barrier(); \
+    sPart[tid] += v; \
+    barrier(); }
+
+void main() {
+    uint tid = gl_LocalInvocationID.x;
+    uint total = kRadix * numBlocks;
+    uint per   = (total + 1023u) / 1024u;
+    uint begin = min(tid * per, total), end = min(begin + per, total);
+
+    uint sum = 0u;
+    for (uint i = begin; i < end; ++i) sum += hist[i];
+    sPart[tid] = sum;
+    barrier();
+
+    // inclusive scan of the run totals (Hillis-Steele)
+    SCAN_STEP(1u)   SCAN_STEP(2u)   SCAN_STEP(4u)   SCAN_STEP(8u)   SCAN_STEP(16u)
+    SCAN_STEP(32u)  SCAN_STEP(64u)  SCAN_STEP(128u) SCAN_STEP(256u) SCAN_STEP(512u)
+
+    uint run = sPart[tid] - sum;   // exclusive: everything before this run
+    for (uint i = begin; i < end; ++i) {
+        uint x = hist[i];
+        hist[i] = run;
+        run += x;
+    }
+}

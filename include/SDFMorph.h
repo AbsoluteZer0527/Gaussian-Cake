@@ -35,6 +35,10 @@ public:
                  std::vector<unsigned int>& outIndices) const;
 
     bool   IsBuilt() const { return built; }
+    const SDFGrid&   GridA() const { return gridA; }
+    const SDFGrid&   GridB() const { return gridB; }
+    const glm::mat3& MapMatrix() const { return A; }
+    const glm::vec3& MapOffset() const { return b; }
     double buildMs = 0.0;
     mutable double lastExtractMs = 0.0;
 

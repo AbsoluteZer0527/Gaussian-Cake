@@ -1,0 +1,36 @@
+#version 430
+// Pass 3: one quad per grid edge with a sign change, joining the 4 cells
+// around that edge, wound so the normal points from inside (phi < 0) to
+// outside. One thread per grid point checks its +x, +y and +z edges.
+layout(local_size_x = 4, local_size_y = 4, local_size_z = 4) in;
+
+void EmitQuad(ivec3 c0, ivec3 c1, ivec3 c2, ivec3 c3, bool flip) {
+    int v0 = cellVert[CellId(c0)], v1 = cellVert[CellId(c1)];
+    int v2 = cellVert[CellId(c2)], v3 = cellVert[CellId(c3)];
+    if (v0 < 0 || v1 < 0 || v2 < 0 || v3 < 0) return;
+    if (flip) { int tmp = v1; v1 = v3; v3 = tmp; }
+
+    uint slot = atomicAdd(indexCount, 6u);
+    if (slot + 6u > indexCap) { overflow = 1u; return; }
+    indices[slot + 0u] = uint(v0); indices[slot + 1u] = uint(v1); indices[slot + 2u] = uint(v2);
+    indices[slot + 3u] = uint(v0); indices[slot + 4u] = uint(v2); indices[slot + 5u] = uint(v3);
+}
+
+bool Inside(ivec3 p) { return field[PointId(p)] < 0.0; }
+
+void main() {
+    ivec3 p = ivec3(gl_GlobalInvocationID);
+    if (any(greaterThanEqual(p, ivec3(n)))) return;
+    int i = p.x, j = p.y, k = p.z, c = n - 1;
+    bool in0 = Inside(p);
+
+    // x-edge: cells in the (y, z) plane, CCW about +x
+    if (i + 1 < n && j >= 1 && k >= 1 && j < c && k < c && in0 != Inside(p + ivec3(1, 0, 0)))
+        EmitQuad(ivec3(i, j - 1, k - 1), ivec3(i, j, k - 1), ivec3(i, j, k), ivec3(i, j - 1, k), !in0);
+    // y-edge: cells in the (z, x) plane, CCW about +y
+    if (j + 1 < n && i >= 1 && k >= 1 && i < c && k < c && in0 != Inside(p + ivec3(0, 1, 0)))
+        EmitQuad(ivec3(i - 1, j, k - 1), ivec3(i - 1, j, k), ivec3(i, j, k), ivec3(i, j, k - 1), !in0);
+    // z-edge: cells in the (x, y) plane, CCW about +z
+    if (k + 1 < n && i >= 1 && j >= 1 && i < c && j < c && in0 != Inside(p + ivec3(0, 0, 1)))
+        EmitQuad(ivec3(i - 1, j - 1, k), ivec3(i, j - 1, k), ivec3(i, j, k), ivec3(i - 1, j, k), !in0);
+}

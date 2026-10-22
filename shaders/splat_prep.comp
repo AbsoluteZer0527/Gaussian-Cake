@@ -1,0 +1,127 @@
+#version 430
+// One thread per splat: interpolate it at the current time (the same math as
+// the CPU loop in Window::idleCallback), then project it to a 2D screen-space
+// Gaussian (the same EWA math as splat.vert) and write a depth sort key.
+// Doing the projection here, once per splat, means the vertex shader only
+// has to place the quad's four corners.
+layout(local_size_x = 256) in;
+
+struct SplatKeyframes {
+    vec4 meanA, meanB;           // xyz
+    vec4 rotA, rotB;             // quaternion (x, y, z, w)
+    vec4 logScaleA, logScaleB;   // xyz = log(scale), w = opacity
+    vec4 colorA, colorB;         // rgb
+    vec4 smoothDisp;             // xyz: neighbour-averaged displacement
+};
+struct Prepared {
+    vec4 clip;                   // clip-space center
+    vec4 conicRadius;            // inverse 2D covariance (xx, xy, yy), quad radius in pixels (0 = culled)
+    vec4 color;                  // rgba
+};
+
+layout(std430, binding = 0) readonly  buffer Keyframes { SplatKeyframes keyframes[]; };
+layout(std430, binding = 1) writeonly buffer Prep      { Prepared prep[]; };
+layout(std430, binding = 2) writeonly buffer SortKeys  { uint sortKeys[]; };
+layout(std430, binding = 3) writeonly buffer SortVals  { uint sortVals[]; };
+
+uniform uint  count;
+uniform float e;          // eased time
+uniform float g;          // cohesion: how much of each splat's own correction is applied
+uniform float grow;       // mid-flight size boost
+uniform int   hasSmooth;
+uniform mat4  view;
+uniform mat4  proj;
+uniform vec2  viewport;   // pixels
+
+// glm::slerp: shortest path, plain lerp when the two are nearly equal
+vec4 Slerp(vec4 x, vec4 y, float a) {
+    float c = dot(x, y);
+    if (c < 0.0) { y = -y; c = -c; }
+    if (c > 1.0 - 1.1920929e-7) return mix(x, y, a);
+    float angle = acos(c);
+    return (sin((1.0 - a) * angle) * x + sin(a * angle) * y) / sin(angle);
+}
+
+// glm::mat3_cast for q = (x, y, z, w)
+mat3 QuatToMat(vec4 q) {
+    float xx = q.x * q.x, yy = q.y * q.y, zz = q.z * q.z;
+    float xy = q.x * q.y, xz = q.x * q.z, yz = q.y * q.z;
+    float wx = q.w * q.x, wy = q.w * q.y, wz = q.w * q.z;
+    return mat3(1.0 - 2.0 * (yy + zz), 2.0 * (xy + wz),       2.0 * (xz - wy),
+                2.0 * (xy - wz),       1.0 - 2.0 * (xx + zz), 2.0 * (yz + wx),
+                2.0 * (xz + wy),       2.0 * (yz - wx),       1.0 - 2.0 * (xx + yy));
+}
+
+// Float -> uint whose integer order is the float's order (flip all bits of
+// negatives, only the sign bit of positives).
+uint SortableBits(float f) {
+    uint u = floatBitsToUint(f);
+    return u ^ (((u >> 31) != 0u) ? 0xFFFFFFFFu : 0x80000000u);
+}
+
+void Cull(uint i) {
+    prep[i] = Prepared(vec4(0.0, 0.0, 2.0, 1.0), vec4(0.0), vec4(0.0));
+    sortKeys[i] = 0xFFFFFFFFu;   // sorts last
+    sortVals[i] = i;
+}
+
+void main() {
+    uint i = gl_GlobalInvocationID.x;
+    if (i >= count) return;
+    SplatKeyframes k = keyframes[i];
+
+    // ---- interpolate (Window::idleCallback) ----
+    vec3 a = k.meanA.xyz, b = k.meanB.xyz;
+    vec3 mean;
+    if (hasSmooth != 0) {
+        vec3 sd = k.smoothDisp.xyz;
+        mean = a + e * sd + g * ((b - a) - sd);
+    } else {
+        mean = mix(a, b, e);
+    }
+    vec4  rot     = Slerp(k.rotA, k.rotB, e);
+    vec3  scale   = grow * exp(mix(k.logScaleA.xyz, k.logScaleB.xyz, e));
+    vec3  color   = mix(k.colorA.rgb, k.colorB.rgb, e);
+    float opacity = mix(k.logScaleA.w, k.logScaleB.w, e);
+
+    // Sigma = (R S)(R S)^T
+    mat3 M = QuatToMat(rot) * mat3(scale.x, 0.0, 0.0, 0.0, scale.y, 0.0, 0.0, 0.0, scale.z);
+    mat3 Sigma = M * transpose(M);
+
+    // ---- project (splat.vert) ----
+    vec4 tv = view * vec4(mean, 1.0);
+    float tz = -tv.z;
+    if (tz < 0.05 || opacity < 1.0 / 255.0) { Cull(i); return; }
+
+    float fx = proj[0][0] * viewport.x * 0.5;
+    float fy = proj[1][1] * viewport.y * 0.5;
+    float limX = 1.3 / proj[0][0];
+    float limY = 1.3 / proj[1][1];
+    float tx = clamp(tv.x / tz, -limX, limX) * tz;
+    float ty = clamp(tv.y / tz, -limY, limY) * tz;
+    mat3 J = mat3(fx / tz, 0.0, 0.0,
+                  0.0, fy / tz, 0.0,
+                  fx * tx / (tz * tz), fy * ty / (tz * tz), 0.0);
+    mat3 T = J * mat3(view);
+    mat3 cov2d = T * Sigma * transpose(T);
+
+    float ca = cov2d[0][0] + 0.3;
+    float cb = cov2d[0][1];
+    float cc = cov2d[1][1] + 0.3;
+    float det = ca * cc - cb * cb;
+    if (det <= 0.0) { Cull(i); return; }
+
+    float mid = 0.5 * (ca + cc);
+    float lambda1 = mid + sqrt(max(0.1, mid * mid - det));
+    float radius = 3.0 * sqrt(lambda1);
+
+    vec4 clip = proj * tv;
+    // off screen, even counting the quad's size
+    vec2 ndc = clip.xy / clip.w;
+    vec2 rNdc = 2.0 * radius / viewport;
+    if (any(greaterThan(abs(ndc), vec2(1.0) + rNdc))) { Cull(i); return; }
+
+    prep[i] = Prepared(clip, vec4(vec3(cc, -cb, ca) / det, radius), vec4(color, opacity));
+    sortKeys[i] = SortableBits(tv.z);   // most negative z = farthest = drawn first
+    sortVals[i] = i;
+}
