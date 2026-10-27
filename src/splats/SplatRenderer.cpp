@@ -152,7 +152,7 @@ struct GpuSplatKeyframes {
     glm::vec4 rotA, rotB;             // (x, y, z, w)
     glm::vec4 logScaleA, logScaleB;   // w = opacity
     glm::vec4 colorA, colorB;
-    glm::vec4 smoothDisp;
+    glm::vec4 smoothDisp;             // w = halfway stretch factor
 };
 static const size_t kPreparedBytes = 12 * sizeof(float);   // Prepared in splat_prep.comp
 static const GLuint kSortBlock = 1024;                     // kBlock in radix_common.glsl
@@ -198,8 +198,12 @@ static GLuint MakeStorage(size_t bytes, const void* data = nullptr) {
 }
 
 void SplatRenderer::UploadKeyframes(const std::vector<Splat>& start, const std::vector<Splat>& end,
-                                    const std::vector<glm::vec3>& smoothDisp) {
+                                    const std::vector<glm::vec3>& smoothDisp,
+                                    const std::vector<float>& stretch) {
     ReleaseGpuBuffers();
+    // the timers averaged the old set; PerfModel must not pair them with the new count
+    prepTimer.Reset();
+    drawTimer.Reset();
     const size_t n = std::min(start.size(), end.size());
     if (n == 0 || !InitializeGpu()) return;
     gpuHasSmooth = smoothDisp.size() == n;
@@ -218,7 +222,8 @@ void SplatRenderer::UploadKeyframes(const std::vector<Splat>& start, const std::
         k[i].logScaleB  = glm::vec4(glm::log(b.scale), b.opacity);
         k[i].colorA     = glm::vec4(a.color, 1.0f);
         k[i].colorB     = glm::vec4(b.color, 1.0f);
-        k[i].smoothDisp = glm::vec4(gpuHasSmooth ? smoothDisp[i] : glm::vec3(0.0f), 0.0f);
+        float s = (stretch.size() == n) ? stretch[i] : 1.0f;
+        k[i].smoothDisp = glm::vec4(gpuHasSmooth ? smoothDisp[i] : glm::vec3(0.0f), s);
     }
 
     const GLuint blocks = (GLuint)((n + kSortBlock - 1) / kSortBlock);
@@ -258,7 +263,7 @@ void SplatRenderer::SortByDepth() {
     }
 }
 
-void SplatRenderer::DrawMorph(float e, float g, float grow,
+void SplatRenderer::DrawMorph(float e, float g, float grow, float stretchOn,
                               const glm::mat4& view, const glm::mat4& proj) {
     if (!HasKeyframes()) return;
     GLint vp[4];
@@ -272,6 +277,7 @@ void SplatRenderer::DrawMorph(float e, float g, float grow,
     glUniform1f(glGetUniformLocation(progPrep, "e"), e);
     glUniform1f(glGetUniformLocation(progPrep, "g"), g);
     glUniform1f(glGetUniformLocation(progPrep, "grow"), grow);
+    glUniform1f(glGetUniformLocation(progPrep, "stretchOn"), stretchOn);
     glUniform1i(glGetUniformLocation(progPrep, "hasSmooth"), gpuHasSmooth ? 1 : 0);
     glUniformMatrix4fv(glGetUniformLocation(progPrep, "view"), 1, GL_FALSE, glm::value_ptr(view));
     glUniformMatrix4fv(glGetUniformLocation(progPrep, "proj"), 1, GL_FALSE, glm::value_ptr(proj));

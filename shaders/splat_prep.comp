@@ -11,7 +11,7 @@ struct SplatKeyframes {
     vec4 rotA, rotB;             // quaternion (x, y, z, w)
     vec4 logScaleA, logScaleB;   // xyz = log(scale), w = opacity
     vec4 colorA, colorB;         // rgb
-    vec4 smoothDisp;             // xyz: neighbour-averaged displacement
+    vec4 smoothDisp;             // xyz: neighbour-averaged displacement, w: halfway stretch
 };
 struct Prepared {
     vec4 clip;                   // clip-space center
@@ -28,6 +28,7 @@ uniform uint  count;
 uniform float e;          // eased time
 uniform float g;          // cohesion: how much of each splat's own correction is applied
 uniform float grow;       // mid-flight size boost
+uniform float stretchOn;  // 1 = apply the per-splat area stretch, 0 = ignore it
 uniform int   hasSmooth;
 uniform mat4  view;
 uniform mat4  proj;
@@ -81,6 +82,8 @@ void main() {
     }
     vec4  rot     = Slerp(k.rotA, k.rotB, e);
     vec3  scale   = grow * exp(mix(k.logScaleA.xyz, k.logScaleB.xyz, e));
+    float tc      = clamp(e, 0.0, 1.0);
+    scale.xy     *= pow(k.smoothDisp.w, stretchOn * 4.0 * tc * (1.0 - tc));   // z is the thin axis
     vec3  color   = mix(k.colorA.rgb, k.colorB.rgb, e);
     float opacity = mix(k.logScaleA.w, k.logScaleB.w, e);
 

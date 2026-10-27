@@ -4,21 +4,107 @@
 
 #include <Eigen/Sparse>
 #include <Eigen/Dense>
+#include <algorithm>
 #include <chrono>
 #include <cmath>
 #include <iostream>
+#include <unordered_map>
 
 using SpMat = Eigen::SparseMatrix<double>;
 
 static Eigen::Vector3d ToE(const glm::vec3& v) { return Eigen::Vector3d(v.x, v.y, v.z); }
 
-// Best rotation taking vertex i's rest one-ring edges onto its current ones.
+static uint64_t PairKey(int i, int j) {
+    if (i > j) std::swap(i, j);
+    return ((uint64_t)i << 32) | (uint64_t)j;
+}
+
+// Cotan weight of every edge of forms.edges on the given positions:
+// w_ij = (cot alpha + cot beta) / 2, alpha and beta the angles opposite the edge.
+// This is the diagonal Hodge star on 1-forms (DEC's *1). Obtuse angles can make
+// a weight negative; that's fine and kept as is: d0^T W d0 is the Dirichlet
+// energy of piecewise-linear functions, so it stays positive semidefinite, and
+// clamping would cost the exact "linear functions have zero Laplacian" property.
+// Slivers are the real danger: a near-zero-area triangle has a cot near +-1e8,
+// so those faces are skipped (their edges keep the weight from the other side).
+static std::vector<double> CotanWeights(const IndexedMesh& m, const DiscreteForms& forms,
+                                        const std::vector<glm::vec3>& pos) {
+    const int E = (int)forms.edges.size();
+    std::unordered_map<uint64_t, int> edgeId;
+    edgeId.reserve(E);
+    for (int e = 0; e < E; ++e)
+        edgeId[PairKey(forms.edges[e][0], forms.edges[e][1])] = e;
+
+    std::vector<double> w(E, 0.0);
+    for (int f = 0; f < m.FaceCount(); ++f) {
+        // shape quality: 1 for equilateral, 0 for a sliver (2 area / sum of squared edges, scaled)
+        glm::vec3 p0 = pos[m.indices[3 * f + 0]];
+        glm::vec3 p1 = pos[m.indices[3 * f + 1]];
+        glm::vec3 p2 = pos[m.indices[3 * f + 2]];
+        double twiceArea = ToE(p1 - p0).cross(ToE(p2 - p0)).norm();
+        double edgeSq = ToE(p1 - p0).squaredNorm() + ToE(p2 - p1).squaredNorm() + ToE(p0 - p2).squaredNorm();
+        if (edgeSq <= 0.0 || 2.0 * std::sqrt(3.0) * twiceArea / edgeSq < 1e-4) continue;
+
+        for (int k = 0; k < 3; ++k) {
+            // corner c, and the edge (a, b) across from it
+            int c = (int)m.indices[3 * f + k];
+            int a = (int)m.indices[3 * f + (k + 1) % 3];
+            int b = (int)m.indices[3 * f + (k + 2) % 3];
+
+            Eigen::Vector3d u = ToE(pos[a] - pos[c]);
+            Eigen::Vector3d v = ToE(pos[b] - pos[c]);
+            double sinArea = u.cross(v).norm();   // |u||v| sin(angle), > 0 after the check above
+            double cot = u.dot(v) / sinArea;      // |u||v| cos / |u||v| sin
+
+            w[edgeId[PairKey(a, b)]] += 0.5 * cot;
+        }
+    }
+    return w;
+}
+
+// Row-normalized Laplacian L = D^-1 C, with C = d0^T W d0 and D = diag(C).
+// W = I gives the uniform Laplacian (L_ii = 1, L_ij = -1/deg); W = cotan weights
+// gives the cotan Laplacian (*d*d in exterior calculus). Normalizing keeps
+// L * x in length units either way, so the stiffness schedule fits both.
+static SpMat NormalizedLaplacian(const DiscreteForms& forms, const std::vector<double>& w, int n) {
+    const int E = (int)forms.edges.size();
+    SpMat W(E, E);
+    std::vector<Eigen::Triplet<double>> diag;
+    diag.reserve(E);
+    for (int e = 0; e < E; ++e) diag.emplace_back(e, e, w[e]);
+    W.setFromTriplets(diag.begin(), diag.end());
+
+    SpMat C = SpMat(forms.d0.transpose()) * W * forms.d0;   // n x n
+
+    // D_ii = sum of vertex i's edge weights
+    Eigen::VectorXd D = C.diagonal();
+
+    std::vector<Eigen::Triplet<double>> trip;
+    trip.reserve(C.nonZeros() + n);
+    for (int col = 0; col < C.outerSize(); ++col) {
+        for (SpMat::InnerIterator it(C, col); it; ++it) {
+            int row = (int)it.row();
+            if (D(row) > 0.0) trip.emplace_back(row, col, it.value() / D(row));
+        }
+    }
+    for (int i = 0; i < n; ++i)
+        if (D(i) <= 0.0) trip.emplace_back(i, i, 1.0);   // vertex without edges: identity row
+    SpMat L(n, n);
+    L.setFromTriplets(trip.begin(), trip.end());
+    return L;
+}
+
+// Best rotation taking vertex i's rest one-ring edges onto its current ones,
+// each edge weighted by ringW (the Laplacian's edge weights; ARAP local step).
 static Eigen::Matrix3d RingRotation(int i, const std::vector<int>& ring,
+                                    const std::vector<double>& ringW,
                                     const std::vector<glm::vec3>& rest,
                                     const std::vector<glm::vec3>& cur) {
     Eigen::Matrix3d S = Eigen::Matrix3d::Zero();
-    for (int j : ring)
-        S += ToE(rest[j] - rest[i]) * ToE(cur[j] - cur[i]).transpose();
+    for (size_t r = 0; r < ring.size(); ++r) {
+        int j = ring[r];
+        S += ringW[r] * ToE(rest[j] - rest[i]) * ToE(cur[j] - cur[i]).transpose();
+    }
     Eigen::JacobiSVD<Eigen::Matrix3d> svd(S, Eigen::ComputeFullU | Eigen::ComputeFullV);
     Eigen::Matrix3d U = svd.matrixU(), V = svd.matrixV();
     Eigen::Matrix3d R = V * U.transpose();
@@ -48,16 +134,25 @@ std::vector<glm::vec3> MeshFitter::Fit(const IndexedMesh& tmpl,
 
     auto rings = MeshTopology::OneRings(tmpl);
 
-    // Uniform Laplacian L and the rest differential coordinates delta = L * start.
-    std::vector<Eigen::Triplet<double>> trip;
-    trip.reserve(n * 8);
-    for (int i = 0; i < n; ++i) {
-        trip.emplace_back(i, i, 1.0);
-        double w = rings[i].empty() ? 0.0 : 1.0 / (double)rings[i].size();
-        for (int j : rings[i]) trip.emplace_back(i, j, -w);
-    }
-    SpMat L(n, n);
-    L.setFromTriplets(trip.begin(), trip.end());
+    // Laplacian L = D^-1 d0^T W d0 and the rest differential coordinates delta = L * start.
+    // W is the cotan Hodge star on the rest shape, or all ones for the uniform Laplacian.
+    DiscreteForms forms = MeshTopology::BuildForms(tmpl);
+    std::vector<double> edgeW = params.cotanLaplacian
+        ? CotanWeights(tmpl, forms, start)
+        : std::vector<double>(forms.edges.size(), 1.0);
+    SpMat L = NormalizedLaplacian(forms, edgeW, n);
+
+    // the same weights per one-ring neighbour, for the rotation fit
+    std::unordered_map<uint64_t, double> weightOf;
+    weightOf.reserve(forms.edges.size());
+    for (size_t e = 0; e < forms.edges.size(); ++e)
+        weightOf[PairKey(forms.edges[e][0], forms.edges[e][1])] = edgeW[e];
+    std::vector<std::vector<double>> ringW(n);
+    for (int i = 0; i < n; ++i)
+        // A negative weight would make the rotation fit pull an edge the wrong
+        // way, so the local step uses only the positive part (L keeps the sign).
+        for (int j : rings[i]) ringW[i].push_back(std::max(0.0, weightOf[PairKey(i, j)]));
+
     SpMat Lt = L.transpose();
     SpMat LtL = Lt * L;
 
@@ -108,7 +203,7 @@ std::vector<glm::vec3> MeshFitter::Fit(const IndexedMesh& tmpl,
             // local step: per-vertex rotations of the rest Laplacian coordinates
             ParallelFor(n, [&](int i) {
                 R[i] = rings[i].empty() ? Eigen::Matrix3d::Identity()
-                                        : RingRotation(i, rings[i], start, X);
+                                        : RingRotation(i, rings[i], ringW[i], start, X);
             });
             Eigen::MatrixXd rotDelta(n, 3);
             for (int i = 0; i < n; ++i)

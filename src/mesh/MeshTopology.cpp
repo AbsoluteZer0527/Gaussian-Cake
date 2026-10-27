@@ -4,6 +4,7 @@
 #include <algorithm>
 #include <numeric>
 #include <cmath>
+#include <queue>
 #include <sstream>
 
 static uint64_t EdgeKey(unsigned int a, unsigned int b) {
@@ -25,7 +26,8 @@ std::string TopologyInfo::Describe() const {
     std::ostringstream ss;
     ss << verts << " verts, " << faces << " faces, " << parts << " part(s), chi=" << euler
        << ", " << boundaryLoops << " hole(s) (" << boundaryEdges << " open edges), "
-       << nonManifoldEdges << " non-manifold edges";
+       << nonManifoldEdges << " non-manifold edges, genus " << genus
+       << (orientable ? "" : " (non-orientable)");
     return ss.str();
 }
 
@@ -164,6 +166,132 @@ bool MeshTopology::OrientOutward(IndexedMesh& m) {
     return true;
 }
 
+// Reverse face f's winding: swapping two corners turns (0,1,2) into (1,0,2).
+static void FlipFace(IndexedMesh& m, int f) {
+    std::swap(m.indices[3 * f + 0], m.indices[3 * f + 1]);
+}
+
+// True if face f steps straight from vertex a to vertex b.
+// Face (0, 1, 2) walks 0->1, 1->2, 2->0, so (1, 2) is true and (2, 1) is false.
+static bool FaceWalks(const IndexedMesh& m, int f, unsigned int a, unsigned int b) {
+    for (int k = 0; k < 3; ++k) {
+        unsigned int from = m.indices[3 * f + k];
+        unsigned int to   = m.indices[3 * f + (k + 1) % 3];
+        if (from == a && to == b) return true;
+    }
+    return false;
+}
+
+// Make the winding consistent: two faces sharing an edge must walk it in
+// opposite directions. Breadth-first search: start at one face, then fix its
+// neighbours, then their neighbours, and so on, like a ripple spreading out.
+bool MeshTopology::OrientConsistently(IndexedMesh& m) {
+    const int F = m.FaceCount();
+
+    // edge -> the faces that use it (2 for a normal edge, 1 on a hole's border)
+    std::unordered_map<uint64_t, std::vector<int>> edgeFaces;
+    for (int f = 0; f < F; ++f) {
+        for (int k = 0; k < 3; ++k) {
+            unsigned int a = m.indices[3 * f + k];
+            unsigned int b = m.indices[3 * f + (k + 1) % 3];
+            edgeFaces[EdgeKey(a, b)].push_back(f);
+        }
+    }
+
+    std::vector<char> visited(F, 0);   // 1 once a face's winding is final
+    std::queue<int> q;                 // faces waiting to check their neighbours
+    bool orientable = true;
+
+    // one BFS per connected part: start from any face nobody reached yet
+    for (int start = 0; start < F; ++start) {
+        if (visited[start]) continue;
+        visited[start] = 1;
+        q.push(start);
+
+        while (!q.empty()) {
+            int f = q.front();         // take the oldest waiting face
+            q.pop();
+
+            for (int k = 0; k < 3; ++k) {
+                unsigned int a = m.indices[3 * f + k];
+                unsigned int b = m.indices[3 * f + (k + 1) % 3];
+
+                const std::vector<int>& faces = edgeFaces[EdgeKey(a, b)];
+                if (faces.size() != 2) continue;   // hole border or non-manifold: skip
+                int g = (faces[0] == f) ? faces[1] : faces[0];   // the face on the other side
+
+                // f walks this edge a -> b; g agrees only if it walks b -> a
+                bool same = FaceWalks(m, g, a, b);
+                if (!visited[g]) {
+                    if (same) FlipFace(m, g);
+                    visited[g] = 1;
+                    q.push(g);
+                } else if (same) {
+                    orientable = false;   // g is already final, so nothing can fix it (e.g. a Mobius strip)
+                }
+            }
+        }
+    }
+    return orientable;
+}
+
+DiscreteForms MeshTopology::BuildForms(const IndexedMesh& m) {
+    DiscreteForms forms;
+    const int V = (int)m.verts.size();
+    const int F = m.FaceCount();
+
+    // Number every undirected edge once, in first-seen order.
+    // Each edge is stored low -> high: that is its "forward" direction.
+    std::unordered_map<uint64_t, int> edgeId;
+    edgeId.reserve(m.indices.size());
+    for (int f = 0; f < F; ++f) {
+        for (int k = 0; k < 3; ++k) {
+            unsigned int a = m.indices[3 * f + k];
+            unsigned int b = m.indices[3 * f + (k + 1) % 3];
+
+            uint64_t key = EdgeKey(a, b);
+            if (edgeId.count(key) > 0) continue;   // already numbered from another face
+
+            int newId = (int)forms.edges.size();
+            edgeId[key] = newId;
+            int i = (int)std::min(a, b);
+            int j = (int)std::max(a, b);
+            forms.edges.push_back({ i, j });
+        }
+    }
+    const int E = (int)forms.edges.size();
+
+    // d0 (|E| x |V|): the change along each edge, (d0 f)_e = f_j - f_i.
+    std::vector<Eigen::Triplet<double>> trip;
+    trip.reserve(2 * E);
+    for (int e = 0; e < E; ++e) {
+        int i = forms.edges[e][0];
+        int j = forms.edges[e][1];
+        trip.emplace_back(e, i, -1.0);
+        trip.emplace_back(e, j, +1.0);
+    }
+    forms.d0.resize(E, V);
+    forms.d0.setFromTriplets(trip.begin(), trip.end());
+
+    // d1 (|F| x |E|): the circulation around each face, summed over its 3 edges.
+    trip.clear();
+    trip.reserve(3 * F);
+    for (int f = 0; f < F; ++f) {
+        for (int k = 0; k < 3; ++k) {
+            unsigned int a = m.indices[3 * f + k];
+            unsigned int b = m.indices[3 * f + (k + 1) % 3];
+            int e = edgeId[EdgeKey(a, b)];
+
+            // walking a -> b with a < b follows the edge's stored direction
+            double sign = (a < b) ? 1.0 : -1.0;
+            trip.emplace_back(f, e, sign);
+        }
+    }
+    forms.d1.resize(F, E);
+    forms.d1.setFromTriplets(trip.begin(), trip.end());
+    return forms;
+}
+
 TopologyInfo MeshTopology::Analyze(const IndexedMesh& m) {
     TopologyInfo info;
     info.faces = m.FaceCount();
@@ -195,6 +323,7 @@ TopologyInfo MeshTopology::Analyze(const IndexedMesh& m) {
     }
     info.euler = info.verts - (int)counts.size() + info.faces;
     info.boundaryLoops = (int)BoundaryLoops(m).size();
+    info.genus = (2 * info.parts - info.euler - info.boundaryLoops) / 2;
     return info;
 }
 

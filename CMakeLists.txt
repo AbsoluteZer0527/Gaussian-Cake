@@ -2,64 +2,75 @@ cmake_minimum_required(VERSION 3.16)
 
 project(menv)
 
-# Add source files
+# Our code lives in src/<module>/, each header next to its .cpp:
+#   app        window, GUI, camera, entry point, performance model
+#   core       OpenGL setup, shaders, GPU timers, threading helpers
+#   io         .obj meshes and .ply splat captures
+#   mesh       topology, sampling, closest-point queries, template fitting, drawing
+#   transport  Gaussians, Gaussian mixtures, optimal transport, the morph timeline
+#   morph      signed-distance-field morph (CPU and GPU)
+#   splats     Gaussian splats: generation and rendering
+#   particles  the particle system
+# Third-party code (imgui, Eigen, glm, GLEW, GLFW and their .lib files) is in external/.
+set(MODULES app core io mesh transport morph splats particles)
+
 set(
     SOURCES
-    main.cpp
-    src/Camera.cpp
-    src/Shader.cpp
-    src/Window.cpp
-    src/imgui_widgets.cpp
-    src/imgui.cpp
-    src/imgui_demo.cpp
-    src/imgui_draw.cpp
-    src/imgui_tables.cpp
-    src/imgui_impl_glfw.cpp
-    src/imgui_impl_opengl3.cpp
-    src/Particle.cpp
-    src/ParticleSystem.cpp
-    src/Gaussian.cpp
-    src/OBJLoader.cpp
-    src/MeshSampler.cpp
-    src/OptimalTransport.cpp
-    src/TransportAnimator.cpp
-    src/MeshRenderer.cpp
-    src/MeshTopology.cpp
-    src/SurfaceQuery.cpp
-    src/MeshFitter.cpp
-    src/SDFMorph.cpp
-    src/GaussianMixture.cpp
-    src/SplatGenerator.cpp
-    src/SplatRenderer.cpp
-    src/GpuSDFMorph.cpp
-    src/PlyLoader.cpp
+    src/app/main.cpp
+    src/app/Window.cpp
+    src/app/Camera.cpp
+    src/app/PerfModel.cpp
+    src/core/Shader.cpp
+    src/io/OBJLoader.cpp
+    src/io/PlyLoader.cpp
+    src/mesh/MeshTopology.cpp
+    src/mesh/MeshSampler.cpp
+    src/mesh/SurfaceQuery.cpp
+    src/mesh/MeshFitter.cpp
+    src/mesh/MeshRenderer.cpp
+    src/transport/Gaussian.cpp
+    src/transport/GaussianMixture.cpp
+    src/transport/OptimalTransport.cpp
+    src/transport/TransportAnimator.cpp
+    src/morph/SDFMorph.cpp
+    src/morph/GpuSDFMorph.cpp
+    src/splats/SplatGenerator.cpp
+    src/splats/SplatRenderer.cpp
+    src/particles/Particle.cpp
+    src/particles/ParticleSystem.cpp
 )
 
-# Add header files
 set(
-    HEADERS
-    include/core.h
-    include/Camera.h
-    include/Shader.h
-    include/Window.h
+    IMGUI_SOURCES
+    external/imgui/imgui.cpp
+    external/imgui/imgui_demo.cpp
+    external/imgui/imgui_draw.cpp
+    external/imgui/imgui_tables.cpp
+    external/imgui/imgui_widgets.cpp
+    external/imgui/imgui_impl_glfw.cpp
+    external/imgui/imgui_impl_opengl3.cpp
 )
 
 # Require GL
 find_package(OpenGL REQUIRED)
 
-# Add include directories
-include_directories(
-    include
-    include/Eigen
-)
+# Every module folder is on the include path, so "#include \"Window.h\"" works anywhere
+include_directories(external external/Eigen external/imgui)
+foreach(module ${MODULES})
+    include_directories(src/${module})
+endforeach()
 
 # Add library directories
 link_directories(
-    lib
+    external/lib
 )
 
+# Headers too, so Visual Studio lists them, grouped by folder as on disk
+file(GLOB HEADERS src/*/*.h)
+source_group(TREE ${PROJECT_SOURCE_DIR}/src FILES ${SOURCES} ${HEADERS})
+
 # Add executable
-add_executable(${PROJECT_NAME} ${SOURCES} ${HEADERS})
+add_executable(${PROJECT_NAME} ${SOURCES} ${HEADERS} ${IMGUI_SOURCES})
 set_property(TARGET ${PROJECT_NAME} PROPERTY CXX_STANDARD 17)
 
 # Link libraries

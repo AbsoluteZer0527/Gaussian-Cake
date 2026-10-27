@@ -51,6 +51,7 @@ private:
 
     GLuint progField = 0, progCells = 0, progQuads = 0, progFinalize = 0;
     GLuint texA = 0, texB = 0;
+    GLuint gradTexA = 0, gradTexB = 0;   // grid gradients, for the analytic surface normal
     GLuint fieldBuf = 0, cellBuf = 0, vertBuf = 0, indexBuf = 0, counterBuf = 0;
     GLuint vao = 0;
 

@@ -38,11 +38,8 @@ void main() {
     if (v >= vertCap) { overflow = 1u; cellVert[id] = -1; return; }
 
     // The field grows fastest straight out of the surface, so its gradient
-    // (central differences) is the outward normal.
-    float d = 0.5 * h;
-    vec3 grad = vec3(Phi(pos + vec3(d, 0, 0)) - Phi(pos - vec3(d, 0, 0)),
-                     Phi(pos + vec3(0, d, 0)) - Phi(pos - vec3(0, d, 0)),
-                     Phi(pos + vec3(0, 0, d)) - Phi(pos - vec3(0, 0, d)));
+    // is the outward normal (closed form, see PhiGrad).
+    vec3 grad = PhiGrad(pos);
     float len = length(grad);
     vec3 nrm = (len > 1e-12) ? grad / len : vec3(0.0, 1.0, 0.0);
 

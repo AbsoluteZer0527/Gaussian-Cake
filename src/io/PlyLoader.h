@@ -26,12 +26,21 @@ public:
     static bool Load(const std::string& path, std::vector<Splat>& outSplats,
                      const PlyLoadOptions& options = {});
 
+    // Splats in the file before cleaning, from the header alone (0 if unreadable).
+    static size_t CountSplats(const std::string& path);
+
 private:
+    // The properties every 3DGS capture has, in the order kRequired lists them.
+    enum Field { X, Y, Z, DC0, DC1, DC2, Opacity, Scale0, Scale1, Scale2,
+                 Rot0, Rot1, Rot2, Rot3, kFieldCount };
+    static const char* const kRequired[kFieldCount];
+
     // What the header tells us about the binary data that follows it.
     struct Header {
         size_t vertexCount = 0;                         // number of splats
         size_t stride = 0;                              // bytes per splat record
         std::unordered_map<std::string, size_t> offset; // property name -> byte offset in a record
+        size_t field[kFieldCount] = {};                 // offset of each Field, looked up once
     };
 
     // Reads the text header up to and including "end_header". Afterwards the

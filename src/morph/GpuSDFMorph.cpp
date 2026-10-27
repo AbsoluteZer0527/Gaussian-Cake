@@ -45,7 +45,7 @@ bool GpuSDFMorph::Init() {
 }
 
 void GpuSDFMorph::Release() {
-    for (GLuint* t : { &texA, &texB })
+    for (GLuint* t : { &texA, &texB, &gradTexA, &gradTexB })
         if (*t) { glDeleteTextures(1, t); *t = 0; }
     for (GLuint* buf : { &fieldBuf, &cellBuf, &vertBuf, &indexBuf, &counterBuf })
         if (*buf) { glDeleteBuffers(1, buf); *buf = 0; }
@@ -64,6 +64,42 @@ static GLuint MakeGridTexture(const SDFGrid& g) {
     glPixelStorei(GL_UNPACK_ALIGNMENT, 4);
     // x fastest, then y, then z: the same order a 3D texture stores texels
     glTexImage3D(GL_TEXTURE_3D, 0, GL_R32F, g.n, g.n, g.n, 0, GL_RED, GL_FLOAT, g.v.data());
+    glTexParameteri(GL_TEXTURE_3D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+    glTexParameteri(GL_TEXTURE_3D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+    for (GLenum w : { GL_TEXTURE_WRAP_S, GL_TEXTURE_WRAP_T, GL_TEXTURE_WRAP_R })
+        glTexParameteri(GL_TEXTURE_3D, w, GL_CLAMP_TO_EDGE);
+    glBindTexture(GL_TEXTURE_3D, 0);
+    return tex;
+}
+
+// Gradient of a grid's distance values (central differences, one-sided at the
+// border), in distance per world unit. Half floats: normals don't need more.
+// RGBA with alpha unused: 3-channel float textures are padded or poorly
+// supported on some drivers.
+static GLuint MakeGradientTexture(const SDFGrid& g) {
+    const int n = g.n;
+    std::vector<float> grad((size_t)n * n * n * 4);
+    auto diff = [&](int i, int j, int k, int axis) {
+        int p[3] = { i, j, k };
+        int lo = std::max(p[axis] - 1, 0);
+        int hi = std::min(p[axis] + 1, n - 1);
+        int a[3] = { i, j, k }, b[3] = { i, j, k };
+        a[axis] = lo;
+        b[axis] = hi;
+        return (g.At(b[0], b[1], b[2]) - g.At(a[0], a[1], a[2])) / ((hi - lo) * g.h);
+    };
+    for (int k = 0; k < n; ++k)
+        for (int j = 0; j < n; ++j)
+            for (int i = 0; i < n; ++i) {
+                size_t id = (((size_t)k * n + j) * n + i) * 4;
+                for (int axis = 0; axis < 3; ++axis) grad[id + axis] = diff(i, j, k, axis);
+            }
+
+    GLuint tex;
+    glGenTextures(1, &tex);
+    glBindTexture(GL_TEXTURE_3D, tex);
+    glPixelStorei(GL_UNPACK_ALIGNMENT, 4);
+    glTexImage3D(GL_TEXTURE_3D, 0, GL_RGBA16F, n, n, n, 0, GL_RGBA, GL_FLOAT, grad.data());
     glTexParameteri(GL_TEXTURE_3D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
     glTexParameteri(GL_TEXTURE_3D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
     for (GLenum w : { GL_TEXTURE_WRAP_S, GL_TEXTURE_WRAP_T, GL_TEXTURE_WRAP_R })
@@ -95,6 +131,8 @@ void GpuSDFMorph::Upload(const SDFMorph& morph, int vertCapHint, int indexCapHin
 
     texA = MakeGridTexture(ga);
     texB = MakeGridTexture(gb);
+    gradTexA = MakeGradientTexture(ga);
+    gradTexB = MakeGradientTexture(gb);
 
     const size_t points = (size_t)n * n * n;
     const size_t cells  = (size_t)(n - 1) * (n - 1) * (n - 1);
@@ -138,6 +176,8 @@ static void SetCommonUniforms(GLuint p, int n, const glm::vec3& lo, float h, flo
     glUseProgram(p);
     glUniform1i(glGetUniformLocation(p, "gridA"), 0);
     glUniform1i(glGetUniformLocation(p, "gridB"), 1);
+    glUniform1i(glGetUniformLocation(p, "gradA"), 2);
+    glUniform1i(glGetUniformLocation(p, "gradB"), 3);
     glUniform1i(glGetUniformLocation(p, "n"), n);
     glUniform3fv(glGetUniformLocation(p, "lo"), 1, glm::value_ptr(lo));
     glUniform1f(glGetUniformLocation(p, "h"), h);
@@ -172,6 +212,10 @@ void GpuSDFMorph::Extract(float t) {
     glBindTexture(GL_TEXTURE_3D, texA);
     glActiveTexture(GL_TEXTURE1);
     glBindTexture(GL_TEXTURE_3D, texB);
+    glActiveTexture(GL_TEXTURE2);
+    glBindTexture(GL_TEXTURE_3D, gradTexA);
+    glActiveTexture(GL_TEXTURE3);
+    glBindTexture(GL_TEXTURE_3D, gradTexB);
     glActiveTexture(GL_TEXTURE0);
 
     auto run = [&](GLuint prog, int count) {

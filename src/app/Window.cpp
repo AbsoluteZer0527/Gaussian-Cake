@@ -13,18 +13,21 @@
 #include "SDFMorph.h"
 #include "GpuSDFMorph.h"
 #include "GpuTimer.h"
+#include "PerfModel.h"
 
 #include <glm/gtc/quaternion.hpp>
 #include <chrono>
 #include <atomic>
 #include <execution>
 #include <future>
+#include <mutex>
 #include <numeric>
 #include <cmath>
 
 #include <filesystem>
 #include <algorithm>
 #include <unordered_map>
+#include <random>
 
 //Window Properties
 int Window::width;
@@ -45,6 +48,7 @@ RenderMode Window::renderMode = RenderMode::Particles;
 MorphMethod Window::morphMethod     = MorphMethod::Auto;
 int         Window::sdfResolution   = 64;
 float       Window::fitStiffness    = 1.0f;
+bool        Window::fitCotan        = true;
 bool        Window::trueMorphActive = false;
 bool        Window::morphBaking     = false;
 std::string Window::morphStatus;
@@ -82,10 +86,27 @@ static double MsSince(std::chrono::steady_clock::time_point t0) {
 }
 
 // Splat attributes for this frame on the GPU path (computed in idleCallback)
-static float g_splatE = 0.0f, g_splatG = 0.0f, g_splatGrow = 1.0f;
+static float g_splatE = 0.0f, g_splatG = 0.0f, g_splatGrow = 1.0f, g_splatStretchOn = 1.0f;
+
+// Full-resolution captures on the GPU: [0] = A, [1] = B. Shown while the
+// timeline rests at that end (the morph itself moves a subsample), and [0]
+// also holds the static preview of a capture source.
+static SplatRenderer* g_fullSplats[2] = { nullptr, nullptr };
+static bool g_previewOnGpu = false;   // the splat preview lives in g_fullSplats[0]
 
 static bool SplatsOnGpu() {
     return Window::useGpu && Window::gpuAvailable && Window::splatRenderer->HasKeyframes();
+}
+
+// The GPU splat set to draw this frame, or nullptr for the CPU path.
+static SplatRenderer* GpuSplatSet() {
+    if (!Window::useGpu || !Window::gpuAvailable) return nullptr;
+    if (!Window::splatMorphActive) return g_previewOnGpu ? g_fullSplats[0] : nullptr;
+    if (!Window::animator->IsTransporting()) {
+        int end = (Window::animator->state == AnimationState::GAUSSIAN_B) ? 1 : 0;
+        if (g_fullSplats[end]->HasKeyframes()) return g_fullSplats[end];
+    }
+    return SplatsOnGpu() ? Window::splatRenderer : nullptr;
 }
 
 //Splat mode state
@@ -99,7 +120,10 @@ float Window::splatSizeMul     = 1.0f;
 int   Window::mixtureK         = 32;
 float Window::sinkhornEps      = 0.05f;
 float Window::posteriorTemp    = 1.0f;
+PlyLoadOptions Window::plyOptions;
 float Window::splatCohesion    = 0.6f;
+bool  Window::splatAreaPreserve = true;
+std::vector<float> Window::splatStretch;
 std::vector<glm::vec3> Window::splatSmoothDisp;
 static int splatPreviewGen     = 0;   // bump to force the static preview to rebuild
 
@@ -115,6 +139,8 @@ std::vector<std::string> Window::meshPaths;
 int              Window::meshIndexA    = 0;
 int              Window::meshIndexB    = 0;
 int              Window::sampleCount   = 5000;
+float            Window::quality       = 0.5f;
+bool             Window::autoQuality   = true;
 
 //Interaction Variables
 bool LeftDown, RightDown;
@@ -131,10 +157,149 @@ static void SetBlob(Gaussian& g) {
 }
 
 // Load an OBJ and normalize it to [-1, 1]^3. Returns false on failure.
+// .ply files are 3D Gaussian Splatting captures (Splats mode only); .obj are meshes.
+static bool IsCapture(const std::string& path) {
+    return std::filesystem::path(path).extension() == ".ply";
+}
+
 static bool LoadNormalized(const std::string& path, std::vector<Triangle>& tris) {
     if (!OBJLoader::Load(path, tris)) return false;
     OBJLoader::Normalize(tris);
     return true;
+}
+
+// ---- Quality bar ----
+// Every costly setting, as a function of one quality q in [0, 1].
+struct QualitySettings {
+    int splatCount;
+    int mixtureK;
+    int sampleCount;
+    int sdfResolution;
+    int particleCount;
+};
+
+static const int    kSplatFloor    = 5000;     // splats at q = 0
+static const int    kSplatMax      = 500000;   // the most the GPU path is built for
+static const double kBakeBudgetMs  = 6000.0;   // Auto keeps the bake under this...
+static const double kFrameBudgetMs = 12.0;     // ...and a GPU splat frame under this
+
+static PerfModel g_perf;                // learned bake and frame costs
+static bool      g_refitQuality = true; // Auto should pick again (new shapes, mode or costs)
+
+// The settings at quality q (0 = fastest, 1 = finest). Blended in log space:
+// cost grows with each value, so every step of the bar multiplies it by the
+// same factor (5k..500k gives 50k at q = 0.5, not 252k).
+static QualitySettings SettingsFor(float q, int splatCeiling) {
+    auto logLerp = [q](int lo, int hi) {
+        return (int)std::lround(lo * std::pow((double)hi / lo, (double)q));
+    };
+    return { logLerp(kSplatFloor, splatCeiling),
+             logLerp(16, 64),
+             logLerp(4000, 20000),
+             logLerp(32, 160),
+             logLerp(500, 10000) };
+}
+
+// A capture as loaded with these options (cleaning and cropping depend on them)
+static std::string CaptureKey(const std::string& path, const PlyLoadOptions& ply) {
+    return path + "|" + std::to_string(ply.cropRadius) + "|" + std::to_string((int)ply.up);
+}
+
+// Splats each capture kept after cleaning and cropping, once the preview or a
+// bake has loaded it (main thread only).
+static std::unordered_map<std::string, size_t> g_cleanedCounts;
+
+static void RecordCleanedCount(const std::string& key, size_t count) {
+    auto it = g_cleanedCounts.find(key);
+    if (it != g_cleanedCounts.end() && it->second == count) return;
+    g_cleanedCounts[key] = count;
+    g_refitQuality = true;   // the ceiling changed
+}
+
+// The splat count both shapes can supply: a capture can't give more than it
+// has. The header count is only an upper bound (cleaning drops splats), so
+// the cleaned count wins once it's known.
+static int SplatCeiling() {
+    static std::unordered_map<std::string, size_t> headerCounts;   // header reads, once per file
+    int ceiling = kSplatMax;
+    for (int idx : { Window::meshIndexA, Window::meshIndexB }) {
+        if (idx <= 0 || idx > (int)Window::meshPaths.size()) continue;
+        const std::string& path = Window::meshPaths[idx - 1];
+        if (!IsCapture(path)) continue;
+        size_t have = 0;
+        auto cleaned = g_cleanedCounts.find(CaptureKey(path, Window::plyOptions));
+        if (cleaned != g_cleanedCounts.end()) {
+            have = cleaned->second;
+        } else {
+            auto it = headerCounts.find(path);
+            if (it == headerCounts.end()) it = headerCounts.emplace(path, PlyLoader::CountSplats(path)).first;
+            have = it->second;
+        }
+        if (have > 0) ceiling = std::min(ceiling, (int)have);
+    }
+    return std::max(ceiling, kSplatFloor);
+}
+
+static QualitySettings CurrentSettings() {
+    return { Window::splatCount, Window::mixtureK, Window::sampleCount,
+             Window::sdfResolution, Window::particleCount };
+}
+
+static void ApplySettings(const QualitySettings& s) {
+    Window::splatCount    = s.splatCount;
+    Window::mixtureK      = s.mixtureK;
+    Window::sampleCount   = s.sampleCount;
+    Window::sdfResolution = s.sdfResolution;
+    Window::particleCount = s.particleCount;
+}
+
+// Do this mode's settings still match the bar, or were they edited by hand?
+static bool MatchesQuality(const QualitySettings& s) {
+    QualitySettings c = CurrentSettings();
+    switch (Window::renderMode) {
+        case RenderMode::Splats:
+            return c.splatCount == s.splatCount && c.mixtureK == s.mixtureK && c.sampleCount == s.sampleCount;
+        case RenderMode::TriangleMorph:
+            return c.sdfResolution == s.sdfResolution;
+        case RenderMode::Particles:
+            return c.particleCount == s.particleCount;
+    }
+    return true;
+}
+
+// Highest quality whose splat count fits both the shapes and the time budget.
+// Searches q itself, so it works for whatever mapping SettingsFor uses.
+static float FitQuality(int ceiling) {
+    int target = g_perf.MaxCount(kSplatFloor, ceiling, kBakeBudgetMs, kFrameBudgetMs);
+    if (SettingsFor(1.0f, ceiling).splatCount <= target) return 1.0f;
+    float lo = 0.0f, hi = 1.0f;
+    for (int i = 0; i < 20; ++i) {
+        float mid = 0.5f * (lo + hi);
+        if (SettingsFor(mid, ceiling).splatCount <= target) lo = mid;
+        else                                                 hi = mid;
+    }
+    return lo;
+}
+
+// Auto re-picks only when something it depends on changed, never per frame:
+// a new splat count rebuilds the preview.
+static void UpdateQuality() {
+    static int lastA = -1, lastB = -1;
+    static RenderMode lastMode = RenderMode::Particles;
+    static bool lastAuto = false;
+    if (lastA != Window::meshIndexA || lastB != Window::meshIndexB ||
+        lastMode != Window::renderMode || lastAuto != Window::autoQuality) {
+        lastA = Window::meshIndexA; lastB = Window::meshIndexB;
+        lastMode = Window::renderMode; lastAuto = Window::autoQuality;
+        g_refitQuality = true;
+    }
+    if (!Window::autoQuality || !g_refitQuality) return;
+    g_refitQuality = false;
+
+    // only splats have a learned cost; the other modes take the middle
+    int ceiling = SplatCeiling();
+    Window::quality = (Window::renderMode == RenderMode::Splats) ? FitQuality(ceiling) : 0.5f;
+    ApplySettings(SettingsFor(Window::quality, ceiling));
 }
 
 // ---- Static previews for Particles / Topology modes ----
@@ -157,7 +322,8 @@ static void UpdateModePreview() {
     static std::vector<Triangle> tris;
     static int loadedIndex = -1;
     int idx = Window::meshIndexA;
-    bool hasMesh = idx > 0 && idx <= (int)Window::meshPaths.size();
+    bool hasMesh = idx > 0 && idx <= (int)Window::meshPaths.size() &&
+                   !IsCapture(Window::meshPaths[idx - 1]);   // captures: Splats mode only
     if (hasMesh && loadedIndex != idx) {
         if (LoadNormalized(Window::meshPaths[idx - 1], tris)) {
             loadedIndex = idx;
@@ -201,8 +367,8 @@ static void ScanMeshes() {
     if (fs::is_directory(meshDir)) {
         std::vector<std::string> found;
         for (const auto& entry : fs::directory_iterator(meshDir)) {
-            if (entry.is_regular_file() &&
-                entry.path().extension() == ".obj") {
+            auto ext = entry.path().extension();
+            if (entry.is_regular_file() && (ext == ".obj" || ext == ".ply")) {
                 found.push_back(entry.path().string());
             }
         }
@@ -241,6 +407,10 @@ bool Window::initializeObjects() {
     meshRenderer   = new MeshRenderer();
     splatRenderer  = new SplatRenderer();
     if (!splatRenderer->Initialize()) return false;
+    for (SplatRenderer*& r : g_fullSplats) {
+        r = new SplatRenderer();
+        if (!r->Initialize()) return false;
+    }
 
     // GPU playback needs compute shaders (OpenGL 4.3); without them every
     // mode stays on its CPU path.
@@ -276,6 +446,7 @@ void Window::cleanUp() {
     delete particleSystem;
     delete meshRenderer;
     delete splatRenderer;
+    for (SplatRenderer* r : g_fullSplats) delete r;
     delete g_previewMesh;
     delete g_gpuSdf;
     delete g_morphTimer;
@@ -370,6 +541,12 @@ void Window::idleCallback() {
         g_splatGrow = grow;
         size_t cpuCount = SplatsOnGpu() ? 0 : splatCurrent.size();
 
+        // Area-preserving size: each splat's tangent size also follows the OT
+        // map's own area stretch, s_i^(4t(1-t)): 1 at both ends, s_i halfway.
+        bool stretch = splatAreaPreserve && splatStretch.size() == splatCurrent.size();
+        g_splatStretchOn = splatAreaPreserve ? 1.0f : 0.0f;
+        float stretchExp = 4.0f * tc * (1.0f - tc);
+
         for (size_t i = 0; i < cpuCount; ++i) {
             const Splat& a = splatStart[i];
             const Splat& b = splatEnd[i];
@@ -382,6 +559,11 @@ void Window::idleCallback() {
             }
             s.rot     = glm::slerp(a.rot, b.rot, e);   // shortest path
             s.scale   = grow * glm::exp(glm::mix(glm::log(a.scale), glm::log(b.scale), e));
+            if (stretch) {
+                float k = std::pow(splatStretch[i], stretchExp);
+                s.scale.x *= k;
+                s.scale.y *= k;   // z is the thin axis
+            }
             s.color   = glm::mix(a.color, b.color, e);
             s.opacity = glm::mix(a.opacity, b.opacity, e);
         }
@@ -401,15 +583,21 @@ void Window::idleCallback() {
 void Window::displayCallback(GLFWwindow* window) {
     glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
 
-    // GPU splats time their own passes (timer queries can't nest)
-    bool gpuSplats = renderMode == RenderMode::Splats && splatMorphActive && SplatsOnGpu();
     auto cpuStart = std::chrono::steady_clock::now();
-    if (!gpuSplats) g_drawTimer->Begin();
+    UpdateQuality();
+    if (renderMode == RenderMode::Splats && !splatMorphActive) UpdateSplatPreview();
+
+    // GPU splats time their own passes (timer queries can't nest)
+    SplatRenderer* gpuSet = (renderMode == RenderMode::Splats) ? GpuSplatSet() : nullptr;
+    if (!gpuSet) g_drawTimer->Begin();
 
     if (renderMode == RenderMode::Splats) {
-        if (!splatMorphActive) UpdateSplatPreview();
-        if (gpuSplats)
-            splatRenderer->DrawMorph(g_splatE, g_splatG, g_splatGrow, Cam->GetViewMtx(), Cam->GetProjectMtx());
+        if (gpuSet == splatRenderer)
+            splatRenderer->DrawMorph(g_splatE, g_splatG, g_splatGrow, g_splatStretchOn, Cam->GetViewMtx(), Cam->GetProjectMtx());
+        else if (gpuSet)   // a full capture: start == end, so the time doesn't matter.
+                           // The preview is uploaded unscaled, so Splat Size is applied here.
+            gpuSet->DrawMorph(0.0f, 0.0f, splatMorphActive ? 1.0f : splatSizeMul, 0.0f,
+                              Cam->GetViewMtx(), Cam->GetProjectMtx());
         else
             splatRenderer->Draw(splatCurrent, Cam->GetViewMtx(), Cam->GetProjectMtx());
     } else if (renderMode == RenderMode::TriangleMorph && trueMorphActive) {
@@ -428,8 +616,17 @@ void Window::displayCallback(GLFWwindow* window) {
         particleSystem->Draw(Cam->GetViewProjectMtx());
     }
 
-    if (!gpuSplats) g_drawTimer->End();
+    if (!gpuSet) g_drawTimer->End();
     SmoothMs(g_cpuDrawMs, MsSince(cpuStart));
+
+    // Teach the quality bar how fast this GPU handles splats (once a second;
+    // the timers are already smoothed)
+    static double lastObserved = 0.0;
+    if (gpuSet && glfwGetTime() - lastObserved > 1.0 &&
+        gpuSet->PrepSortMs() >= 0.0 && gpuSet->DrawMs() >= 0.0) {
+        lastObserved = glfwGetTime();
+        g_perf.ObserveFrame(gpuSet->Count(), gpuSet->PrepSortMs() + gpuSet->DrawMs());
+    }
 
     ImGui_ImplOpenGL3_NewFrame();
     ImGui_ImplGlfw_NewFrame();
@@ -534,38 +731,137 @@ struct SplatBakeSettings {
     std::string pathA, pathB;
     int   splatCount, sampleCount, mixtureK;
     float sizeMul, sinkhornEps, posteriorTemp;
+    PlyLoadOptions ply;
 };
 
 struct SplatBakeResult {
     bool ok = false;
     std::vector<Splat> start, end;   // start[i] travels to end[i]
     std::vector<glm::vec3> smoothDisp;   // neighbour-averaged end - start
+    std::vector<float> stretch;      // per splat: the OT map's extra size factor halfway (MidwayStretch)
+    double detMin = 0.0, detMed = 0.0, detMax = 0.0;   // det J of the map over the splats
     std::vector<int> knn;            // kSplatNeighbors nearest A-neighbours per splat (-1 = none)
+    std::vector<Splat> restA, restB; // full captures shown at rest (empty when nothing was dropped)
+    size_t cleanedA = 0, cleanedB = 0; // splats each capture kept after cleaning (0 = a mesh)
     double ms = 0.0;
+    double loadMs = 0.0;             // part of ms spent reading the files
     double meanMatchDist = 0.0;      // rms |T(a_i) - b_match(i)| after refinement
     double nearestBound  = 0.0;      // rms distance to the nearest b (no one-to-one)
+    std::string pathA, pathB;        // what was baked, for RecordCleanedCount
+    PlyLoadOptions ply;
 };
 
-// Per-mesh work that doesn't depend on the other mesh, kept between bakes.
-// Only the bake thread touches it, and only one bake runs at a time.
+// Per-shape work that doesn't depend on the other shape, kept between bakes.
+// A shape is a mesh (.obj -> tris) or a capture (.ply -> splats).
+// The bake and the capture preview both run on workers and share it, so each
+// holds g_meshCacheMutex while it uses the cache.
 struct SplatMeshCache {
-    std::vector<Triangle> tris;
+    std::vector<Triangle> tris;          // meshes
+    std::vector<Splat>    splats;        // captures
+    bool  capture  = false;
+    float cropUsed = -1.0f;              // plyOptions the splats were loaded with
+    int   upUsed   = -1;
     int mixK = -1, mixSamples = -1;      // settings the mixture was fit with
     GaussianMixture mix;
 };
 static std::unordered_map<std::string, SplatMeshCache> g_meshCache;
+static std::mutex g_meshCacheMutex;
 
-static SplatMeshCache* GetMeshCache(const std::string& path) {
-    auto it = g_meshCache.find(path);
-    if (it != g_meshCache.end()) return &it->second;
-    SplatMeshCache c;
-    if (!LoadNormalized(path, c.tris)) return nullptr;
-    return &g_meshCache.emplace(path, std::move(c)).first->second;
+static SplatMeshCache* GetMeshCache(const std::string& path, const PlyLoadOptions& ply) {
+    SplatMeshCache& c = g_meshCache[path];   // an empty entry the first time
+    if (IsCapture(path)) {
+        if (c.capture && c.cropUsed == ply.cropRadius && c.upUsed == (int)ply.up) return &c;
+        c = SplatMeshCache();                // new crop or up axis: reload everything
+        c.capture = true;
+        if (!PlyLoader::Load(path, c.splats, ply)) {
+            g_meshCache.erase(path);
+            return nullptr;
+        }
+        c.cropUsed = ply.cropRadius;
+        c.upUsed   = (int)ply.up;
+        return &c;
+    }
+    if (c.tris.empty() && !LoadNormalized(path, c.tris)) {
+        g_meshCache.erase(path);
+        return nullptr;
+    }
+    return &c;
+}
+
+// How much of the shape a capture splat stands for: opacity x footprint.
+static float SplatWeight(const Splat& s) {
+    return s.opacity * s.scale.x * s.scale.y;
+}
+
+// Points spread over a capture the way MeshSampler spreads them over a mesh:
+// pick splats in proportion to their weight, then a random point inside each
+// picked splat's Gaussian.
+static std::vector<glm::vec3> SampleSplats(const std::vector<Splat>& splats, int count,
+                                           unsigned int seed) {
+    std::vector<double> w(splats.size());
+    for (size_t i = 0; i < splats.size(); ++i) w[i] = SplatWeight(splats[i]);
+    std::discrete_distribution<size_t> pick(w.begin(), w.end());
+    std::normal_distribution<float> gauss(0.0f, 1.0f);
+    std::mt19937 rng(seed);
+
+    std::vector<glm::vec3> pts(count);
+    for (glm::vec3& p : pts) {
+        const Splat& s = splats[pick(rng)];
+        glm::vec3 local(gauss(rng), gauss(rng), gauss(rng));
+        p = s.mean + s.rot * (s.scale * local);
+    }
+    return pts;
+}
+
+// n of a capture's m splats, without replacement, in proportion to their
+// weight (weighted reservoir sampling: the n smallest -log(u) / w win). The
+// kept splats widen by sqrt(m / n), so n of them still cover what m did, but
+// at most 2x: captures are many splats thick, so they keep covering anyway,
+// and wider splats only blur.
+static std::vector<Splat> SubsampleSplats(const std::vector<Splat>& splats, int n,
+                                          float sizeMul, unsigned int seed) {
+    const size_t m = splats.size();
+    std::vector<int> order(m);
+    std::iota(order.begin(), order.end(), 0);
+    if ((size_t)n < m) {
+        std::mt19937 rng(seed);
+        std::uniform_real_distribution<float> uni(1e-7f, 1.0f);
+        std::vector<float> key(m);
+        for (size_t i = 0; i < m; ++i)
+            key[i] = -std::log(uni(rng)) / std::max(SplatWeight(splats[i]), 1e-12f);
+        std::nth_element(order.begin(), order.begin() + n, order.end(),
+                         [&](int a, int b) { return key[a] < key[b]; });
+        order.resize(n);
+    }
+
+    float widen = std::min(std::sqrt((float)m / (float)order.size()), 2.0f);
+    std::vector<Splat> out(order.size());
+    for (size_t k = 0; k < order.size(); ++k) {
+        Splat s = splats[order[k]];
+        s.scale *= sizeMul * glm::vec3(widen, widen, 1.0f);   // z is the thin axis
+        out[k] = s;
+    }
+    return out;
+}
+
+// The n splats a shape brings to the bake.
+static std::vector<Splat> BakeSplats(const SplatMeshCache& c, int n, float sizeMul, unsigned int seed) {
+    return c.capture ? SubsampleSplats(c.splats, n, sizeMul, seed)
+                     : SplatGenerator::FromTriangles(c.tris, n, sizeMul, seed);
+}
+
+// Typical splat radius among the n baked splats; sets the neighbour-search cell size.
+static float SplatRadius(const SplatMeshCache& c, const std::vector<Splat>& splats, float sizeMul) {
+    if (!c.capture) return sizeMul * SplatGenerator::BaseSigma(c.tris, (int)splats.size());
+    std::vector<float> r(splats.size());
+    for (size_t i = 0; i < splats.size(); ++i) r[i] = std::sqrt(splats[i].scale.x * splats[i].scale.y);
+    std::nth_element(r.begin(), r.begin() + r.size() / 2, r.end());
+    return r[r.size() / 2];
 }
 
 static void EnsureMixture(SplatMeshCache& c, int K, int samples) {
     if (c.mixK == K && c.mixSamples == samples) return;
-    c.mix.Fit(MeshSampler::Sample(c.tris, samples), K);
+    c.mix.Fit(c.capture ? SampleSplats(c.splats, samples, 7u) : MeshSampler::Sample(c.tris, samples), K);
     c.mixK = K;
     c.mixSamples = samples;
 }
@@ -677,24 +973,70 @@ static int RefineMatch(const std::vector<glm::vec3>& y, const std::vector<glm::v
     return pass;
 }
 
+// How much the OT path stretches a splat's surface patch halfway, beyond what
+// the log-lerp of its end sizes already does. Under a linear map M the patch
+// spanned by unit tangents t1, t2 gets area |M t1 x M t2|: the area 2-form
+// pulled back by M, i.e. the wedge of the pushed tangents. Along the path
+// M_t = (1 - t) I + t J that area is a(t), with a(0) = 1. The log-lerp of the
+// end sizes already reaches sqrt(a(1)) halfway, so the extra linear size is
+//   s = sqrt(a(1/2) / sqrt(a(1)))
+// Clamped to [0.5, 2] so one badly stretched splat can't blow up.
+static float MidwayStretch(const glm::quat& rot, const Eigen::Matrix3d& J) {
+    glm::vec3 t1 = rot * glm::vec3(1, 0, 0);
+    glm::vec3 t2 = rot * glm::vec3(0, 1, 0);
+    Eigen::Vector3d u(t1.x, t1.y, t1.z);
+    Eigen::Vector3d v(t2.x, t2.y, t2.z);
+    Eigen::Matrix3d Mhalf = 0.5 * (Eigen::Matrix3d::Identity() + J);
+    double aHalf = (Mhalf * u).cross(Mhalf * v).norm();
+    double aEnd  = (J * u).cross(J * v).norm();
+    if (aEnd < 1e-12) return 1.0f;
+    double s = std::sqrt(aHalf / std::sqrt(aEnd));
+    return (float)std::clamp(s, 0.5, 2.0);
+}
+
 static SplatBakeResult RunSplatBake(SplatBakeSettings st) {
     SplatBakeResult res;
+    res.pathA = st.pathA;
+    res.pathB = st.pathB;
+    res.ply   = st.ply;
     auto t0 = std::chrono::steady_clock::now();
+    std::lock_guard<std::mutex> lock(g_meshCacheMutex);   // A and B live in the shared cache
 
     SetBakeStage(0, 2);
-    SplatMeshCache* A = GetMeshCache(st.pathA);
+    SplatMeshCache* A = GetMeshCache(st.pathA, st.ply);
     g_bakeDone++;
-    SplatMeshCache* B = GetMeshCache(st.pathB);
+    SplatMeshCache* B = GetMeshCache(st.pathB, st.ply);
     g_bakeDone++;
+    res.loadMs = MsSince(t0);
     if (!A || !B) return res;
+    if (A->capture) res.cleanedA = A->splats.size();
+    if (B->capture) res.cleanedB = B->splats.size();
 
-    // Same count on both surfaces; each surface sizes its own splats from its
-    // area, so both ends are fully covered.
-    std::vector<Splat> splatsA = SplatGenerator::FromTriangles(A->tris, st.splatCount, st.sizeMul, 42u);
-    std::vector<Splat> splatsB = SplatGenerator::FromTriangles(B->tris, st.splatCount, st.sizeMul, 43u);
+    // Same count on both shapes (a capture can't give more splats than it has);
+    // each shape sizes its own splats, so both ends are fully covered.
+    int count = st.splatCount;
+    if (A->capture) count = std::min(count, (int)A->splats.size());
+    if (B->capture) count = std::min(count, (int)B->splats.size());
+    std::vector<Splat> splatsA = BakeSplats(*A, count, st.sizeMul, 42u);
+    std::vector<Splat> splatsB = BakeSplats(*B, count, st.sizeMul, 43u);
     const int n = (int)std::min(splatsA.size(), splatsB.size());
     splatsA.resize(n);
     splatsB.resize(n);
+    const float radiusA = SplatRadius(*A, splatsA, st.sizeMul);
+    const float radiusB = SplatRadius(*B, splatsB, st.sizeMul);
+
+    // A capture that lost splats to the subsample is shown in full at rest
+    // (up to kSplatMax, the most the GPU path is built for)
+    auto fullCapture = [&](const SplatMeshCache& c, unsigned int seed) {
+        std::vector<Splat> full;
+        if (!c.capture || c.splats.size() <= (size_t)n) return full;
+        if (c.splats.size() > (size_t)kSplatMax) return SubsampleSplats(c.splats, kSplatMax, st.sizeMul, seed);
+        full = c.splats;
+        for (Splat& s : full) s.scale *= st.sizeMul;
+        return full;
+    };
+    res.restA = fullCapture(*A, 44u);
+    res.restB = fullCapture(*B, 45u);
 
     // Mixture fit on surface samples; K = 1 reproduces the original single map
     SetBakeStage(1, 1);
@@ -707,6 +1049,8 @@ static SplatBakeResult RunSplatBake(SplatBakeSettings st) {
     // should go on B (keeps "which part goes where").
     SetBakeStage(3, n);
     std::vector<glm::vec3> y(n), bPos(n);
+    std::vector<double> detJ(n);
+    res.stretch.resize(n);
     {
         std::vector<int> idx(n);
         std::iota(idx.begin(), idx.end(), 0);
@@ -714,8 +1058,24 @@ static SplatBakeResult RunSplatBake(SplatBakeSettings st) {
             Eigen::Matrix3d J;
             OptimalTransport::ApplyMixture(map, splatsA[i].mean, y[i], J);
             bPos[i] = splatsB[i].mean;
+            detJ[i] = J.determinant();   // volume form ratio: the Monge-Ampere factor
+            res.stretch[i] = MidwayStretch(splatsA[i].rot, J);
         });
         g_bakeDone = n;
+    }
+    if (n > 0) {
+        std::vector<double> d = detJ;
+        std::sort(d.begin(), d.end());
+        res.detMin = d.front();
+        res.detMed = d[d.size() / 2];
+        res.detMax = d.back();
+    }
+    // K = 1: one Gaussian map, so det J must equal sqrt(det Sigma_B / det Sigma_A)
+    if (st.mixtureK == 1 && !map.maps.empty()) {
+        double expect = std::sqrt(B->mix.components[0].covariance.determinant() /
+                                  A->mix.components[0].covariance.determinant());
+        std::cout << "[Splats] det J " << res.detMed << " vs closed form sqrt(det SB / det SA) "
+                  << expect << "\n";
     }
 
     // Fine: one-to-one matching of the mapped points to B's splats
@@ -724,7 +1084,7 @@ static SplatBakeResult RunSplatBake(SplatBakeSettings st) {
     std::vector<int> perm = MedianSplitMatch(y, bPos);
     double splitCost = MatchCost(y, bPos, perm);
     g_bakeDone = n;
-    float cell = 2.0f * st.sizeMul * SplatGenerator::BaseSigma(B->tris, n);
+    float cell = 2.0f * radiusB;
     int passes = RefineMatch(y, bPos, perm, cell, maxPasses);
     double refinedCost = MatchCost(y, bPos, perm);
     res.meanMatchDist = std::sqrt(refinedCost / n);
@@ -764,7 +1124,7 @@ static SplatBakeResult RunSplatBake(SplatBakeSettings st) {
         std::vector<glm::vec3> aPos(n);
         for (int i = 0; i < n; ++i) aPos[i] = res.start[i].mean;
         PointGrid g;
-        g.Build(aPos, 2.0f * st.sizeMul * SplatGenerator::BaseSigma(A->tris, n));
+        g.Build(aPos, 2.0f * radiusA);
 
         std::for_each(std::execution::par, idx.begin(), idx.end(), [&](int i) {
             std::vector<std::pair<float, int>> cand;
@@ -817,6 +1177,8 @@ static SplatBakeResult RunSplatBake(SplatBakeSettings st) {
               << " vs nearest-point bound " << res.nearestBound << "\n";
     std::cout << "[Splats] neighbour displacement spread: raw " << rawSpread
               << " -> smoothed " << smoothSpread << "\n";
+    std::cout << "[Splats] map volume ratio det J: min " << res.detMin << ", median " << res.detMed
+              << ", max " << res.detMax << "\n";
     res.ok = true;
     return res;
 }
@@ -837,6 +1199,7 @@ void Window::BakeSplatMorph(const std::string& pathA, const std::string& pathB) 
     st.sizeMul       = splatSizeMul;
     st.sinkhornEps   = sinkhornEps;
     st.posteriorTemp = posteriorTemp;
+    st.ply           = plyOptions;
 
     g_stageNames = kBakeStageNames;
     g_stageCount = 6;
@@ -864,16 +1227,23 @@ void Window::PollSplatBake() {
         std::cerr << "[Splats] bake failed: could not load meshes\n";
         return;
     }
+    if (res.cleanedA > 0) RecordCleanedCount(CaptureKey(res.pathA, res.ply), res.cleanedA);
+    if (res.cleanedB > 0) RecordCleanedCount(CaptureKey(res.pathB, res.ply), res.cleanedB);
     // user pressed Clear or left Splats mode while the bake was running
     if (g_bakeLaunchEpoch != g_bakeEpoch || renderMode != RenderMode::Splats) return;
 
     splatStart   = std::move(res.start);
     splatEnd        = std::move(res.end);
     splatSmoothDisp = std::move(res.smoothDisp);
+    splatStretch    = std::move(res.stretch);
     splatCurrent    = splatStart;
 
     // GPU path: the keyframes go up once; each frame then only sends the time
-    if (gpuAvailable) splatRenderer->UploadKeyframes(splatStart, splatEnd, splatSmoothDisp);
+    if (gpuAvailable) {
+        splatRenderer->UploadKeyframes(splatStart, splatEnd, splatSmoothDisp, splatStretch);
+        g_fullSplats[0]->UploadKeyframes(res.restA, res.restA, {});   // empty = none
+        g_fullSplats[1]->UploadKeyframes(res.restB, res.restB, {});
+    }
 
     // The animator only provides the timeline (easing, duration, state)
     animator->InitializeWithEndPoints({}, {});
@@ -882,23 +1252,112 @@ void Window::PollSplatBake() {
     trueMorphActive     = false;
     particleMorphActive = false;
     lastBakeMs          = (float)res.ms;
+    g_perf.ObserveBake((int)splatStart.size(), res.ms - res.loadMs);
+    g_refitQuality = true;
 
     std::cout << "[Splats] baked " << splatStart.size() << " matched splats, K=" << mixtureK
               << ", mean match distance " << res.meanMatchDist << ", " << res.ms << " ms\n";
 }
 
-// Show mesh A (or the default blob) as static splats until a morph is baked.
-// Regenerates only when the inputs change.
+// What the preview worker hands back for a capture.
+struct CapturePreview {
+    std::vector<Splat> splats;   // what to show, unscaled (Splat Size is applied later)
+    std::string countKey;        // CaptureKey of the capture
+    size_t cleaned = 0;          // splats it kept after cleaning; 0 = the load failed
+};
+
+static const int kCpuPreviewMax = 50000;   // the CPU path sorts every frame, so show a subsample
+
+// Runs on a worker. Loads through the bake's cache, so the bake won't parse
+// the file again, and keeps at most maxCount splats.
+static CapturePreview LoadCapturePreview(std::string path, PlyLoadOptions ply, int maxCount) {
+    std::lock_guard<std::mutex> lock(g_meshCacheMutex);
+    CapturePreview out;
+    out.countKey = CaptureKey(path, ply);
+    SplatMeshCache* c = GetMeshCache(path, ply);
+    if (!c) return out;
+    out.cleaned = c->splats.size();
+    if (c->splats.size() > (size_t)maxCount) out.splats = SubsampleSplats(c->splats, maxCount, 1.0f, 42u);
+    else                                     out.splats = c->splats;
+    return out;
+}
+
+// Source A is a capture. A big .ply takes seconds to parse, so it loads on a
+// worker and the window keeps running; nothing is shown until it lands. Once
+// it's on screen, the Splat Size slider only rescales it: the GPU path applies
+// it at draw time, the CPU path rescales its kept subsample.
+// resume: we're coming back from another preview, so splatCurrent is stale.
+static void UpdateCapturePreview(const std::string& path, bool gpu, bool resume) {
+    static std::future<CapturePreview> pending;
+    static std::string pendingKey, shownKey, failedKey;   // capture being loaded / on screen / unreadable
+    static std::vector<Splat> cpuBase;                     // CPU path: the unscaled subsample
+    static float shownSize = -1.0f;
+
+    std::string key = CaptureKey(path, Window::plyOptions) + (gpu ? "|gpu|" : "|cpu|") +
+                      std::to_string(splatPreviewGen);
+    if (resume) shownSize = -1.0f;
+
+    // a finished load: show it if it's still the one wanted
+    if (pending.valid() && pending.wait_for(std::chrono::seconds(0)) == std::future_status::ready) {
+        CapturePreview p = pending.get();
+        if (p.cleaned > 0) RecordCleanedCount(p.countKey, p.cleaned);
+        if (pendingKey == key) {
+            if (p.cleaned == 0) {
+                failedKey = key;   // don't retry every frame
+            } else {
+                shownKey  = key;
+                shownSize = -1.0f;
+                if (gpu) g_fullSplats[0]->UploadKeyframes(p.splats, p.splats, {});
+                else     cpuBase = std::move(p.splats);
+            }
+        }
+        pendingKey.clear();
+    }
+
+    if (shownKey != key) {
+        g_previewOnGpu = false;
+        Window::splatCurrent.clear();
+        if (!pending.valid() && key != failedKey) {
+            pendingKey = key;
+            int maxCount = gpu ? kSplatMax : kCpuPreviewMax;
+            pending = std::async(std::launch::async, LoadCapturePreview, path, Window::plyOptions, maxCount);
+        }
+        return;
+    }
+
+    if (gpu) {
+        g_previewOnGpu = true;
+    } else if (shownSize != Window::splatSizeMul) {
+        shownSize = Window::splatSizeMul;
+        Window::splatCurrent = cpuBase;
+        for (Splat& s : Window::splatCurrent) s.scale *= shownSize;
+    }
+}
+
+// Show source A (mesh, capture or the default blob) as static splats until a
+// morph is baked. Regenerates only when the inputs change.
 void Window::UpdateSplatPreview() {
     static int   lastIndex = -1, lastCount = -1, lastGen = -1;
     static float lastSize  = -1.0f;
-    if (lastIndex == meshIndexA && lastCount == splatCount &&
-        lastSize == splatSizeMul && lastGen == splatPreviewGen)
-        return;
-    lastIndex = meshIndexA; lastCount = splatCount;
-    lastSize = splatSizeMul; lastGen = splatPreviewGen;
+    static bool  lastWasCapture = false;
 
-    if (meshIndexA > 0 && meshIndexA <= (int)meshPaths.size()) {
+    bool hasShape = meshIndexA > 0 && meshIndexA <= (int)meshPaths.size();
+    if (hasShape && IsCapture(meshPaths[meshIndexA - 1])) {
+        UpdateCapturePreview(meshPaths[meshIndexA - 1], useGpu && gpuAvailable, !lastWasCapture);
+        lastWasCapture = true;
+        lastIndex = -1;   // the mesh / blob preview must rebuild when we come back
+        return;
+    }
+    lastWasCapture = false;
+    g_previewOnGpu = false;
+
+    if (lastIndex == meshIndexA && lastCount == splatCount && lastSize == splatSizeMul &&
+        lastGen == splatPreviewGen)
+        return;
+    lastIndex = meshIndexA; lastCount = splatCount; lastSize = splatSizeMul;
+    lastGen = splatPreviewGen;
+
+    if (hasShape) {
         // keep the loaded mesh so dragging the count/size sliders doesn't reload it
         static std::vector<Triangle> tris;
         static int loadedIndex = -1;
@@ -1010,8 +1469,11 @@ static bool LoadMorphMesh(const std::string& path, IndexedMesh& m, TopologyInfo&
     if (!LoadNormalized(path, tris)) return false;
     MeshTopology::Build(tris, m);
     int filled = MeshTopology::FillSmallHoles(m, 40);
+    // the signed volume in OrientOutward only means something once the winding agrees
+    bool orientable = MeshTopology::OrientConsistently(m);
     MeshTopology::OrientOutward(m);
     info = MeshTopology::Analyze(m);
+    info.orientable = orientable;
     std::cout << "[Morph] " << path << ": " << info.Describe();
     if (filled) std::cout << " (" << filled << " small holes filled)";
     std::cout << "\n";
@@ -1028,9 +1490,14 @@ static std::string TopologyMismatch(const TopologyInfo& a, const std::string& na
             return *names[k] + " has " + std::to_string(infos[k]->parts) + " parts";
         if (infos[k]->nonManifoldEdges > 0)
             return *names[k] + " has non-manifold edges";
+        if (!infos[k]->orientable)
+            return *names[k] + " is non-orientable";
     }
+    if (a.genus != b.genus)
+        return "different genus (" + std::to_string(a.genus) + " vs " + std::to_string(b.genus) + ")";
     if (a.euler != b.euler)
-        return "different genus (chi " + std::to_string(a.euler) + " vs " + std::to_string(b.euler) + ")";
+        return "different Euler characteristic (chi " + std::to_string(a.euler) + " vs " +
+               std::to_string(b.euler) + ")";
     if (a.boundaryLoops != b.boundaryLoops)
         return "different number of holes (" + std::to_string(a.boundaryLoops) + " vs " +
                std::to_string(b.boundaryLoops) + ")";
@@ -1044,6 +1511,7 @@ struct TrueMorphSettings {
     MorphMethod method;
     int   sdfResolution, sampleCount;
     float fitStiffness;
+    bool  fitCotan;
 };
 
 struct TrueMorphResult {
@@ -1113,6 +1581,7 @@ static TrueMorphResult RunTrueMorphBake(TrueMorphSettings st) {
 
         FitParams params;
         params.stiffnessScale = st.fitStiffness;
+        params.cotanLaplacian = st.fitCotan;
         FitStats stats;
         std::vector<glm::vec3> fitted = MeshFitter::Fit(tmpl, aligned,
                                                         templateIsA ? trisB : trisA, params, &stats);
@@ -1168,6 +1637,7 @@ void Window::BakeTrueMorph(const std::string& pathA, const std::string& pathB) {
     st.sdfResolution = sdfResolution;
     st.sampleCount   = sampleCount;
     st.fitStiffness  = fitStiffness;
+    st.fitCotan      = fitCotan;
 
     g_stageNames = kMorphStageNames;
     g_stageCount = 3;
@@ -1398,8 +1868,10 @@ void Window::DrawMainGUI() {
 
     bool hasA = meshIndexA > 0, hasB = meshIndexB > 0;
     bool needsMeshes = renderMode != RenderMode::Particles;
+    bool captureOutsideSplats = renderMode != RenderMode::Splats &&
+        ((hasA && IsCapture(meshPaths[meshIndexA - 1])) || (hasB && IsCapture(meshPaths[meshIndexB - 1])));
     bool baking  = splatBaking || morphBaking;
-    bool canBake = !baking && (!needsMeshes || (hasA && hasB));
+    bool canBake = !baking && !captureOutsideSplats && (!needsMeshes || (hasA && hasB));
 
     // ---- 3. Transport ----
     ImGui::SeparatorText("Transport");
@@ -1434,6 +1906,8 @@ void Window::DrawMainGUI() {
 
     if (needsMeshes && !(hasA && hasB))
         ImGui::TextColored(ImVec4(1.0f, 0.55f, 0.4f, 1.0f), "Pick a mesh for both A and B to bake.");
+    if (captureOutsideSplats)
+        ImGui::TextColored(ImVec4(1.0f, 0.55f, 0.4f, 1.0f), ".ply captures only work in Splats mode.");
 
     // Status: bake progress while baking, then the timeline position
     if (baking) {
@@ -1457,34 +1931,97 @@ void Window::DrawMainGUI() {
     // ---- 4. Settings for the selected type ----
     ImGui::Spacing();
     if (ImGui::CollapsingHeader("Settings", ImGuiTreeNodeFlags_DefaultOpen)) {
-        if (renderMode == RenderMode::Particles) {
-            ImGui::SliderInt("Particles", &particleCount, 100, 10000);
-            ImGui::SliderFloat("Particle Radius", &particleSystem->particleRadius, 0.01f, 1.0f);
-        } else if (renderMode == RenderMode::TriangleMorph) {
-            const char* methods[] = { "Auto", "Shared Topology", "SDF" };
-            int m = (int)morphMethod;
-            if (ImGui::Combo("Method", &m, methods, 3)) morphMethod = (MorphMethod)m;
-            HintText(morphMethod == MorphMethod::Auto ? "Shared topology if both meshes match, else SDF" :
-                     morphMethod == MorphMethod::SharedTopology ? "Fit the denser mesh onto the other" :
-                                                                  "Distance-field blend: any genus / parts");
-            ImGui::SliderFloat("Fit Stiffness", &fitStiffness, 0.1f, 10.0f, "%.2f", ImGuiSliderFlags_Logarithmic);
-            ImGui::SetItemTooltip("Shared topology: how stiffly the template keeps its shape while fitting");
-            ImGui::SliderInt("SDF Resolution", &sdfResolution, 32, 160);
-            ImGui::SetItemTooltip("SDF: grid points per axis (higher = finer, slower)");
-        } else {
-            ImGui::SliderInt("Splats", &splatCount, 1000, 500000, "%d", ImGuiSliderFlags_Logarithmic);
-            ImGui::SliderFloat("Splat Size", &splatSizeMul, 0.3f, 3.0f);
-            ImGui::SliderFloat("Cohesion", &splatCohesion, 0.0f, 1.0f);
-            ImGui::SetItemTooltip("0 = every splat flies straight\n1 = neighbours move together as chunks");
-            ImGui::SliderInt("Mixture K", &mixtureK, 1, 128);
-            ImGui::SetItemTooltip("Gaussians fitted per shape for the OT map\n1 = original single-Gaussian map");
-            ImGui::SliderFloat("Sinkhorn eps", &sinkhornEps, 0.005f, 0.5f, "%.3f", ImGuiSliderFlags_Logarithmic);
-            ImGui::SetItemTooltip("Softness of the cluster-to-cluster transport plan");
-            ImGui::SliderFloat("Blend Temp", &posteriorTemp, 0.25f, 8.0f, "%.2f", ImGuiSliderFlags_Logarithmic);
-            ImGui::SetItemTooltip("How smoothly each splat blends between nearby clusters");
+        // Quality: one bar for every costly setting. The bar moves freely while
+        // dragging; the settings follow on release (a new count rebuilds the preview).
+        int ceiling = SplatCeiling();
+        QualitySettings atBar = SettingsFor(quality, ceiling);
+        bool custom = !MatchesQuality(atBar);
+        const char* tier = quality < 0.25f ? "Low" : quality < 0.5f ? "Medium" :
+                           quality < 0.75f ? "High" : "Ultra";
+        char barText[64];
+        if (custom)
+            snprintf(barText, sizeof(barText), "Custom");
+        else if (renderMode == RenderMode::Splats)
+            snprintf(barText, sizeof(barText), "%s - %dk splats", tier, (atBar.splatCount + 500) / 1000);
+        else if (renderMode == RenderMode::TriangleMorph)
+            snprintf(barText, sizeof(barText), "%s - SDF %d", tier, atBar.sdfResolution);
+        else
+            snprintf(barText, sizeof(barText), "%s - %d particles", tier, atBar.particleCount);
+
+        ImGui::SetNextItemWidth(ImGui::CalcItemWidth() - ImGui::GetFrameHeight() -
+                                ImGui::GetStyle().ItemInnerSpacing.x - ImGui::CalcTextSize("Auto").x);
+        ImGui::SliderFloat("##quality", &quality, 0.0f, 1.0f, barText, ImGuiSliderFlags_NoInput);
+        if (ImGui::IsItemActivated()) autoQuality = false;
+        if (ImGui::IsItemDeactivatedAfterEdit()) ApplySettings(SettingsFor(quality, ceiling));
+        ImGui::SetItemTooltip("Left = fast, right = fine.\nMoves the splat count, mixture K, samples,\n"
+                              "SDF resolution and particle count together.");
+        ImGui::SameLine(0.0f, ImGui::GetStyle().ItemInnerSpacing.x);
+        ImGui::Checkbox("Auto", &autoQuality);
+        ImGui::SetItemTooltip("Pick the quality from the chosen shapes and how fast\n"
+                              "this machine has baked and drawn so far");
+        ImGui::SameLine(0.0f, ImGui::GetStyle().ItemInnerSpacing.x);
+        ImGui::TextUnformatted("Quality");
+        if (renderMode == RenderMode::Splats) {
+            int n = custom ? splatCount : atBar.splatCount;
+            char est[96];
+            snprintf(est, sizeof(est), "~%.1f s bake, ~%.1f ms per frame (GPU)",
+                     g_perf.PredictBakeMs(n) / 1000.0, g_perf.PredictFrameMs(n));
+            HintText(est);
         }
-        ImGui::SliderInt("Mesh Samples", &sampleCount, 500, 20000);
-        ImGui::SetItemTooltip("Surface points used to fit the Gaussians for the OT map");
+
+        // Settings the bar doesn't touch
+        if (renderMode == RenderMode::Splats) {
+            ImGui::SeparatorText("Captures (.ply)");
+            // Changing the crop reloads the capture, so apply it on release, not while dragging
+            static float crop = plyOptions.cropRadius;
+            ImGui::SliderFloat("Crop Radius", &crop, 1.0f, 4.0f);
+            if (ImGui::IsItemDeactivatedAfterEdit()) plyOptions.cropRadius = crop;
+            ImGui::SetItemTooltip("Keep splats within this many times the capture's typical radius");
+            const char* upAxes[] = { "As is", "Flip Y (COLMAP)", "Rotate X +90", "Rotate X -90" };
+            int up = (int)plyOptions.up;
+            if (ImGui::Combo("Up Axis", &up, upAxes, 4)) plyOptions.up = (PlyLoadOptions::Up)up;
+        }
+
+        // Advanced: every setting by hand. Editing a costly one turns Auto off,
+        // so a model change doesn't overwrite it.
+        if (ImGui::TreeNode("Advanced")) {
+            if (renderMode == RenderMode::Particles) {
+                if (ImGui::SliderInt("Particles", &particleCount, 100, 10000)) autoQuality = false;
+                ImGui::SliderFloat("Particle Radius", &particleSystem->particleRadius, 0.01f, 1.0f);
+            } else if (renderMode == RenderMode::TriangleMorph) {
+                const char* methods[] = { "Auto", "Shared Topology", "SDF" };
+                int m = (int)morphMethod;
+                if (ImGui::Combo("Method", &m, methods, 3)) morphMethod = (MorphMethod)m;
+                HintText(morphMethod == MorphMethod::Auto ? "Shared topology if both meshes match, else SDF" :
+                         morphMethod == MorphMethod::SharedTopology ? "Fit the denser mesh onto the other" :
+                                                                      "Distance-field blend: any genus / parts");
+                ImGui::SliderFloat("Fit Stiffness", &fitStiffness, 0.1f, 10.0f, "%.2f", ImGuiSliderFlags_Logarithmic);
+                ImGui::SetItemTooltip("Shared topology: how stiffly the template keeps its shape while fitting");
+                ImGui::Checkbox("Cotan Laplacian", &fitCotan);
+                ImGui::SetItemTooltip("Shared topology: weight the shape-keeping term by triangle angles\n"
+                                      "(cotan Laplacian) instead of treating every neighbour the same");
+                if (ImGui::SliderInt("SDF Resolution", &sdfResolution, 32, 160)) autoQuality = false;
+                ImGui::SetItemTooltip("SDF: grid points per axis (higher = finer, slower)");
+            } else {
+                if (ImGui::SliderInt("Splats", &splatCount, 1000, 500000, "%d", ImGuiSliderFlags_Logarithmic))
+                    autoQuality = false;
+                ImGui::SliderFloat("Splat Size", &splatSizeMul, 0.3f, 3.0f);
+                ImGui::SliderFloat("Cohesion", &splatCohesion, 0.0f, 1.0f);
+                ImGui::SetItemTooltip("0 = every splat flies straight\n1 = neighbours move together as chunks");
+                ImGui::Checkbox("Area-preserving splats", &splatAreaPreserve);
+                ImGui::SetItemTooltip("Mid-flight, grow or shrink each splat by how much the OT map\n"
+                                      "stretches its patch of surface (exact size at both ends)");
+                if (ImGui::SliderInt("Mixture K", &mixtureK, 1, 128)) autoQuality = false;
+                ImGui::SetItemTooltip("Gaussians fitted per shape for the OT map\n1 = original single-Gaussian map");
+                ImGui::SliderFloat("Sinkhorn eps", &sinkhornEps, 0.005f, 0.5f, "%.3f", ImGuiSliderFlags_Logarithmic);
+                ImGui::SetItemTooltip("Softness of the cluster-to-cluster transport plan");
+                ImGui::SliderFloat("Blend Temp", &posteriorTemp, 0.25f, 8.0f, "%.2f", ImGuiSliderFlags_Logarithmic);
+                ImGui::SetItemTooltip("How smoothly each splat blends between nearby clusters");
+            }
+            if (ImGui::SliderInt("Mesh Samples", &sampleCount, 500, 20000)) autoQuality = false;
+            ImGui::SetItemTooltip("Surface points used to fit the Gaussians for the OT map");
+            ImGui::TreePop();
+        }
     }
 
     // ---- 5. Performance ----
@@ -1509,6 +2046,8 @@ void Window::DrawMainGUI() {
         };
         ImGui::Text("Frame        %.2f ms (%.0f FPS)", 1000.0f / ImGui::GetIO().Framerate,
                     ImGui::GetIO().Framerate);
+        ImGui::TextDisabled("Auto quality budget: bake <= %.0f s, GPU frame <= %.0f ms",
+                            kBakeBudgetMs / 1000.0, kFrameBudgetMs);
         ImGui::Text("CPU update   %s", ms(g_cpuUpdateMs));
         ImGui::Text("CPU draw     %s", ms(g_cpuDrawMs));
         bool gpuSplats = renderMode == RenderMode::Splats && splatMorphActive && SplatsOnGpu();

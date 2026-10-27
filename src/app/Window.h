@@ -9,6 +9,7 @@
 #include "TransportAnimator.h"
 #include "MeshRenderer.h"
 #include "SplatRenderer.h"
+#include "PlyLoader.h"
 
 #include <string>
 #include <vector>
@@ -44,6 +45,7 @@ public:
     static MorphMethod morphMethod;
     static int         sdfResolution;    // SDF grid points per axis
     static float       fitStiffness;     // multiplier on the template-fit stiffness schedule
+    static bool        fitCotan;         // cotan vs uniform Laplacian in the template fit
     static bool        trueMorphActive;
     static bool        morphBaking;      // a background Topology bake is running
     static std::string morphStatus;      // which method ran, and why
@@ -61,6 +63,8 @@ public:
     static std::vector<Splat> splatStart, splatEnd, splatCurrent;
     static std::vector<glm::vec3> splatSmoothDisp;   // neighbour-averaged displacement per splat
     static float splatCohesion;      // 0 = straight lines, 1 = neighbours move as chunks
+    static bool  splatAreaPreserve;  // size splats mid-flight by the OT map's area stretch
+    static std::vector<float> splatStretch;   // per splat: that stretch at the halfway point
     static bool  splatMorphActive;
     static bool  splatBaking;        // a background bake is running
     static float lastBakeMs;         // duration of the last finished bake
@@ -69,6 +73,13 @@ public:
     static int   mixtureK;           // Gaussian-mixture components (1 = original single map)
     static float sinkhornEps;        // relative entropic regularization
     static float posteriorTemp;      // softness of the per-splat component blend
+    static PlyLoadOptions plyOptions;   // how .ply captures are cropped and turned upright
+
+    // One bar for the costly settings (splat count, mixture K, samples, SDF
+    // resolution, particles): 0 = fastest, 1 = finest. Auto fits it to the
+    // chosen shapes and to how fast this machine has been.
+    static float quality;
+    static bool  autoQuality;
 
     // Gaussian OT pipeline
     static Gaussian* gaussianA;

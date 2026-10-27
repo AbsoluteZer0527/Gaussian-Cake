@@ -35,14 +35,18 @@ public:
     bool InitializeGpu();
 
     // start[i] travels to end[i]; smoothDisp may be empty (straight paths).
+    // stretch: per-splat halfway size factor (empty = 1 for every splat).
     void UploadKeyframes(const std::vector<Splat>& start, const std::vector<Splat>& end,
-                         const std::vector<glm::vec3>& smoothDisp);
+                         const std::vector<glm::vec3>& smoothDisp,
+                         const std::vector<float>& stretch = {});
 
     // e = eased time, g = cohesion weight, grow = mid-flight size factor
     // (the same values the CPU loop in Window::idleCallback uses).
-    void DrawMorph(float e, float g, float grow, const glm::mat4& view, const glm::mat4& proj);
+    // stretchOn = 1 applies the per-splat stretch, 0 ignores it
+    void DrawMorph(float e, float g, float grow, float stretchOn, const glm::mat4& view, const glm::mat4& proj);
 
     bool HasKeyframes() const { return gpuCount > 0; }
+    int  Count() const { return gpuCount; }
 
     // Splats sorted on the GPU last frame, back to front (debug readback; stalls).
     bool CheckGpuSortOrder(std::vector<uint32_t>* keysOut = nullptr);

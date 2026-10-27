@@ -35,3 +35,5 @@
 out/
 build/
 .vs/
+# 3DGS captures are large; see README for where to get them
+meshes/*.ply

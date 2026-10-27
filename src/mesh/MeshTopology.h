@@ -1,6 +1,8 @@
 #pragma once
 #include "core.h"
 #include "OBJLoader.h"
+#include <Eigen/Sparse>
+#include <array>
 #include <vector>
 #include <string>
 
@@ -20,8 +22,18 @@ struct TopologyInfo {
     int boundaryEdges = 0;      // edges used by one face (open holes)
     int boundaryLoops = 0;
     int nonManifoldEdges = 0;   // edges used by 3+ faces
+    int genus = 0;              // (2 parts - euler - boundaryLoops) / 2
+    bool orientable = true;     // faces can be wound consistently
 
     std::string Describe() const;
+};
+
+// Discrete exterior derivatives on a triangle mesh (0-forms live on vertices,
+// 1-forms on edges, 2-forms on faces). d1 * d0 = 0 is the discrete d o d = 0.
+struct DiscreteForms {
+    std::vector<std::array<int, 2>> edges;   // edge e = (i, j) with i < j
+    Eigen::SparseMatrix<double> d0;          // |E| x |V|: (d0 f)_e = f_j - f_i
+    Eigen::SparseMatrix<double> d1;          // |F| x |E|: +1 if the face walks e as i -> j, -1 if j -> i
 };
 
 class MeshTopology {
@@ -44,7 +56,13 @@ public:
     // point outward. Returns true if the mesh was flipped.
     static bool OrientOutward(IndexedMesh& m);
 
+    // Flip faces so every manifold edge is walked in opposite directions by
+    // its two faces. Returns false if that's impossible (non-orientable).
+    static bool OrientConsistently(IndexedMesh& m);
+
     static TopologyInfo Analyze(const IndexedMesh& m);
+
+    static DiscreteForms BuildForms(const IndexedMesh& m);
 
     // Neighbouring vertex indices of every vertex.
     static std::vector<std::vector<int>> OneRings(const IndexedMesh& m);

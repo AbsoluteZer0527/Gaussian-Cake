@@ -27,6 +27,21 @@ Dowson & Landau 1982, The Fréchet distance between multivariate normal distribu
 
 Peyré & Cuturi 2019, Computational Optimal Transport. arXiv:1803.00567
 
+### Exterior Calculus in the Pipeline
+Four parts of the morph are applications of exterior calculus (CSE 270):
+
+| Where | Identity | What it does |
+|---|---|---|
+| `MeshTopology::BuildForms` | `d1 ∘ d0 = 0` | Builds the discrete exterior derivatives (vertex → edge → face incidence). The load log prints `\|d1 d0\| = 0`. |
+| `MeshTopology::OrientConsistently` | an orientation (area form) exists | Fixes the triangle winding face by face, and detects non-orientable meshes (Möbius strip), which then use the SDF path. Topology mode also reports the genus `g = (2·parts − χ − holes)/2`. |
+| `MeshFitter` (Cotan Laplacian) | `Δ = ⋆d⋆d` → `L = d0ᵀ ⋆1 d0` | The template fit keeps its shape with the cotan Laplacian (the Hodge star `⋆1` is the cotan edge weights) instead of a uniform one. It respects the actual triangle shapes, and linear functions get exactly zero Laplacian. |
+| `sdf_common.glsl` `PhiGrad` | `d` commutes with pullback | The morph field is a pullback, `φ_t = (M_t⁻¹)*[(1−t)φ_A + t·T*φ_B]`, so the surface normal is exact: `∇φ_t = M_t⁻ᵀ[(1−t)∇φ_A + t·Aᵀ∇φ_B]`. Gradients are 1-forms and transform by the inverse transpose. This replaces the 6-sample finite difference. |
+| `MidwayStretch` (Splats) | pullback of the area 2-form | A splat's patch of surface, spanned by tangents t₁, t₂, has area `\|M t₁ ∧ M t₂\|` under the OT path `M_t`. Splats grow or shrink mid-flight to match, so they keep covering the surface (toggle: *Area-preserving splats*). The bake also logs `det J`, the Monge–Ampère volume ratio. |
+
+Wang, Nabizadeh, Chern 2023, Exterior Calculus in Graphics (course notes).
+
+Sorkine & Alexa 2007, As-Rigid-As-Possible Surface Modeling.
+
 ## Inspiration
 This project is inspired by the mathematical problem of **Optimal Transport (OT)**, which seeks a mapping between two distributions that minimizes a specified transport cost. 
 

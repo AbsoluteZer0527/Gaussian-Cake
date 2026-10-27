@@ -18,6 +18,7 @@ struct FitParams {
     float normalCosMin    = 0.5f;   // reject matches whose normals differ > 60 deg
     float backwardWeight  = 1.0f;   // pull from target samples to nearest template vertex
     int   relaxRounds     = 3;      // tangential relax + reproject after the fit
+    bool  cotanLaplacian  = true;   // cotan (geometry-aware) vs uniform Laplacian regularizer
 };
 
 struct FitStats {

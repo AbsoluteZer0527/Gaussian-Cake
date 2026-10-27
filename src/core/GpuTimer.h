@@ -30,6 +30,14 @@ public:
     // Smoothed GPU time of the block, in ms (-1 until the first result).
     double Ms() const { return ms; }
 
+    // The work changed (e.g. a new splat count): forget the average, and drop
+    // the queries still in flight, which timed the old work.
+    void Reset() {
+        for (int k = 0; k < kRing; ++k)
+            if (pending[k]) stale[k] = true;
+        ms = -1.0;
+    }
+
 private:
     static const int kRing = 4;
 
@@ -44,6 +52,7 @@ private:
             GLuint64 ns = 0;
             glGetQueryObjectui64v(queries[q], GL_QUERY_RESULT, &ns);
             pending[q] = false;
+            if (stale[q]) { stale[q] = false; continue; }
             double sample = (double)ns * 1e-6;
             ms = (ms < 0.0) ? sample : 0.9 * ms + 0.1 * sample;
         }
@@ -52,11 +61,13 @@ private:
             GLuint64 ns = 0;
             glGetQueryObjectui64v(queries[next], GL_QUERY_RESULT, &ns);
             pending[next] = false;
+            stale[next] = false;
         }
     }
 
     GLuint queries[kRing] = {};
     bool   pending[kRing] = {};
+    bool   stale[kRing] = {};     // in flight across a Reset: the result is thrown away
     bool   created = false;
     int    next = 0;
     double ms = -1.0;
