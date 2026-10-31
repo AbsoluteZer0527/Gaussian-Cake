@@ -5,6 +5,9 @@ uniform sampler3D gridA;      // signed distance of A, one texel per grid point
 uniform sampler3D gridB;
 uniform sampler3D gradA;      // gradient of gridA, distance per world unit
 uniform sampler3D gradB;
+uniform sampler3D colorA;     // colour of A's closest surface point (if hasColor)
+uniform sampler3D colorB;
+uniform int   hasColor;       // 1: the morph carries colours
 uniform int   n;              // grid points per axis
 uniform vec3  lo;             // position of grid point (0, 0, 0)
 uniform float h;              // spacing between grid points
@@ -19,6 +22,7 @@ uniform uint  indexCap;       // room in the index buffer
 struct Vertex {
     vec4 position;            // xyz used
     vec4 normal;              // xyz used
+    vec4 color;               // rgb used (display colour)
 };
 
 layout(std430, binding = 0) buffer Field    { float field[]; };      // phi_t per grid point
@@ -79,6 +83,17 @@ vec3 PhiGrad(vec3 y) {
     if (t < 1.0) g += (1.0 - t) * SampleGrad(gradA, u);
     if (t > 0.0) g += t * (transpose(Amat) * SampleGrad(gradB, Amat * u + bvec));
     return transpose(LtInv) * g;
+}
+
+// Colour of the t-surface at y: A's colour where y came from on A, B's at
+// the matching point on B, blended like Phi (same as SDFMorph::Extract).
+vec3 ColorAt(vec3 y) {
+    vec3 u  = LtInv * (y - shift);
+    vec3 qa = clamp((u - lo) / h, vec3(0.0), vec3(float(n - 1)));
+    vec3 qb = clamp((Amat * u + bvec - lo) / h, vec3(0.0), vec3(float(n - 1)));
+    vec3 ca = texture(colorA, (qa + 0.5) / float(n)).rgb;
+    vec3 cb = texture(colorB, (qb + 0.5) / float(n)).rgb;
+    return mix(ca, cb, t);
 }
 
 uint PointId(ivec3 p) { return uint((p.z * n + p.y) * n + p.x); }

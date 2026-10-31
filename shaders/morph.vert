@@ -7,12 +7,16 @@ layout (location = 0) in vec3 positionStart;
 layout (location = 1) in vec3 normalStart;
 layout (location = 2) in vec3 positionEnd;
 layout (location = 3) in vec3 normalEnd;
+layout (location = 4) in vec3 colorStart;   // per-vertex colours (used if useVertexColor is on)
+layout (location = 5) in vec3 colorEnd;
 
 uniform mat4 viewProj;
 uniform mat4 model;
 uniform float morphT;
 
 out vec3 fragNormal;
+out vec3 fragAlbedo;
+out vec2 fragUV;             // no textures on morph targets (shader.frag needs the input)
 
 void main()
 {
@@ -26,4 +30,6 @@ void main()
 
     gl_Position = viewProj * model * vec4(position, 1.0);
     fragNormal = vec3(model * vec4(normal, 0));
+    fragAlbedo = mix(colorStart, colorEnd, morphT);
+    fragUV = vec2(0.0);
 }

@@ -3,6 +3,7 @@
 
 #include <glm/gtc/type_ptr.hpp>
 #include <algorithm>
+#include <cmath>
 #include <iostream>
 
 // Matches the Counters block in sdf_common.glsl. The first five fields are the
@@ -18,8 +19,8 @@ struct SdfCounters {
     GLuint overflow;        // 1 if either ran out of room
 };
 
-// One surface vertex as the GPU stores it (std430: two vec4s).
-static const GLsizei kVertexStride = 8 * sizeof(float);
+// One surface vertex as the GPU stores it (std430: position, normal, colour vec4s).
+static const GLsizei kVertexStride = 12 * sizeof(float);
 static const int kGroup = 4;   // compute workgroups are 4x4x4 threads
 
 static GLuint Groups(int count) { return (GLuint)((count + kGroup - 1) / kGroup); }
@@ -45,7 +46,7 @@ bool GpuSDFMorph::Init() {
 }
 
 void GpuSDFMorph::Release() {
-    for (GLuint* t : { &texA, &texB, &gradTexA, &gradTexB })
+    for (GLuint* t : { &texA, &texB, &gradTexA, &gradTexB, &colorTexA, &colorTexB })
         if (*t) { glDeleteTextures(1, t); *t = 0; }
     for (GLuint* buf : { &fieldBuf, &cellBuf, &vertBuf, &indexBuf, &counterBuf })
         if (*buf) { glDeleteBuffers(1, buf); *buf = 0; }
@@ -108,6 +109,27 @@ static GLuint MakeGradientTexture(const SDFGrid& g) {
     return tex;
 }
 
+// RGBA8 is plenty for display colours (alpha unused, as for the gradients).
+static GLuint MakeColorTexture(const ColorGrid& g) {
+    const size_t count = (size_t)g.n * g.n * g.n;
+    std::vector<unsigned char> rgba(count * 4, 255);
+    for (size_t i = 0; i < count; ++i)
+        for (int ch = 0; ch < 3; ++ch)
+            rgba[4 * i + ch] = (unsigned char)std::lround(glm::clamp(g.c[i][ch], 0.0f, 1.0f) * 255.0f);
+
+    GLuint tex;
+    glGenTextures(1, &tex);
+    glBindTexture(GL_TEXTURE_3D, tex);
+    glPixelStorei(GL_UNPACK_ALIGNMENT, 4);
+    glTexImage3D(GL_TEXTURE_3D, 0, GL_RGBA8, g.n, g.n, g.n, 0, GL_RGBA, GL_UNSIGNED_BYTE, rgba.data());
+    glTexParameteri(GL_TEXTURE_3D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+    glTexParameteri(GL_TEXTURE_3D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+    for (GLenum w : { GL_TEXTURE_WRAP_S, GL_TEXTURE_WRAP_T, GL_TEXTURE_WRAP_R })
+        glTexParameteri(GL_TEXTURE_3D, w, GL_CLAMP_TO_EDGE);
+    glBindTexture(GL_TEXTURE_3D, 0);
+    return tex;
+}
+
 static GLuint MakeBuffer(GLenum target, size_t bytes, GLenum usage, const void* data = nullptr) {
     GLuint buf;
     glGenBuffers(1, &buf);
@@ -133,6 +155,10 @@ void GpuSDFMorph::Upload(const SDFMorph& morph, int vertCapHint, int indexCapHin
     texB = MakeGridTexture(gb);
     gradTexA = MakeGradientTexture(ga);
     gradTexB = MakeGradientTexture(gb);
+    if (morph.HasColor()) {
+        colorTexA = MakeColorTexture(morph.ColorGridA());
+        colorTexB = MakeColorTexture(morph.ColorGridB());
+    }
 
     const size_t points = (size_t)n * n * n;
     const size_t cells  = (size_t)(n - 1) * (n - 1) * (n - 1);
@@ -164,6 +190,8 @@ void GpuSDFMorph::Allocate(int newVertCap, int newIndexCap) {
     glVertexAttribPointer(0, 3, GL_FLOAT, GL_FALSE, kVertexStride, (void*)0);
     glEnableVertexAttribArray(1);   // normal (xyz of the second vec4)
     glVertexAttribPointer(1, 3, GL_FLOAT, GL_FALSE, kVertexStride, (void*)(4 * sizeof(float)));
+    glEnableVertexAttribArray(4);   // colour (xyz of the third vec4)
+    glVertexAttribPointer(4, 3, GL_FLOAT, GL_FALSE, kVertexStride, (void*)(8 * sizeof(float)));
     glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, indexBuf);
     glBindVertexArray(0);
     glBindBuffer(GL_ARRAY_BUFFER, 0);
@@ -172,8 +200,11 @@ void GpuSDFMorph::Allocate(int newVertCap, int newIndexCap) {
 static void SetCommonUniforms(GLuint p, int n, const glm::vec3& lo, float h, float t,
                               const glm::mat3& LtInv, const glm::vec3& shift,
                               const glm::mat3& A, const glm::vec3& b,
-                              int vertCap, int indexCap) {
+                              int vertCap, int indexCap, bool hasColor) {
     glUseProgram(p);
+    glUniform1i(glGetUniformLocation(p, "colorA"), 4);
+    glUniform1i(glGetUniformLocation(p, "colorB"), 5);
+    glUniform1i(glGetUniformLocation(p, "hasColor"), hasColor ? 1 : 0);
     glUniform1i(glGetUniformLocation(p, "gridA"), 0);
     glUniform1i(glGetUniformLocation(p, "gridB"), 1);
     glUniform1i(glGetUniformLocation(p, "gradA"), 2);
@@ -216,10 +247,14 @@ void GpuSDFMorph::Extract(float t) {
     glBindTexture(GL_TEXTURE_3D, gradTexA);
     glActiveTexture(GL_TEXTURE3);
     glBindTexture(GL_TEXTURE_3D, gradTexB);
+    glActiveTexture(GL_TEXTURE4);
+    glBindTexture(GL_TEXTURE_3D, colorTexA);
+    glActiveTexture(GL_TEXTURE5);
+    glBindTexture(GL_TEXTURE_3D, colorTexB);
     glActiveTexture(GL_TEXTURE0);
 
     auto run = [&](GLuint prog, int count) {
-        SetCommonUniforms(prog, n, lo, h, t, LtInv, shift, A, b, vertCap, indexCap);
+        SetCommonUniforms(prog, n, lo, h, t, LtInv, shift, A, b, vertCap, indexCap, colorTexA != 0);
         glDispatchCompute(Groups(count), Groups(count), Groups(count));
         // a memory barrier: the next pass reads what this one wrote
         glMemoryBarrier(GL_SHADER_STORAGE_BARRIER_BIT);
@@ -228,7 +263,7 @@ void GpuSDFMorph::Extract(float t) {
     run(progCells, n - 1);   // one thread per cell
     run(progQuads, n);       // one thread per grid point (its 3 edges)
 
-    SetCommonUniforms(progFinalize, n, lo, h, t, LtInv, shift, A, b, vertCap, indexCap);
+    SetCommonUniforms(progFinalize, n, lo, h, t, LtInv, shift, A, b, vertCap, indexCap, colorTexA != 0);
     glDispatchCompute(1, 1, 1);
 
     // the draw reads vertices, indices and its count from these buffers
@@ -303,6 +338,8 @@ void GpuSDFMorph::Draw(GLuint shaderProgram, const glm::mat4& viewProj, const gl
     GLint locM     = glGetUniformLocation(shaderProgram, "model");
     GLint locDiff  = glGetUniformLocation(shaderProgram, "DiffuseColor");
     GLint locAlpha = glGetUniformLocation(shaderProgram, "alpha");
+    GLint locColor = glGetUniformLocation(shaderProgram, "useVertexColor");
+    if (locColor >= 0) glUniform1i(locColor, colorTexA ? 1 : 0);
     if (locVP    >= 0) glUniformMatrix4fv(locVP, 1, GL_FALSE, glm::value_ptr(viewProj));
     if (locM     >= 0) glUniformMatrix4fv(locM, 1, GL_FALSE, glm::value_ptr(model));
     if (locDiff  >= 0) glUniform3fv(locDiff, 1, glm::value_ptr(diffuseColor));

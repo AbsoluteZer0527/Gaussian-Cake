@@ -12,11 +12,13 @@ public:
                                           int N,
                                           unsigned int seed = 42);
 
-    // Same as Sample, but also reports which triangle each point came from.
+    // Same as Sample, but also reports which triangle each point came from,
+    // and optionally where in it (barycentric weights of v0, v1, v2).
     static std::vector<glm::vec3> Sample(const std::vector<Triangle>& triangles,
                                           int N,
                                           unsigned int seed,
-                                          std::vector<int>& outTriIndices);
+                                          std::vector<int>& outTriIndices,
+                                          std::vector<glm::vec3>* outBary = nullptr);
 
     static float TotalArea(const std::vector<Triangle>& triangles);
 

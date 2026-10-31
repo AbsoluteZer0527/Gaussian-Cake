@@ -10,6 +10,7 @@
 #include "MeshRenderer.h"
 #include "SplatRenderer.h"
 #include "PlyLoader.h"
+#include "GltfLoader.h"
 
 #include <string>
 #include <vector>
@@ -73,6 +74,7 @@ public:
     static int   mixtureK;           // Gaussian-mixture components (1 = original single map)
     static float sinkhornEps;        // relative entropic regularization
     static float posteriorTemp;      // softness of the per-splat component blend
+    static float colorMatch;         // 0 = match splats by position only; higher = similar colours pair up
     static PlyLoadOptions plyOptions;   // how .ply captures are cropped and turned upright
 
     // One bar for the costly settings (splat count, mixture K, samples, SDF

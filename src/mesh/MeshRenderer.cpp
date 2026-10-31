@@ -6,8 +6,9 @@
 MeshRenderer::MeshRenderer()
     : diffuseColor(0.72f, 0.72f, 0.74f),  // default neutral gray
       alpha(1.0f), morphT(0.0f),
-      isInitialized(false), vao(0), vboPos(0), vboNorm(0), vboPosEnd(0), vboNormEnd(0), ebo(0),
-      vertexCount(0), indexCount(0), morphTarget(false) {}
+      isInitialized(false), vao(0), vboPos(0), vboNorm(0), vboPosEnd(0), vboNormEnd(0),
+      vboColor(0), vboColorEnd(0), ebo(0),
+      vertexCount(0), indexCount(0), morphTarget(false), hasColors(false) {}
 
 MeshRenderer::~MeshRenderer() {
     if (vao)        glDeleteVertexArrays(1, &vao);
@@ -15,6 +16,8 @@ MeshRenderer::~MeshRenderer() {
     if (vboNorm)    glDeleteBuffers(1, &vboNorm);
     if (vboPosEnd)  glDeleteBuffers(1, &vboPosEnd);
     if (vboNormEnd) glDeleteBuffers(1, &vboNormEnd);
+    if (vboColor)   glDeleteBuffers(1, &vboColor);
+    if (vboColorEnd) glDeleteBuffers(1, &vboColorEnd);
     if (ebo)        glDeleteBuffers(1, &ebo);
 }
 
@@ -28,7 +31,8 @@ void MeshRenderer::Upload(GLuint vbo, GLuint location, const std::vector<glm::ve
 }
 
 void MeshRenderer::Initialize(const std::vector<glm::vec3>& positions,
-                              const std::vector<unsigned int>& indices) {
+                              const std::vector<unsigned int>& indices,
+                              const std::vector<glm::vec3>& colors) {
     if (positions.empty() || indices.empty() || indices.size() % 3 != 0) {
         std::cerr << "MeshRenderer::Initialize: invalid input\n";
         return;
@@ -56,6 +60,16 @@ void MeshRenderer::Initialize(const std::vector<glm::vec3>& positions,
     Upload(vboNorm, 1, normals);
     glDisableVertexAttribArray(2);
     glDisableVertexAttribArray(3);
+    glDisableVertexAttribArray(5);
+
+    // Colours at location 4, if there's one per vertex
+    hasColors = (colors.size() == positions.size());
+    if (hasColors) {
+        if (!vboColor) glGenBuffers(1, &vboColor);
+        Upload(vboColor, 4, colors);
+    } else {
+        glDisableVertexAttribArray(4);
+    }
 
     // Triangle indices (topology stays fixed for the entire morph)
     glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, ebo);
@@ -70,12 +84,16 @@ void MeshRenderer::Initialize(const std::vector<glm::vec3>& positions,
 
 void MeshRenderer::InitializeMorph(const std::vector<glm::vec3>& startPositions,
                                    const std::vector<glm::vec3>& endPositions,
-                                   const std::vector<unsigned int>& indices) {
+                                   const std::vector<unsigned int>& indices,
+                                   const std::vector<glm::vec3>& startColors,
+                                   const std::vector<glm::vec3>& endColors) {
     if (startPositions.size() != endPositions.size()) {
         std::cerr << "MeshRenderer::InitializeMorph: start/end vertex counts differ\n";
         return;
     }
-    Initialize(startPositions, indices);
+    bool colored = startColors.size() == startPositions.size() &&
+                   endColors.size() == endPositions.size();
+    Initialize(startPositions, indices, colored ? startColors : std::vector<glm::vec3>());
     if (!isInitialized) return;
 
     if (!vboPosEnd) {
@@ -89,11 +107,16 @@ void MeshRenderer::InitializeMorph(const std::vector<glm::vec3>& startPositions,
     glBindVertexArray(vao);
     Upload(vboPosEnd, 2, endPositions);
     Upload(vboNormEnd, 3, normals);
+    if (colored) {
+        if (!vboColorEnd) glGenBuffers(1, &vboColorEnd);
+        Upload(vboColorEnd, 5, endColors);
+    }
     glBindVertexArray(0);
     morphTarget = true;
 }
 
-void MeshRenderer::UpdatePositions(const std::vector<glm::vec3>& positions) {
+void MeshRenderer::UpdatePositions(const std::vector<glm::vec3>& positions,
+                                   const std::vector<glm::vec3>& colors) {
     if (!isInitialized || (int)positions.size() != vertexCount) return;
 
     // Positions
@@ -110,6 +133,11 @@ void MeshRenderer::UpdatePositions(const std::vector<glm::vec3>& positions) {
     glBufferSubData(GL_ARRAY_BUFFER, 0,
                     vertexCount * sizeof(glm::vec3),
                     normals.data());
+
+    if (hasColors && (int)colors.size() == vertexCount) {
+        glBindBuffer(GL_ARRAY_BUFFER, vboColor);
+        glBufferSubData(GL_ARRAY_BUFFER, 0, vertexCount * sizeof(glm::vec3), colors.data());
+    }
 }
 
 void MeshRenderer::Draw(GLuint shaderProgram, const glm::mat4& viewProj) {
@@ -124,12 +152,14 @@ void MeshRenderer::Draw(GLuint shaderProgram, const glm::mat4& viewProj) {
     GLint locDiff  = glGetUniformLocation(shaderProgram, "DiffuseColor");
     GLint locAlpha = glGetUniformLocation(shaderProgram, "alpha");
     GLint locMorph = glGetUniformLocation(shaderProgram, "morphT");
+    GLint locColor = glGetUniformLocation(shaderProgram, "useVertexColor");
 
     if (locVP    >= 0) glUniformMatrix4fv(locVP,  1, GL_FALSE, glm::value_ptr(viewProj));
     if (locM     >= 0) glUniformMatrix4fv(locM,   1, GL_FALSE, glm::value_ptr(model));
     if (locDiff  >= 0) glUniform3fv(locDiff, 1, glm::value_ptr(diffuseColor));
     if (locAlpha >= 0) glUniform1f(locAlpha, alpha);
     if (locMorph >= 0) glUniform1f(locMorph, morphT);
+    if (locColor >= 0) glUniform1i(locColor, hasColors ? 1 : 0);
 
     glEnable(GL_DEPTH_TEST);
 

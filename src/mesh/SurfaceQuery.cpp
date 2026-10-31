@@ -52,6 +52,26 @@ glm::vec3 ClosestPointOnTriangle(const glm::vec3& p, const glm::vec3& a,
 
 static const int kLeafSize = 4;
 
+// Barycentric weights: write p - a = v (b - a) + w (c - a) and dot both sides
+// with each edge, which gives a 2x2 system (Ericson, "Real-Time Collision
+// Detection" 3.4). The weights are then (1 - v - w, v, w).
+glm::vec3 Barycentric(const glm::vec3& p, const glm::vec3& a,
+                      const glm::vec3& b, const glm::vec3& c) {
+    glm::vec3 e0 = b - a;
+    glm::vec3 e1 = c - a;
+    glm::vec3 ep = p - a;
+    float d00 = glm::dot(e0, e0);
+    float d01 = glm::dot(e0, e1);
+    float d11 = glm::dot(e1, e1);
+    float d20 = glm::dot(ep, e0);
+    float d21 = glm::dot(ep, e1);
+    float denom = d00 * d11 - d01 * d01;
+    if (denom < 1e-20f) return glm::vec3(1.0f, 0.0f, 0.0f);   // degenerate: all weight on a
+    float v = (d11 * d20 - d01 * d21) / denom;
+    float w = (d00 * d21 - d01 * d20) / denom;
+    return glm::vec3(1.0f - v - w, v, w);
+}
+
 void SurfaceBVH::Build(const std::vector<Triangle>& input) {
     tris = input;
     nodes.clear();

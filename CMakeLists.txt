@@ -5,7 +5,7 @@ project(menv)
 # Our code lives in src/<module>/, each header next to its .cpp:
 #   app        window, GUI, camera, entry point, performance model
 #   core       OpenGL setup, shaders, GPU timers, threading helpers
-#   io         .obj meshes and .ply splat captures
+#   io         .obj / .glb / .gltf meshes (with materials and textures), .ply splat captures
 #   mesh       topology, sampling, closest-point queries, template fitting, drawing
 #   transport  Gaussians, Gaussian mixtures, optimal transport, the morph timeline
 #   morph      signed-distance-field morph (CPU and GPU)
@@ -23,9 +23,15 @@ set(
     src/core/Shader.cpp
     src/io/OBJLoader.cpp
     src/io/PlyLoader.cpp
+    src/io/MeshData.cpp
+    src/io/Texture.cpp
+    src/io/GltfLoader.cpp
+    src/io/PlyMeshLoader.cpp
     src/mesh/MeshTopology.cpp
     src/mesh/MeshSampler.cpp
     src/mesh/SurfaceQuery.cpp
+    src/mesh/SurfaceColor.cpp
+    src/mesh/TexturedMeshRenderer.cpp
     src/mesh/MeshFitter.cpp
     src/mesh/MeshRenderer.cpp
     src/transport/Gaussian.cpp

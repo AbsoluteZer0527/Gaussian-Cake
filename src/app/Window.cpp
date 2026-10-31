@@ -14,6 +14,9 @@
 #include "GpuSDFMorph.h"
 #include "GpuTimer.h"
 #include "PerfModel.h"
+#include "SurfaceColor.h"
+#include "PlyMeshLoader.h"
+#include "TexturedMeshRenderer.h"
 
 #include <glm/gtc/quaternion.hpp>
 #include <chrono>
@@ -21,6 +24,7 @@
 #include <execution>
 #include <future>
 #include <mutex>
+#include <array>
 #include <numeric>
 #include <cmath>
 
@@ -59,6 +63,15 @@ bool Window::useGpu       = false;
 
 // Real endpoint meshes (shown exactly at t = 0 and t = 1) and the in-between data.
 static IndexedMesh               g_morphA, g_morphB;
+// Per-vertex colours (all empty when neither mesh has colours)
+static std::vector<glm::vec3>    g_colorsA, g_colorsB;                   // of g_morphA / g_morphB
+static std::vector<glm::vec3>    g_sharedColorStart, g_sharedColorEnd;   // shared topology ends
+static std::vector<glm::vec3>    g_sharedColorCurrent;                   // CPU path only
+// The coloured originals, drawn with their real textures while the timeline
+// rests at A or B (in-between surfaces only have vertex colours)
+static MeshData                  g_dataA, g_dataB;
+static TexturedMeshRenderer*     g_restMesh = nullptr;
+static bool                      g_restTextured = false;   // g_restMesh is what's shown at rest
 static bool                      g_morphShared = false;   // shared topology vs SDF
 static std::vector<glm::vec3>    g_sharedStart, g_sharedEnd;
 static std::vector<glm::vec3>    g_sharedCurrent;         // CPU path only
@@ -120,6 +133,7 @@ float Window::splatSizeMul     = 1.0f;
 int   Window::mixtureK         = 32;
 float Window::sinkhornEps      = 0.05f;
 float Window::posteriorTemp    = 1.0f;
+float Window::colorMatch       = 0.0f;
 PlyLoadOptions Window::plyOptions;
 float Window::splatCohesion    = 0.6f;
 bool  Window::splatAreaPreserve = true;
@@ -157,14 +171,35 @@ static void SetBlob(Gaussian& g) {
 }
 
 // Load an OBJ and normalize it to [-1, 1]^3. Returns false on failure.
-// .ply files are 3D Gaussian Splatting captures (Splats mode only); .obj are meshes.
+// A .ply without faces is a 3D Gaussian Splatting capture (Splats mode only);
+// with faces it's a mesh like .obj / .glb. Asked every frame and from the bake
+// thread, so the header check is cached behind a mutex.
 static bool IsCapture(const std::string& path) {
-    return std::filesystem::path(path).extension() == ".ply";
+    if (std::filesystem::path(path).extension() != ".ply") return false;
+    static std::unordered_map<std::string, bool> known;
+    static std::mutex knownMutex;
+    std::lock_guard<std::mutex> lock(knownMutex);
+    auto it = known.find(path);
+    if (it == known.end()) it = known.emplace(path, !PlyMeshLoader::IsMesh(path)).first;
+    return it->second;
 }
 
+// Any mesh file (.obj, .glb, .gltf, .ply with faces), with its appearance.
+static bool LoadNormalized(const std::string& path, MeshData& mesh) {
+    auto ext = std::filesystem::path(path).extension();
+    bool ok = (ext == ".glb" || ext == ".gltf") ? GltfLoader::Load(path, mesh)
+            : (ext == ".ply")                   ? PlyMeshLoader::Load(path, mesh)
+                                                : OBJLoader::Load(path, mesh);
+    if (!ok) return false;
+    OBJLoader::Normalize(mesh.tris);
+    return true;
+}
+
+// Geometry only, for the modes that don't use colour yet.
 static bool LoadNormalized(const std::string& path, std::vector<Triangle>& tris) {
-    if (!OBJLoader::Load(path, tris)) return false;
-    OBJLoader::Normalize(tris);
+    MeshData mesh;
+    if (!LoadNormalized(path, mesh)) return false;
+    tris = std::move(mesh.tris);
     return true;
 }
 
@@ -307,6 +342,8 @@ static void UpdateQuality() {
 // Particles shows particles sampled on A (or the default blob). Rebuilt only
 // when the source, particle count, mode or g_previewGen changes.
 static MeshRenderer* g_previewMesh = nullptr;
+static TexturedMeshRenderer* g_previewTextured = nullptr;   // the preview of a coloured mesh
+static bool g_previewIsTextured = false;
 static int g_previewGen = 0;   // bump to force the preview to rebuild
 
 static void UpdateModePreview() {
@@ -319,13 +356,14 @@ static void UpdateModePreview() {
     lastMode = mode; lastGen = g_previewGen;
 
     // keep the loaded source so changing the particle count doesn't reload it
-    static std::vector<Triangle> tris;
+    static MeshData mesh;
+    const std::vector<Triangle>& tris = mesh.tris;
     static int loadedIndex = -1;
     int idx = Window::meshIndexA;
     bool hasMesh = idx > 0 && idx <= (int)Window::meshPaths.size() &&
                    !IsCapture(Window::meshPaths[idx - 1]);   // captures: Splats mode only
     if (hasMesh && loadedIndex != idx) {
-        if (LoadNormalized(Window::meshPaths[idx - 1], tris)) {
+        if (LoadNormalized(Window::meshPaths[idx - 1], mesh)) {
             loadedIndex = idx;
         } else {
             hasMesh = false;
@@ -342,6 +380,11 @@ static void UpdateModePreview() {
         }
         g_previewMesh->alpha = 1.0f;
         g_previewMesh->Initialize(m.verts, m.indices);
+        g_previewIsTextured = mesh.HasAppearance();
+        if (g_previewIsTextured) {
+            if (!g_previewTextured) g_previewTextured = new TexturedMeshRenderer();
+            g_previewTextured->Initialize(mesh);
+        }
         return;
     }
 
@@ -368,7 +411,8 @@ static void ScanMeshes() {
         std::vector<std::string> found;
         for (const auto& entry : fs::directory_iterator(meshDir)) {
             auto ext = entry.path().extension();
-            if (entry.is_regular_file() && (ext == ".obj" || ext == ".ply")) {
+            if (entry.is_regular_file() &&
+                (ext == ".obj" || ext == ".ply" || ext == ".glb" || ext == ".gltf")) {
                 found.push_back(entry.path().string());
             }
         }
@@ -448,6 +492,8 @@ void Window::cleanUp() {
     delete splatRenderer;
     for (SplatRenderer* r : g_fullSplats) delete r;
     delete g_previewMesh;
+    delete g_previewTextured;
+    delete g_restMesh;
     delete g_gpuSdf;
     delete g_morphTimer;
     delete g_drawTimer;
@@ -603,13 +649,17 @@ void Window::displayCallback(GLFWwindow* window) {
     } else if (renderMode == RenderMode::TriangleMorph && trueMorphActive) {
         if (g_sdfOnGpu && g_morphShown == MorphShown::Blend)
             g_gpuSdf->Draw(shaderProgram, Cam->GetViewProjectMtx(), meshRenderer->diffuseColor);
+        else if (g_restTextured && g_morphShown != MorphShown::Blend)
+            g_restMesh->Draw(shaderProgram, Cam->GetViewProjectMtx());
         else
             meshRenderer->Draw(meshRenderer->IsMorphTarget() ? morphProgram : shaderProgram,
                                Cam->GetViewProjectMtx());
     } else if (renderMode == RenderMode::TriangleMorph && meshIndexA > 0) {
         // Topology preview: the source mesh as a solid surface
         UpdateModePreview();
-        if (g_previewMesh && g_previewMesh->isInitialized)
+        if (g_previewIsTextured && g_previewTextured)
+            g_previewTextured->Draw(shaderProgram, Cam->GetViewProjectMtx());
+        else if (g_previewMesh && g_previewMesh->isInitialized)
             g_previewMesh->Draw(shaderProgram, Cam->GetViewProjectMtx());
     } else {
         if (!particleMorphActive) UpdateModePreview();
@@ -731,6 +781,7 @@ struct SplatBakeSettings {
     std::string pathA, pathB;
     int   splatCount, sampleCount, mixtureK;
     float sizeMul, sinkhornEps, posteriorTemp;
+    float colorMatch;
     PlyLoadOptions ply;
 };
 
@@ -756,7 +807,7 @@ struct SplatBakeResult {
 // The bake and the capture preview both run on workers and share it, so each
 // holds g_meshCacheMutex while it uses the cache.
 struct SplatMeshCache {
-    std::vector<Triangle> tris;          // meshes
+    MeshData              mesh;          // meshes
     std::vector<Splat>    splats;        // captures
     bool  capture  = false;
     float cropUsed = -1.0f;              // plyOptions the splats were loaded with
@@ -781,7 +832,7 @@ static SplatMeshCache* GetMeshCache(const std::string& path, const PlyLoadOption
         c.upUsed   = (int)ply.up;
         return &c;
     }
-    if (c.tris.empty() && !LoadNormalized(path, c.tris)) {
+    if (c.mesh.tris.empty() && !LoadNormalized(path, c.mesh)) {
         g_meshCache.erase(path);
         return nullptr;
     }
@@ -847,12 +898,12 @@ static std::vector<Splat> SubsampleSplats(const std::vector<Splat>& splats, int 
 // The n splats a shape brings to the bake.
 static std::vector<Splat> BakeSplats(const SplatMeshCache& c, int n, float sizeMul, unsigned int seed) {
     return c.capture ? SubsampleSplats(c.splats, n, sizeMul, seed)
-                     : SplatGenerator::FromTriangles(c.tris, n, sizeMul, seed);
+                     : SplatGenerator::FromMesh(c.mesh, n, sizeMul, seed);
 }
 
 // Typical splat radius among the n baked splats; sets the neighbour-search cell size.
 static float SplatRadius(const SplatMeshCache& c, const std::vector<Splat>& splats, float sizeMul) {
-    if (!c.capture) return sizeMul * SplatGenerator::BaseSigma(c.tris, (int)splats.size());
+    if (!c.capture) return sizeMul * SplatGenerator::BaseSigma(c.mesh.tris, (int)splats.size());
     std::vector<float> r(splats.size());
     for (size_t i = 0; i < splats.size(); ++i) r[i] = std::sqrt(splats[i].scale.x * splats[i].scale.y);
     std::nth_element(r.begin(), r.begin() + r.size() / 2, r.end());
@@ -861,7 +912,7 @@ static float SplatRadius(const SplatMeshCache& c, const std::vector<Splat>& spla
 
 static void EnsureMixture(SplatMeshCache& c, int K, int samples) {
     if (c.mixK == K && c.mixSamples == samples) return;
-    c.mix.Fit(c.capture ? SampleSplats(c.splats, samples, 7u) : MeshSampler::Sample(c.tris, samples), K);
+    c.mix.Fit(c.capture ? SampleSplats(c.splats, samples, 7u) : MeshSampler::Sample(c.mesh.tris, samples), K);
     c.mixK = K;
     c.mixSamples = samples;
 }
@@ -890,19 +941,36 @@ static double MatchCost(const std::vector<glm::vec3>& y, const std::vector<glm::
                                  [&](size_t i) { return (double)Dist2(y[i], b[perm[i]]); });
 }
 
+// A point as the matching sees it: position, then colour times the colour
+// weight. With weight 0 the colour axes are flat and never split on, so the
+// matching is purely by position.
+using MatchPoint = std::array<float, 6>;
+
+static std::vector<MatchPoint> MatchPoints(const std::vector<glm::vec3>& pos,
+                                           const std::vector<glm::vec3>& color) {
+    std::vector<MatchPoint> pts(pos.size());
+    for (size_t i = 0; i < pos.size(); ++i)
+        pts[i] = { pos[i].x, pos[i].y, pos[i].z, color[i].x, color[i].y, color[i].z };
+    return pts;
+}
+
 // One-to-one matching by recursive median splits: split both point sets at
 // their median along the longest axis of the region, so each half of y gets
 // the same number of b points, and recurse. Small leaves are matched by
 // sorting along their longest axis (exact in 1D). Every b is used once.
-static void SplitMatch(const std::vector<glm::vec3>& y, const std::vector<glm::vec3>& b,
+static void SplitMatch(const std::vector<MatchPoint>& y, const std::vector<MatchPoint>& b,
                        int* iy, int* ib, int n, std::vector<int>& perm, int depth) {
-    glm::vec3 lo(1e30f), hi(-1e30f);
-    for (int k = 0; k < n; ++k) {
-        lo = glm::min(lo, glm::min(y[iy[k]], b[ib[k]]));
-        hi = glm::max(hi, glm::max(y[iy[k]], b[ib[k]]));
-    }
-    glm::vec3 ext = hi - lo;
-    int axis = (ext.x >= ext.y && ext.x >= ext.z) ? 0 : (ext.y >= ext.z ? 1 : 2);
+    MatchPoint lo, hi;
+    lo.fill(1e30f);
+    hi.fill(-1e30f);
+    for (int k = 0; k < n; ++k)
+        for (int d = 0; d < 6; ++d) {
+            lo[d] = std::min({ lo[d], y[iy[k]][d], b[ib[k]][d] });
+            hi[d] = std::max({ hi[d], y[iy[k]][d], b[ib[k]][d] });
+        }
+    int axis = 0;
+    for (int d = 1; d < 6; ++d)
+        if (hi[d] - lo[d] > hi[axis] - lo[axis]) axis = d;
 
     if (n <= 16) {
         std::sort(iy, iy + n, [&](int a, int c) { return y[a][axis] < y[c][axis]; });
@@ -928,8 +996,8 @@ static void SplitMatch(const std::vector<glm::vec3>& y, const std::vector<glm::v
     }
 }
 
-static std::vector<int> MedianSplitMatch(const std::vector<glm::vec3>& y,
-                                         const std::vector<glm::vec3>& b) {
+static std::vector<int> MedianSplitMatch(const std::vector<MatchPoint>& y,
+                                         const std::vector<MatchPoint>& b) {
     const int n = (int)y.size();
     std::vector<int> iy(n), ib(n), perm(n);
     std::iota(iy.begin(), iy.end(), 0);
@@ -939,9 +1007,12 @@ static std::vector<int> MedianSplitMatch(const std::vector<glm::vec3>& y,
 }
 
 // Local improvement: for each i, try swapping partners with the owners of
-// nearby b points; keep a swap when it lowers the total squared distance.
+// nearby b points; keep a swap when it lowers the total cost, squared
+// distance plus squared (weighted) colour difference. Candidates come from
+// the positions; yc / bc are the weighted colours (zero = position only).
 // Returns the number of passes run.
 static int RefineMatch(const std::vector<glm::vec3>& y, const std::vector<glm::vec3>& b,
+                       const std::vector<glm::vec3>& yc, const std::vector<glm::vec3>& bc,
                        std::vector<int>& perm, float cellSize, int maxPasses) {
     const int n = (int)y.size();
     PointGrid grid;
@@ -958,8 +1029,9 @@ static int RefineMatch(const std::vector<glm::vec3>& y, const std::vector<glm::v
                 int i2 = owner[j2];                // its current partner
                 int j  = perm[i];
                 if (i2 == i) return;
-                float before = Dist2(y[i], b[j])  + Dist2(y[i2], b[j2]);
-                float after  = Dist2(y[i], b[j2]) + Dist2(y[i2], b[j]);
+                auto cost = [&](int a, int bi) { return Dist2(y[a], b[bi]) + Dist2(yc[a], bc[bi]); };
+                float before = cost(i, j)  + cost(i2, j2);
+                float after  = cost(i, j2) + cost(i2, j);
                 if (after < before - 1e-12f) {
                     perm[i] = j2;  perm[i2] = j;
                     owner[j2] = i; owner[j] = i2;
@@ -1081,11 +1153,20 @@ static SplatBakeResult RunSplatBake(SplatBakeSettings st) {
     // Fine: one-to-one matching of the mapped points to B's splats
     const int maxPasses = 20;
     SetBakeStage(4, n + maxPasses);
-    std::vector<int> perm = MedianSplitMatch(y, bPos);
+    // Colour-aware: a colour difference of 1 (one full channel) costs as much
+    // as colorMatch * kColorUnits of distance (the shapes span about 2 units)
+    const float kColorUnits = 0.5f;
+    const float colorWeight = st.colorMatch * kColorUnits;
+    std::vector<glm::vec3> yColor(n), bColor(n);
+    for (int i = 0; i < n; ++i) {
+        yColor[i] = colorWeight * splatsA[i].color;
+        bColor[i] = colorWeight * splatsB[i].color;
+    }
+    std::vector<int> perm = MedianSplitMatch(MatchPoints(y, yColor), MatchPoints(bPos, bColor));
     double splitCost = MatchCost(y, bPos, perm);
     g_bakeDone = n;
     float cell = 2.0f * radiusB;
-    int passes = RefineMatch(y, bPos, perm, cell, maxPasses);
+    int passes = RefineMatch(y, bPos, yColor, bColor, perm, cell, maxPasses);
     double refinedCost = MatchCost(y, bPos, perm);
     res.meanMatchDist = std::sqrt(refinedCost / n);
 
@@ -1199,6 +1280,7 @@ void Window::BakeSplatMorph(const std::string& pathA, const std::string& pathB) 
     st.sizeMul       = splatSizeMul;
     st.sinkhornEps   = sinkhornEps;
     st.posteriorTemp = posteriorTemp;
+    st.colorMatch    = colorMatch;
     st.ply           = plyOptions;
 
     g_stageNames = kBakeStageNames;
@@ -1359,14 +1441,14 @@ void Window::UpdateSplatPreview() {
 
     if (hasShape) {
         // keep the loaded mesh so dragging the count/size sliders doesn't reload it
-        static std::vector<Triangle> tris;
+        static MeshData mesh;
         static int loadedIndex = -1;
         if (loadedIndex != meshIndexA) {
             loadedIndex = -1;
-            if (!LoadNormalized(meshPaths[meshIndexA - 1], tris)) return;
+            if (!LoadNormalized(meshPaths[meshIndexA - 1], mesh)) return;
             loadedIndex = meshIndexA;
         }
-        splatCurrent = SplatGenerator::FromTriangles(tris, splatCount, splatSizeMul, 42u);
+        splatCurrent = SplatGenerator::FromMesh(mesh, splatCount, splatSizeMul, 42u);
     } else {
         // Blob: round splats sampled from the default isotropic Gaussian
         Gaussian blob;
@@ -1464,10 +1546,10 @@ void Window::ComputeOTAndSpawnParticles() {
 static const int kMaxTemplateFaces = 40000;
 
 // Load, normalize, weld, close small holes, orient outward.
-static bool LoadMorphMesh(const std::string& path, IndexedMesh& m, TopologyInfo& info) {
-    std::vector<Triangle> tris;
-    if (!LoadNormalized(path, tris)) return false;
-    MeshTopology::Build(tris, m);
+// m: the cleaned, welded mesh the morph uses; data: the file as loaded, with its colours.
+static bool LoadMorphMesh(const std::string& path, IndexedMesh& m, TopologyInfo& info, MeshData& data) {
+    if (!LoadNormalized(path, data)) return false;
+    MeshTopology::Build(data.tris, m);
     int filled = MeshTopology::FillSmallHoles(m, 40);
     // the signed volume in OrientOutward only means something once the winding agrees
     bool orientable = MeshTopology::OrientConsistently(m);
@@ -1512,11 +1594,15 @@ struct TrueMorphSettings {
     int   sdfResolution, sampleCount;
     float fitStiffness;
     bool  fitCotan;
+    glm::vec3 fallbackColor;   // display colour of a mesh without colours, beside one with them
 };
 
 struct TrueMorphResult {
     bool ok = false;
     IndexedMesh a, b;                    // cleaned endpoint meshes
+    MeshData dataA, dataB;               // the files as loaded (with materials), if coloured
+    std::vector<glm::vec3> colorsA, colorsB;               // per vertex of a / b (empty: no colours)
+    std::vector<glm::vec3> sharedColorStart, sharedColorEnd;
     bool shared = false;
     std::vector<unsigned int> sharedIndices;
     std::vector<glm::vec3>    sharedStart, sharedEnd;
@@ -1535,10 +1621,24 @@ static TrueMorphResult RunTrueMorphBake(TrueMorphSettings st) {
 
     SetBakeStage(0, 2);
     TopologyInfo infoA, infoB;
-    if (!LoadMorphMesh(st.pathA, res.a, infoA)) return res;
+    MeshData dataA, dataB;
+    if (!LoadMorphMesh(st.pathA, res.a, infoA, dataA)) return res;
     g_bakeDone++;
-    if (!LoadMorphMesh(st.pathB, res.b, infoB)) return res;
+    if (!LoadMorphMesh(st.pathB, res.b, infoB, dataB)) return res;
     g_bakeDone++;
+
+    // Colours: every surface the morph shows takes them from the closest
+    // point of the original meshes. Only if at least one of them has any.
+    const bool colored = dataA.HasAppearance() || dataB.HasAppearance();
+    SurfaceColor colorA, colorB;
+    if (colored) {
+        colorA.Build(dataA, st.fallbackColor);
+        colorB.Build(dataB, st.fallbackColor);
+        res.colorsA = colorA.At(res.a.verts);
+        res.colorsB = colorB.At(res.b.verts);
+    }
+    if (dataA.HasAppearance()) res.dataA = std::move(dataA);
+    if (dataB.HasAppearance()) res.dataB = std::move(dataB);
     std::string nameA = std::filesystem::path(st.pathA).filename().string();
     std::string nameB = std::filesystem::path(st.pathB).filename().string();
 
@@ -1589,6 +1689,10 @@ static TrueMorphResult RunTrueMorphBake(TrueMorphSettings st) {
         res.sharedIndices = tmpl.indices;
         res.sharedStart   = templateIsA ? tmpl.verts : fitted;
         res.sharedEnd     = templateIsA ? fitted : tmpl.verts;
+        if (colored) {
+            res.sharedColorStart = colorA.At(res.sharedStart);
+            res.sharedColorEnd   = colorB.At(res.sharedEnd);
+        }
 
         snprintf(buf, sizeof(buf),
                  "Shared topology: %s (%d tris%s) fitted onto %s in %.0f ms. "
@@ -1598,7 +1702,8 @@ static TrueMorphResult RunTrueMorphBake(TrueMorphSettings st) {
                  stats.ms, stats.meanDist, stats.flipped,
                  mismatch.empty() ? "" : " Warning: ", mismatch.c_str());
     } else {
-        res.sdf.Build(trisA, trisB, res.map, st.sdfResolution);
+        res.sdf.Build(trisA, trisB, res.map, st.sdfResolution,
+                      colored ? &colorA : nullptr, colored ? &colorB : nullptr);
 
         // Size the GPU buffers from a few CPU extractions, with room to spare
         size_t maxVerts = 0, maxIndices = 0;
@@ -1638,6 +1743,7 @@ void Window::BakeTrueMorph(const std::string& pathA, const std::string& pathB) {
     st.sampleCount   = sampleCount;
     st.fitStiffness  = fitStiffness;
     st.fitCotan      = fitCotan;
+    st.fallbackColor = glm::sqrt(meshRenderer->diffuseColor);   // shader.frag's grey, as a display value
 
     g_stageNames = kMorphStageNames;
     g_stageCount = 3;
@@ -1678,6 +1784,14 @@ void Window::PollTrueMorphBake() {
     g_sharedStart   = std::move(res.sharedStart);
     g_sharedEnd     = std::move(res.sharedEnd);
     g_sharedCurrent = g_sharedStart;
+    g_colorsA            = std::move(res.colorsA);
+    g_colorsB            = std::move(res.colorsB);
+    g_sharedColorStart   = std::move(res.sharedColorStart);
+    g_sharedColorEnd     = std::move(res.sharedColorEnd);
+    g_sharedColorCurrent = g_sharedColorStart;
+    g_dataA              = std::move(res.dataA);
+    g_dataB              = std::move(res.dataB);
+    g_restTextured       = false;
     if (!res.shared) {
         g_sdfMorph = std::move(res.sdf);
         if (gpuAvailable) g_gpuSdf->Upload(g_sdfMorph, res.sdfVertCap, res.sdfIndexCap);
@@ -1722,16 +1836,25 @@ void Window::UpdateTrueMorph() {
     if (want != MorphShown::Blend) {
         if (g_morphShown != want) {
             const IndexedMesh& m = (want == MorphShown::A) ? g_morphA : g_morphB;
-            meshRenderer->Initialize(m.verts, m.indices);
+            meshRenderer->Initialize(m.verts, m.indices, (want == MorphShown::A) ? g_colorsA : g_colorsB);
+            // a coloured original is shown as itself, textures and all
+            const MeshData& data = (want == MorphShown::A) ? g_dataA : g_dataB;
+            g_restTextured = data.HasAppearance();
+            if (g_restTextured) {
+                if (!g_restMesh) g_restMesh = new TexturedMeshRenderer();
+                g_restMesh->Initialize(data);
+            }
             g_morphShown = want;
         }
         return;
     }
+    g_restTextured = false;
 
     if (g_morphShared) {
         if (gpu) {
             if (g_morphShown != MorphShown::Blend || !meshRenderer->IsMorphTarget()) {
-                meshRenderer->InitializeMorph(g_sharedStart, g_sharedEnd, g_sharedIndices);
+                meshRenderer->InitializeMorph(g_sharedStart, g_sharedEnd, g_sharedIndices,
+                                              g_sharedColorStart, g_sharedColorEnd);
                 g_morphShown = MorphShown::Blend;
             }
             meshRenderer->morphT = e;
@@ -1739,11 +1862,13 @@ void Window::UpdateTrueMorph() {
         }
         for (size_t i = 0; i < g_sharedCurrent.size(); ++i)
             g_sharedCurrent[i] = g_sharedStart[i] + e * (g_sharedEnd[i] - g_sharedStart[i]);
+        for (size_t i = 0; i < g_sharedColorCurrent.size(); ++i)
+            g_sharedColorCurrent[i] = glm::mix(g_sharedColorStart[i], g_sharedColorEnd[i], glm::clamp(e, 0.0f, 1.0f));
         if (g_morphShown != MorphShown::Blend || meshRenderer->IsMorphTarget()) {
-            meshRenderer->Initialize(g_sharedCurrent, g_sharedIndices);
+            meshRenderer->Initialize(g_sharedCurrent, g_sharedIndices, g_sharedColorCurrent);
             g_morphShown = MorphShown::Blend;
         } else {
-            meshRenderer->UpdatePositions(g_sharedCurrent);
+            meshRenderer->UpdatePositions(g_sharedCurrent, g_sharedColorCurrent);
         }
         return;
     }
@@ -1757,10 +1882,10 @@ void Window::UpdateTrueMorph() {
         g_gpuSdf->Extract(t);
         g_morphTimer->End();
     } else {
-        std::vector<glm::vec3> verts;
+        std::vector<glm::vec3> verts, colors;
         std::vector<unsigned int> indices;
-        g_sdfMorph.Extract(t, verts, indices);
-        if (!indices.empty()) meshRenderer->Initialize(verts, indices);
+        g_sdfMorph.Extract(t, verts, indices, &colors);
+        if (!indices.empty()) meshRenderer->Initialize(verts, indices, colors);
     }
     g_sdfOnGpu   = onGpu;
     g_morphShown = MorphShown::Blend;
@@ -2017,6 +2142,8 @@ void Window::DrawMainGUI() {
                 ImGui::SetItemTooltip("Softness of the cluster-to-cluster transport plan");
                 ImGui::SliderFloat("Blend Temp", &posteriorTemp, 0.25f, 8.0f, "%.2f", ImGuiSliderFlags_Logarithmic);
                 ImGui::SetItemTooltip("How smoothly each splat blends between nearby clusters");
+                ImGui::SliderFloat("Color Match", &colorMatch, 0.0f, 2.0f, "%.2f");
+                ImGui::SetItemTooltip("0 = splats pair up by position only\nHigher = similar colours pair up\n(red parts travel to red parts)");
             }
             if (ImGui::SliderInt("Mesh Samples", &sampleCount, 500, 20000)) autoQuality = false;
             ImGui::SetItemTooltip("Surface points used to fit the Gaussians for the OT map");

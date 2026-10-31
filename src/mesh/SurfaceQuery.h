@@ -9,6 +9,12 @@
 glm::vec3 ClosestPointOnTriangle(const glm::vec3& p, const glm::vec3& a,
                                  const glm::vec3& b, const glm::vec3& c);
 
+// Barycentric weights (wa, wb, wc) of point p in triangle (a, b, c), so that
+// p = wa a + wb b + wc c. p is assumed to lie on the triangle (e.g. the result
+// of ClosestPointOnTriangle).
+glm::vec3 Barycentric(const glm::vec3& p, const glm::vec3& a,
+                      const glm::vec3& b, const glm::vec3& c);
+
 // AABB tree over a triangle soup: exact closest-point queries and the
 // generalized winding number (Jacobson et al. 2013) for inside/outside tests
 // that still work on open or multi-part meshes.

@@ -25,6 +25,31 @@ float SDFGrid::Sample(const glm::vec3& p) const {
     return lerp(lerp(c00, c10, fy), lerp(c01, c11, fy), fz) + outside;
 }
 
+glm::vec3 ColorGrid::Sample(const glm::vec3& p) const {
+    glm::vec3 g = glm::clamp((p - lo) / h, glm::vec3(0.0f), glm::vec3((float)(n - 1) - 1e-4f));
+    int i = (int)g.x, j = (int)g.y, k = (int)g.z;
+    glm::vec3 f = g - glm::vec3((float)i, (float)j, (float)k);
+    glm::vec3 c00 = glm::mix(At(i, j,     k),     At(i + 1, j,     k),     f.x);
+    glm::vec3 c10 = glm::mix(At(i, j + 1, k),     At(i + 1, j + 1, k),     f.x);
+    glm::vec3 c01 = glm::mix(At(i, j,     k + 1), At(i + 1, j,     k + 1), f.x);
+    glm::vec3 c11 = glm::mix(At(i, j + 1, k + 1), At(i + 1, j + 1, k + 1), f.x);
+    return glm::mix(glm::mix(c00, c10, f.y), glm::mix(c01, c11, f.y), f.z);
+}
+
+static ColorGrid BuildColorGrid(const SurfaceColor& color, const SDFGrid& like) {
+    ColorGrid g;
+    g.n = like.n;
+    g.lo = like.lo;
+    g.h = like.h;
+    const int n = g.n;
+    g.c.assign((size_t)n * n * n, glm::vec3(1.0f));
+    ParallelFor(n * n * n, [&](int idx) {
+        int i = idx % n, j = (idx / n) % n, k = idx / (n * n);
+        g.c[idx] = color.At(g.lo + g.h * glm::vec3((float)i, (float)j, (float)k));
+    });
+    return g;
+}
+
 // Signed distance of one mesh on the grid. Inside/outside comes from the
 // generalized winding number. Where the winding number is ambiguous (near
 // open sheets and holes, |w| ~ 0.5) the surface also gets a thin shell, so an
@@ -53,11 +78,18 @@ static SDFGrid BuildGrid(const std::vector<Triangle>& tris, int n) {
 }
 
 void SDFMorph::Build(const std::vector<Triangle>& trisA, const std::vector<Triangle>& trisB,
-                     const OTMap& map, int resolution) {
+                     const OTMap& map, int resolution,
+                     const SurfaceColor* colorA, const SurfaceColor* colorB) {
     auto t0 = std::chrono::high_resolution_clock::now();
     resolution = std::max(16, resolution);
     gridA = BuildGrid(trisA, resolution);
     gridB = BuildGrid(trisB, resolution);
+    colorGridA = ColorGrid();
+    colorGridB = ColorGrid();
+    if (colorA && colorB) {
+        colorGridA = BuildColorGrid(*colorA, gridA);
+        colorGridB = BuildColorGrid(*colorB, gridB);
+    }
 
     // glm is column-major: A[c][r]
     for (int r = 0; r < 3; ++r)
@@ -72,9 +104,11 @@ void SDFMorph::Build(const std::vector<Triangle>& trisA, const std::vector<Trian
 }
 
 void SDFMorph::Extract(float t, std::vector<glm::vec3>& outVerts,
-                       std::vector<unsigned int>& outIndices) const {
+                       std::vector<unsigned int>& outIndices,
+                       std::vector<glm::vec3>* outColors) const {
     outVerts.clear();
     outIndices.clear();
+    if (outColors) outColors->clear();
     if (!built) return;
     auto t0 = std::chrono::high_resolution_clock::now();
 
@@ -161,6 +195,16 @@ void SDFMorph::Extract(float t, std::vector<glm::vec3>& outVerts,
                 if (k + 1 < n && i >= 1 && j >= 1 && i < c && j < c && in0 != (F(i, j, k + 1) < 0.0f))
                     quad(cellId(i - 1, j - 1, k), cellId(i, j - 1, k), cellId(i, j, k), cellId(i - 1, j, k), !in0);
             }
+
+    // Colour: where the vertex came from on A (u) and on B (T(u)), blended
+    // the same way as the distances
+    if (outColors && HasColor()) {
+        outColors->resize(outVerts.size());
+        ParallelFor((int)outVerts.size(), [&](int v) {
+            glm::vec3 u = LtInv * (outVerts[v] - shift);
+            (*outColors)[v] = (1.0f - t) * colorGridA.Sample(u) + t * colorGridB.Sample(A * u + b);
+        });
+    }
 
     lastExtractMs = std::chrono::duration<double, std::milli>(
                         std::chrono::high_resolution_clock::now() - t0).count();

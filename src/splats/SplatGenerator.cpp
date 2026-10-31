@@ -40,15 +40,31 @@ glm::vec3 SplatGenerator::ShadeNormal(const glm::vec3& n) {
     return glm::sqrt(irradiance * baseColor);
 }
 
+glm::vec3 SplatGenerator::ShadeNormal(const glm::vec3& n, const glm::vec3& albedo) {
+    // sqrt(irradiance * linear) = sqrt(irradiance) * display, for display = sqrt(linear)
+    const glm::vec3 lightDir = glm::normalize(glm::vec3(1.0f, 5.0f, 2.0f));
+    float irradiance = 0.2f + std::abs(glm::dot(lightDir, n));
+    return glm::min(std::sqrt(irradiance) * albedo, glm::vec3(1.0f));
+}
+
 std::vector<Splat> SplatGenerator::FromTriangles(const std::vector<Triangle>& tris,
                                                  int N, float sizeMul, unsigned int seed) {
+    MeshData mesh;
+    mesh.tris = tris;
+    return FromMesh(mesh, N, sizeMul, seed);
+}
+
+std::vector<Splat> SplatGenerator::FromMesh(const MeshData& mesh, int N, float sizeMul, unsigned int seed) {
     std::vector<Splat> result;
+    const std::vector<Triangle>& tris = mesh.tris;
     if (tris.empty() || N <= 0) return result;
 
     std::vector<int> triIdx;
-    auto pts = MeshSampler::Sample(tris, N, seed, triIdx);
+    std::vector<glm::vec3> bary;
+    auto pts = MeshSampler::Sample(tris, N, seed, triIdx, &bary);
 
     float sigma = sizeMul * BaseSigma(tris, N);
+    const bool coloured = mesh.HasAppearance();
 
     result.resize(pts.size());
     for (size_t i = 0; i < pts.size(); ++i) {
@@ -57,7 +73,8 @@ std::vector<Splat> SplatGenerator::FromTriangles(const std::vector<Triangle>& tr
         s.mean    = pts[i];
         s.rot     = TriangleFrame(t);
         s.scale   = glm::vec3(sigma, sigma, 0.05f * sigma);  // flat disk
-        s.color   = ShadeNormal(TriangleNormal(t));
+        s.color   = coloured ? ShadeNormal(TriangleNormal(t), mesh.Albedo(triIdx[i], bary[i]))
+                             : ShadeNormal(TriangleNormal(t));
         s.opacity = 0.9f;
     }
     return result;

@@ -3,6 +3,8 @@
 
 layout (location = 0) in vec3 position;
 layout (location = 1) in vec3 normal;
+layout (location = 4) in vec3 color;    // per-vertex colour (used if useVertexColor is on)
+layout (location = 6) in vec2 uv;       // texture coordinates (used if useTexture is on)
 
 // Uniform variables
 uniform mat4 viewProj;
@@ -11,6 +13,8 @@ uniform mat4 model;
 // Outputs of the vertex shader are the inputs of the same name of the fragment shader.
 // The default output, gl_Position, should be assigned something. 
 out vec3 fragNormal;
+out vec3 fragAlbedo;
+out vec2 fragUV;
 
 
 void main()
@@ -20,4 +24,6 @@ void main()
 
     // for shading
 	fragNormal = vec3(model * vec4(normal, 0));
+	fragAlbedo = color;
+	fragUV = uv;
 }

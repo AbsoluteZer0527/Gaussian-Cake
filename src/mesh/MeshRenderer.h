@@ -17,18 +17,25 @@ public:
 
     // Upload initial vertices and triangle connectivity.
     // indices.size() must be a multiple of 3.
+    // colors: optional per-vertex display colours (empty = diffuseColor everywhere).
     void Initialize(const std::vector<glm::vec3>& positions,
-                    const std::vector<unsigned int>& indices);
+                    const std::vector<unsigned int>& indices,
+                    const std::vector<glm::vec3>& colors = {});
 
     // Upload two shapes with the same connectivity: start at morphT = 0, end at
     // morphT = 1. Normals of both ends are precomputed here.
+    // Colours, if given, blend from startColors to endColors the same way.
     void InitializeMorph(const std::vector<glm::vec3>& startPositions,
                          const std::vector<glm::vec3>& endPositions,
-                         const std::vector<unsigned int>& indices);
+                         const std::vector<unsigned int>& indices,
+                         const std::vector<glm::vec3>& startColors = {},
+                         const std::vector<glm::vec3>& endColors = {});
 
     // Replace vertex positions (must match count from Initialize).
     // Recomputes area-weighted vertex normals and uploads both buffers.
-    void UpdatePositions(const std::vector<glm::vec3>& positions);
+    // colors: new per-vertex colours too, if the mesh has them.
+    void UpdatePositions(const std::vector<glm::vec3>& positions,
+                         const std::vector<glm::vec3>& colors = {});
 
     // Render as GL_TRIANGLES using the provided shader program.
     void Draw(GLuint shaderProgram, const glm::mat4& viewProj);
@@ -40,6 +47,7 @@ public:
 
     bool isInitialized;
     bool IsMorphTarget() const { return morphTarget; }
+    bool HasColors() const { return hasColors; }
     int  VertexCount() const { return vertexCount; }
     int  TriangleCount() const { return indexCount / 3; }
 
@@ -49,11 +57,14 @@ private:
     GLuint vboNorm;
     GLuint vboPosEnd;     // morph-target mode only
     GLuint vboNormEnd;
+    GLuint vboColor;      // per-vertex colours (location 4), end colours (location 5)
+    GLuint vboColorEnd;
     GLuint ebo;
 
     int vertexCount;
     int indexCount;
     bool morphTarget;
+    bool hasColors;
 
     // Kept CPU-side so normals can be recomputed on each UpdatePositions.
     std::vector<unsigned int> triIndices;
