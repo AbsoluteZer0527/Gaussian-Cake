@@ -151,7 +151,7 @@ struct GpuSplatKeyframes {
     glm::vec4 meanA, meanB;
     glm::vec4 rotA, rotB;             // (x, y, z, w)
     glm::vec4 logScaleA, logScaleB;   // w = opacity
-    glm::vec4 colorA, colorB;
+    glm::vec4 colorA, colorB;         // colorA.w = heat-wave delay
     glm::vec4 smoothDisp;             // w = halfway stretch factor
 };
 static const size_t kPreparedBytes = 12 * sizeof(float);   // Prepared in splat_prep.comp
@@ -197,9 +197,16 @@ static GLuint MakeStorage(size_t bytes, const void* data = nullptr) {
     return buf;
 }
 
+void SplatRenderer::SetClock(float wave, float cohesionExp, float midGrow) {
+    waveWidth       = wave;
+    waveCohesionExp = cohesionExp;
+    waveMidGrow     = midGrow;
+}
+
 void SplatRenderer::UploadKeyframes(const std::vector<Splat>& start, const std::vector<Splat>& end,
                                     const std::vector<glm::vec3>& smoothDisp,
-                                    const std::vector<float>& stretch) {
+                                    const std::vector<float>& stretch,
+                                    const std::vector<float>& delay) {
     ReleaseGpuBuffers();
     // the timers averaged the old set; PerfModel must not pair them with the new count
     prepTimer.Reset();
@@ -220,7 +227,7 @@ void SplatRenderer::UploadKeyframes(const std::vector<Splat>& start, const std::
         k[i].rotB       = quat(b.rot);
         k[i].logScaleA  = glm::vec4(glm::log(a.scale), a.opacity);
         k[i].logScaleB  = glm::vec4(glm::log(b.scale), b.opacity);
-        k[i].colorA     = glm::vec4(a.color, 1.0f);
+        k[i].colorA     = glm::vec4(a.color, (delay.size() == n) ? delay[i] : 0.0f);
         k[i].colorB     = glm::vec4(b.color, 1.0f);
         float s = (stretch.size() == n) ? stretch[i] : 1.0f;
         k[i].smoothDisp = glm::vec4(gpuHasSmooth ? smoothDisp[i] : glm::vec3(0.0f), s);
@@ -263,7 +270,7 @@ void SplatRenderer::SortByDepth() {
     }
 }
 
-void SplatRenderer::DrawMorph(float e, float g, float grow, float stretchOn,
+void SplatRenderer::DrawMorph(float e, float sizeMul, float stretchOn,
                               const glm::mat4& view, const glm::mat4& proj) {
     if (!HasKeyframes()) return;
     GLint vp[4];
@@ -275,9 +282,11 @@ void SplatRenderer::DrawMorph(float e, float g, float grow, float stretchOn,
     glUseProgram(progPrep);
     glUniform1ui(glGetUniformLocation(progPrep, "count"), (GLuint)gpuCount);
     glUniform1f(glGetUniformLocation(progPrep, "e"), e);
-    glUniform1f(glGetUniformLocation(progPrep, "g"), g);
-    glUniform1f(glGetUniformLocation(progPrep, "grow"), grow);
+    glUniform1f(glGetUniformLocation(progPrep, "sizeMul"), sizeMul);
     glUniform1f(glGetUniformLocation(progPrep, "stretchOn"), stretchOn);
+    glUniform1f(glGetUniformLocation(progPrep, "wave"), waveWidth);
+    glUniform1f(glGetUniformLocation(progPrep, "cohesionExp"), waveCohesionExp);
+    glUniform1f(glGetUniformLocation(progPrep, "midGrow"), waveMidGrow);
     glUniform1i(glGetUniformLocation(progPrep, "hasSmooth"), gpuHasSmooth ? 1 : 0);
     glUniformMatrix4fv(glGetUniformLocation(progPrep, "view"), 1, GL_FALSE, glm::value_ptr(view));
     glUniformMatrix4fv(glGetUniformLocation(progPrep, "proj"), 1, GL_FALSE, glm::value_ptr(proj));

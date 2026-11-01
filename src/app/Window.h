@@ -66,6 +66,8 @@ public:
     static float splatCohesion;      // 0 = straight lines, 1 = neighbours move as chunks
     static bool  splatAreaPreserve;  // size splats mid-flight by the OT map's area stretch
     static std::vector<float> splatStretch;   // per splat: that stretch at the halfway point
+    static float splatWave;          // 0 = all splats leave together; up to 0.6 = they leave in a heat wave
+    static std::vector<float> splatDelay;     // per splat: when the wave reaches it, in [0, 1]
     static bool  splatMorphActive;
     static bool  splatBaking;        // a background bake is running
     static float lastBakeMs;         // duration of the last finished bake

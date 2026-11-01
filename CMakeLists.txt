@@ -42,6 +42,8 @@ set(
     src/morph/GpuSDFMorph.cpp
     src/splats/SplatGenerator.cpp
     src/splats/SplatRenderer.cpp
+    src/splats/SplatHeat.cpp
+    src/mesh/MorphTexturedRenderer.cpp
     src/particles/Particle.cpp
     src/particles/ParticleSystem.cpp
 )

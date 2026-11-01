@@ -62,3 +62,41 @@ glm::vec3 Texture::Sample(const glm::vec2& uv) const {
     glm::vec3 bottom = glm::mix(Texel(xa, yb), Texel(xb, yb), fx);
     return glm::mix(top, bottom, fy);
 }
+
+// Texels are display values in [0, 1], row 0 = the image top. Uploading row 0
+// first puts it at t = 0, which is where our uv (v = 0 at the top) looks.
+GLuint Texture::CreateGLTexture() const {
+    std::vector<unsigned char> rgb(texels.size() * 3);
+    for (size_t i = 0; i < texels.size(); ++i)
+        for (int ch = 0; ch < 3; ++ch)
+            rgb[3 * i + ch] = (unsigned char)std::lround(glm::clamp(texels[i][ch], 0.0f, 1.0f) * 255.0f);
+
+    GLuint id;
+    glGenTextures(1, &id);
+    glBindTexture(GL_TEXTURE_2D, id);
+    glPixelStorei(GL_UNPACK_ALIGNMENT, 1);   // rows of 3-byte pixels aren't 4-byte aligned
+    glTexImage2D(GL_TEXTURE_2D, 0, GL_RGB8, width, height, 0, GL_RGB, GL_UNSIGNED_BYTE, rgb.data());
+    glGenerateMipmap(GL_TEXTURE_2D);         // smaller copies, so a far-away mesh doesn't shimmer
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR_MIPMAP_LINEAR);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_REPEAT);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_REPEAT);
+    glPixelStorei(GL_UNPACK_ALIGNMENT, 4);
+    glBindTexture(GL_TEXTURE_2D, 0);
+    return id;
+}
+
+GLuint TextureCache::Get(const std::shared_ptr<Texture>& image) {
+    auto it = ids.find(image.get());
+    if (it != ids.end()) return it->second;
+    GLuint id = image->CreateGLTexture();
+    ids[image.get()] = id;
+    images.push_back(image);
+    return id;
+}
+
+void TextureCache::Clear() {
+    for (auto& entry : ids) glDeleteTextures(1, &entry.second);
+    ids.clear();
+    images.clear();
+}

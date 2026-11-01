@@ -1,24 +1,21 @@
 # Gaussian Cake
 
-## Demo: https://youtu.be/RBu-PR3ZYA4
-<img width="2100" height="1247" alt="Screenshot 2026-04-05 005843" src="https://github.com/user-attachments/assets/c7f926b8-0df9-4d66-8b2c-34ff7d3b350e" />
-<img width="1544" height="1029" alt="image" src="https://github.com/user-attachments/assets/dcbf13d9-b03c-4d5f-9efe-094bd0207caf" />
-
-## Update 10/13/26
+## Update 11/1/26
 ### Model Morphing: Shared Topology & Gaussian Splatting
 Two new OT morphing mode were building on top of the Original Gaussian Cake.
-
 
 https://github.com/user-attachments/assets/98e52f4b-2f6b-402d-9be6-54df5fd2eb13
 
 
 **Topology Mode**: We first check whether the two models have the sharing topology first, then we uses OT to determine the path for the two mesh's triangle topology and morph into another shape. It uses mesh with more faces as the template, and fits that topology to the other model and show the morph animation.If they don't share the same topology, such as mismatch or different number of genus, it will use the SDF path instead.
 
-SDF: in-between shapes are aligned by two lerp: M_t = (1−t)·I + t·T, making each model a signed distance field and match the surfaces.
+SDF: in-between shapes are aligned by two lerp: M_t = (1−t)·I + t·T, making each model a signed distance field and match the surfaces so it creates a smooth morphing effect, but still slightly off the original shapes visually.
 
 https://github.com/user-attachments/assets/53793805-99b7-4744-a415-52867123ba84
 
 **Splats Mode**: Each Particles is getting replaced by 3D Gaussian blobs, it stores a center, covariance, color and opacity. Then we applies OT between the mixtures of the two models: we first estimate the moving cost for each blob(Bures cost), and matches them after (Sinkhorn), where it shifts and streches each of those blobs to the other location. At the end, we simulate morphing animation and show the cooking.
+
+Currently supports .obj, .glb, .ply files.
 
 References: 
 Chen, Georgiou, Tannenbaum 2019, Optimal Transport for Gaussian Mixture Models. arXiv:1710.07876
@@ -27,20 +24,6 @@ Dowson & Landau 1982, The Fréchet distance between multivariate normal distribu
 
 Peyré & Cuturi 2019, Computational Optimal Transport. arXiv:1803.00567
 
-### Exterior Calculus in the Pipeline
-Four parts of the morph are applications of exterior calculus (CSE 270):
-
-| Where | Identity | What it does |
-|---|---|---|
-| `MeshTopology::BuildForms` | `d1 ∘ d0 = 0` | Builds the discrete exterior derivatives (vertex → edge → face incidence). The load log prints `\|d1 d0\| = 0`. |
-| `MeshTopology::OrientConsistently` | an orientation (area form) exists | Fixes the triangle winding face by face, and detects non-orientable meshes (Möbius strip), which then use the SDF path. Topology mode also reports the genus `g = (2·parts − χ − holes)/2`. |
-| `MeshFitter` (Cotan Laplacian) | `Δ = ⋆d⋆d` → `L = d0ᵀ ⋆1 d0` | The template fit keeps its shape with the cotan Laplacian (the Hodge star `⋆1` is the cotan edge weights) instead of a uniform one. It respects the actual triangle shapes, and linear functions get exactly zero Laplacian. |
-| `sdf_common.glsl` `PhiGrad` | `d` commutes with pullback | The morph field is a pullback, `φ_t = (M_t⁻¹)*[(1−t)φ_A + t·T*φ_B]`, so the surface normal is exact: `∇φ_t = M_t⁻ᵀ[(1−t)∇φ_A + t·Aᵀ∇φ_B]`. Gradients are 1-forms and transform by the inverse transpose. This replaces the 6-sample finite difference. |
-| `MidwayStretch` (Splats) | pullback of the area 2-form | A splat's patch of surface, spanned by tangents t₁, t₂, has area `\|M t₁ ∧ M t₂\|` under the OT path `M_t`. Splats grow or shrink mid-flight to match, so they keep covering the surface (toggle: *Area-preserving splats*). The bake also logs `det J`, the Monge–Ampère volume ratio. |
-
-Wang, Nabizadeh, Chern 2023, Exterior Calculus in Graphics (course notes).
-
-Sorkine & Alexa 2007, As-Rigid-As-Possible Surface Modeling.
 
 ## Inspiration
 This project is inspired by the mathematical problem of **Optimal Transport (OT)**, which seeks a mapping between two distributions that minimizes a specified transport cost. 

@@ -16,6 +16,10 @@ public:
     glm::vec3 At(const glm::vec3& p) const;
     std::vector<glm::vec3> At(const std::vector<glm::vec3>& points) const;   // in parallel
 
+    // The closest point of the mesh's surface to p (hit.tri = -1 without colours)
+    SurfaceBVH::Hit Closest(const glm::vec3& p) const;
+    const MeshData& Mesh() const { return mesh; }
+
 private:
     MeshData   mesh;
     SurfaceBVH bvh;

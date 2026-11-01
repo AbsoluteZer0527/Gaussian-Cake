@@ -18,6 +18,11 @@ glm::vec3 SurfaceColor::At(const glm::vec3& p) const {
     return mesh.Albedo(hit.tri, Barycentric(hit.point, t.v0, t.v1, t.v2));
 }
 
+SurfaceBVH::Hit SurfaceColor::Closest(const glm::vec3& p) const {
+    if (!HasColor()) return SurfaceBVH::Hit();
+    return bvh.Closest(p);
+}
+
 std::vector<glm::vec3> SurfaceColor::At(const std::vector<glm::vec3>& points) const {
     std::vector<glm::vec3> out(points.size(), fallback);
     if (HasColor())

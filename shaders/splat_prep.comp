@@ -10,7 +10,7 @@ struct SplatKeyframes {
     vec4 meanA, meanB;           // xyz
     vec4 rotA, rotB;             // quaternion (x, y, z, w)
     vec4 logScaleA, logScaleB;   // xyz = log(scale), w = opacity
-    vec4 colorA, colorB;         // rgb
+    vec4 colorA, colorB;         // rgb; colorA.w = heat-wave delay
     vec4 smoothDisp;             // xyz: neighbour-averaged displacement, w: halfway stretch
 };
 struct Prepared {
@@ -26,9 +26,11 @@ layout(std430, binding = 3) writeonly buffer SortVals  { uint sortVals[]; };
 
 uniform uint  count;
 uniform float e;          // eased time
-uniform float g;          // cohesion: how much of each splat's own correction is applied
-uniform float grow;       // mid-flight size boost
+uniform float sizeMul;    // scales every splat (a capture shown at rest)
 uniform float stretchOn;  // 1 = apply the per-splat area stretch, 0 = ignore it
+uniform float wave;       // heat-wave width, 0 = off (all splats share e)
+uniform float cohesionExp;   // cohesion weight g = e^cohesionExp
+uniform float midGrow;    // mid-flight size boost: grow = 1 + midGrow 4e(1-e)
 uniform int   hasSmooth;
 uniform mat4  view;
 uniform mat4  proj;
@@ -71,21 +73,32 @@ void main() {
     if (i >= count) return;
     SplatKeyframes k = keyframes[i];
 
+    // ---- this splat's clock (SplatHeat.cpp SplatClockAt, line for line) ----
+    float ei = e;
+    if (wave > 0.0) {
+        float inside = clamp(e, 0.0, 1.0);
+        float local = (inside - wave * k.colorA.w) / (1.0 - wave);
+        ei = clamp(local, 0.0, 1.0) + (e - inside);   // keeps easing overshoot
+    }
+    float gi = pow(max(ei, 0.0), cohesionExp);
+    float tc = clamp(ei, 0.0, 1.0);
+    float bump = 4.0 * tc * (1.0 - tc);
+    float growi = sizeMul * (1.0 + midGrow * bump);
+
     // ---- interpolate (Window::idleCallback) ----
     vec3 a = k.meanA.xyz, b = k.meanB.xyz;
     vec3 mean;
     if (hasSmooth != 0) {
         vec3 sd = k.smoothDisp.xyz;
-        mean = a + e * sd + g * ((b - a) - sd);
+        mean = a + ei * sd + gi * ((b - a) - sd);
     } else {
-        mean = mix(a, b, e);
+        mean = mix(a, b, ei);
     }
-    vec4  rot     = Slerp(k.rotA, k.rotB, e);
-    vec3  scale   = grow * exp(mix(k.logScaleA.xyz, k.logScaleB.xyz, e));
-    float tc      = clamp(e, 0.0, 1.0);
-    scale.xy     *= pow(k.smoothDisp.w, stretchOn * 4.0 * tc * (1.0 - tc));   // z is the thin axis
-    vec3  color   = mix(k.colorA.rgb, k.colorB.rgb, e);
-    float opacity = mix(k.logScaleA.w, k.logScaleB.w, e);
+    vec4  rot     = Slerp(k.rotA, k.rotB, ei);
+    vec3  scale   = growi * exp(mix(k.logScaleA.xyz, k.logScaleB.xyz, ei));
+    scale.xy     *= pow(k.smoothDisp.w, stretchOn * bump);   // z is the thin axis
+    vec3  color   = mix(k.colorA.rgb, k.colorB.rgb, ei);
+    float opacity = mix(k.logScaleA.w, k.logScaleB.w, ei);
 
     // Sigma = (R S)(R S)^T
     mat3 M = QuatToMat(rot) * mat3(scale.x, 0.0, 0.0, 0.0, scale.y, 0.0, 0.0, 0.0, scale.z);

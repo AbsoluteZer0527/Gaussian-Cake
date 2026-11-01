@@ -15,6 +15,9 @@ uniform mat4 model;
 out vec3 fragNormal;
 out vec3 fragAlbedo;
 out vec2 fragUV;
+out vec2 fragUVB;            // shader.frag's morph-texture inputs: same as above here
+out vec3 fragAlbedoA;
+out vec3 fragAlbedoB;
 
 
 void main()
@@ -26,4 +29,7 @@ void main()
 	fragNormal = vec3(model * vec4(normal, 0));
 	fragAlbedo = color;
 	fragUV = uv;
+	fragUVB = uv;
+	fragAlbedoA = color;
+	fragAlbedoB = color;
 }

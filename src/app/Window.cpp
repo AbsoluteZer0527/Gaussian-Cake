@@ -17,6 +17,8 @@
 #include "SurfaceColor.h"
 #include "PlyMeshLoader.h"
 #include "TexturedMeshRenderer.h"
+#include "MorphTexturedRenderer.h"
+#include "SplatHeat.h"
 
 #include <glm/gtc/quaternion.hpp>
 #include <chrono>
@@ -72,6 +74,15 @@ static std::vector<glm::vec3>    g_sharedColorCurrent;                   // CPU 
 static MeshData                  g_dataA, g_dataB;
 static TexturedMeshRenderer*     g_restMesh = nullptr;
 static bool                      g_restTextured = false;   // g_restMesh is what's shown at rest
+// Shared topology with textures: the in-between surface keeps both meshes'
+// textures per pixel (instead of g_sharedColorStart/End at the vertices)
+static MorphTexturedRenderer*    g_morphTextured = nullptr;
+static bool                      g_morphTexturedOn = false;   // g_morphTextured holds this bake
+static float                     g_morphTexT = 0.0f;          // its morphT this frame
+// GL textures of the baked meshes (shared by g_restMesh and g_morphTextured)
+// and of the topology preview
+static TextureCache              g_morphTextures;
+static TextureCache              g_previewTextures;
 static bool                      g_morphShared = false;   // shared topology vs SDF
 static std::vector<glm::vec3>    g_sharedStart, g_sharedEnd;
 static std::vector<glm::vec3>    g_sharedCurrent;         // CPU path only
@@ -99,7 +110,14 @@ static double MsSince(std::chrono::steady_clock::time_point t0) {
 }
 
 // Splat attributes for this frame on the GPU path (computed in idleCallback)
-static float g_splatE = 0.0f, g_splatG = 0.0f, g_splatGrow = 1.0f, g_splatStretchOn = 1.0f;
+static float g_splatE = 0.0f, g_splatStretchOn = 1.0f;
+static const float kSplatMidGrow = 0.3f;   // splats grow up to +30% halfway (SplatClockAt)
+
+// Heat wave (HeatWaveDelay): only computed once the Heat Wave slider is above 0
+static const double kWaveSigma        = 0.6;    // how far the source's heat spreads (the shapes span about 2 units)
+static const double kWaveSeedFraction = 0.02;   // the lowest 2% of splats are the source
+static float g_splatWaveCell = 0.0f;            // neighbour-search cell of the baked splats
+static void EnsureSplatDelay();
 
 // Full-resolution captures on the GPU: [0] = A, [1] = B. Shown while the
 // timeline rests at that end (the morph itself moves a subsample), and [0]
@@ -138,6 +156,8 @@ PlyLoadOptions Window::plyOptions;
 float Window::splatCohesion    = 0.6f;
 bool  Window::splatAreaPreserve = true;
 std::vector<float> Window::splatStretch;
+float Window::splatWave         = 0.0f;
+std::vector<float> Window::splatDelay;
 std::vector<glm::vec3> Window::splatSmoothDisp;
 static int splatPreviewGen     = 0;   // bump to force the static preview to rebuild
 
@@ -383,7 +403,8 @@ static void UpdateModePreview() {
         g_previewIsTextured = mesh.HasAppearance();
         if (g_previewIsTextured) {
             if (!g_previewTextured) g_previewTextured = new TexturedMeshRenderer();
-            g_previewTextured->Initialize(mesh);
+            g_previewTextures.Clear();
+            g_previewTextured->Initialize(mesh, g_previewTextures);
         }
         return;
     }
@@ -494,6 +515,9 @@ void Window::cleanUp() {
     delete g_previewMesh;
     delete g_previewTextured;
     delete g_restMesh;
+    delete g_morphTextured;
+    g_morphTextures.Clear();   // while the GL context is still alive
+    g_previewTextures.Clear();
     delete g_gpuSdf;
     delete g_morphTimer;
     delete g_drawTimer;
@@ -568,50 +592,53 @@ void Window::idleCallback() {
         animator->Update(deltaTime, unused);
 
         float e = animator->GetBlend();
+        EnsureSplatDelay();
 
-        // Splats spread apart while travelling; grow them a little mid-flight
-        // (up to +30% at the halfway point, exact size at both ends).
-        const float kMidGrow = 0.3f;
-        float tc = glm::clamp(e, 0.0f, 1.0f);
-        float grow = 1.0f + kMidGrow * 4.0f * tc * (1.0f - tc);
-
-        // Cohesive path: follow the neighbour-smoothed displacement, and add
-        // each splat's own correction late (g grows slowly, then reaches 1).
-        // cohesion 0 -> g = e -> plain straight lines.
-        float g = std::pow(std::max(e, 0.0f), 1.0f + 4.0f * splatCohesion);
+        // Each splat's clock this frame (SplatClockAt):
+        //   cohesion: splats follow the neighbour-smoothed displacement and add
+        //     their own correction late (g = e^cohesionExp grows slowly, then
+        //     reaches 1); cohesion 0 -> g = e -> plain straight lines.
+        //   grow: splats spread apart while travelling, so they grow a little
+        //     mid-flight (exact size at both ends).
+        //   heat wave: each splat starts when the wave reaches it (its delay).
+        float cohesionExp = 1.0f + 4.0f * splatCohesion;
         bool smooth = splatSmoothDisp.size() == splatCurrent.size();
+        bool wave = splatWave > 0.0f && splatDelay.size() == splatCurrent.size();
+        float waveWidth = wave ? splatWave : 0.0f;
 
         // GPU path: splat_prep.comp runs the loop below for every splat
         g_splatE = e;
-        g_splatG = g;
-        g_splatGrow = grow;
+        splatRenderer->SetClock(waveWidth, cohesionExp, kSplatMidGrow);
         size_t cpuCount = SplatsOnGpu() ? 0 : splatCurrent.size();
 
         // Area-preserving size: each splat's tangent size also follows the OT
         // map's own area stretch, s_i^(4t(1-t)): 1 at both ends, s_i halfway.
         bool stretch = splatAreaPreserve && splatStretch.size() == splatCurrent.size();
         g_splatStretchOn = splatAreaPreserve ? 1.0f : 0.0f;
-        float stretchExp = 4.0f * tc * (1.0f - tc);
 
         for (size_t i = 0; i < cpuCount; ++i) {
             const Splat& a = splatStart[i];
             const Splat& b = splatEnd[i];
             Splat& s = splatCurrent[i];
+
+            float delay = wave ? splatDelay[i] : 0.0f;
+            SplatClock clock = SplatClockAt(e, waveWidth, delay, cohesionExp, kSplatMidGrow);
+
             if (smooth) {
                 glm::vec3 d = b.mean - a.mean;
-                s.mean = a.mean + e * splatSmoothDisp[i] + g * (d - splatSmoothDisp[i]);
+                s.mean = a.mean + clock.e * splatSmoothDisp[i] + clock.g * (d - splatSmoothDisp[i]);
             } else {
-                s.mean = glm::mix(a.mean, b.mean, e);
+                s.mean = glm::mix(a.mean, b.mean, clock.e);
             }
-            s.rot     = glm::slerp(a.rot, b.rot, e);   // shortest path
-            s.scale   = grow * glm::exp(glm::mix(glm::log(a.scale), glm::log(b.scale), e));
+            s.rot     = glm::slerp(a.rot, b.rot, clock.e);   // shortest path
+            s.scale   = clock.grow * glm::exp(glm::mix(glm::log(a.scale), glm::log(b.scale), clock.e));
             if (stretch) {
-                float k = std::pow(splatStretch[i], stretchExp);
+                float k = std::pow(splatStretch[i], clock.stretchExp);
                 s.scale.x *= k;
                 s.scale.y *= k;   // z is the thin axis
             }
-            s.color   = glm::mix(a.color, b.color, e);
-            s.opacity = glm::mix(a.opacity, b.opacity, e);
+            s.color   = glm::mix(a.color, b.color, clock.e);
+            s.opacity = glm::mix(a.opacity, b.opacity, clock.e);
         }
     } else if (trueMorphActive) {
         static std::vector<glm::vec3> unused;
@@ -639,10 +666,10 @@ void Window::displayCallback(GLFWwindow* window) {
 
     if (renderMode == RenderMode::Splats) {
         if (gpuSet == splatRenderer)
-            splatRenderer->DrawMorph(g_splatE, g_splatG, g_splatGrow, g_splatStretchOn, Cam->GetViewMtx(), Cam->GetProjectMtx());
+            splatRenderer->DrawMorph(g_splatE, 1.0f, g_splatStretchOn, Cam->GetViewMtx(), Cam->GetProjectMtx());
         else if (gpuSet)   // a full capture: start == end, so the time doesn't matter.
                            // The preview is uploaded unscaled, so Splat Size is applied here.
-            gpuSet->DrawMorph(0.0f, 0.0f, splatMorphActive ? 1.0f : splatSizeMul, 0.0f,
+            gpuSet->DrawMorph(0.0f, splatMorphActive ? 1.0f : splatSizeMul, 0.0f,
                               Cam->GetViewMtx(), Cam->GetProjectMtx());
         else
             splatRenderer->Draw(splatCurrent, Cam->GetViewMtx(), Cam->GetProjectMtx());
@@ -651,6 +678,8 @@ void Window::displayCallback(GLFWwindow* window) {
             g_gpuSdf->Draw(shaderProgram, Cam->GetViewProjectMtx(), meshRenderer->diffuseColor);
         else if (g_restTextured && g_morphShown != MorphShown::Blend)
             g_restMesh->Draw(shaderProgram, Cam->GetViewProjectMtx());
+        else if (g_morphTexturedOn && g_morphShown == MorphShown::Blend)
+            g_morphTextured->Draw(morphProgram, Cam->GetViewProjectMtx(), g_morphTexT);
         else
             meshRenderer->Draw(meshRenderer->IsMorphTarget() ? morphProgram : shaderProgram,
                                Cam->GetViewProjectMtx());
@@ -783,6 +812,7 @@ struct SplatBakeSettings {
     float sizeMul, sinkhornEps, posteriorTemp;
     float colorMatch;
     PlyLoadOptions ply;
+    bool  heatWave;   // also compute the heat wave's delays (else EnsureSplatDelay does, if needed)
 };
 
 struct SplatBakeResult {
@@ -790,6 +820,8 @@ struct SplatBakeResult {
     std::vector<Splat> start, end;   // start[i] travels to end[i]
     std::vector<glm::vec3> smoothDisp;   // neighbour-averaged end - start
     std::vector<float> stretch;      // per splat: the OT map's extra size factor halfway (MidwayStretch)
+    std::vector<float> delay;        // per splat: when the heat wave reaches it, in [0, 1] (empty: not computed)
+    float waveCell = 0.0f;           // neighbour-search cell for HeatWaveDelay
     double detMin = 0.0, detMed = 0.0, detMax = 0.0;   // det J of the map over the splats
     std::vector<int> knn;            // kSplatNeighbors nearest A-neighbours per splat (-1 = none)
     std::vector<Splat> restA, restB; // full captures shown at rest (empty when nothing was dropped)
@@ -925,11 +957,6 @@ static void ForBoth(SplatMeshCache& a, SplatMeshCache& b, F f) {
     auto job = std::async(std::launch::async, [&] { f(b); });
     f(a);
     job.get();
-}
-
-static float Dist2(const glm::vec3& a, const glm::vec3& b) {
-    glm::vec3 d = a - b;
-    return glm::dot(d, d);
 }
 
 // Total squared distance of a matching y[i] -> b[perm[i]].
@@ -1192,50 +1219,44 @@ static SplatBakeResult RunSplatBake(SplatBakeSettings st) {
         res.end[i] = e;
     }
 
-    // Cohesion: average each splat's displacement over its nearest neighbours
-    // on A (repeated Laplacian smoothing). At runtime splats travel along this
-    // smooth field first, so neighbours move together as chunks, and only add
-    // their own correction near the end, so the endpoints stay exact.
-    const int kNN = kSplatNeighbors, kSmoothIters = 10;
-    SetBakeStage(5, 1 + kSmoothIters);
+    // Cohesion: smooth each splat's displacement over A by heat flow (DEC:
+    // *0 du/dt = -d0^T *1 d0 u on the splats' neighbour graph), one implicit
+    // step. At runtime splats travel along this smooth field first, so
+    // neighbours move together as chunks, and only add their own correction
+    // near the end, so the endpoints stay exact. The heat time sets the chunk
+    // size in distance, so it's the same at every splat count (repeated
+    // neighbour averaging reached a fixed number of neighbours instead, so
+    // chunks shrank as the count grew).
+    const int kNN = kSplatNeighbors;
+    const double kChunkSigma = 0.07;   // chunk size (the shapes span about 2 units)
+    SetBakeStage(5, 3);
     std::vector<int> idx(n);
     std::iota(idx.begin(), idx.end(), 0);
-    res.knn.assign((size_t)n * kNN, -1);
-    {
-        std::vector<glm::vec3> aPos(n);
-        for (int i = 0; i < n; ++i) aPos[i] = res.start[i].mean;
-        PointGrid g;
-        g.Build(aPos, 2.0f * radiusA);
+    std::vector<glm::vec3> aPos(n);
+    for (int i = 0; i < n; ++i) aPos[i] = res.start[i].mean;
+    res.knn = NearestNeighbors(aPos, kNN, 2.0f * radiusA);
+    g_bakeDone++;
 
-        std::for_each(std::execution::par, idx.begin(), idx.end(), [&](int i) {
-            std::vector<std::pair<float, int>> cand;
-            g.ForEachNear(aPos[i], [&](int j) {
-                if (j != i) cand.push_back({ Dist2(aPos[i], aPos[j]), j });
-            });
-            int m = std::min(kNN, (int)cand.size());
-            std::partial_sort(cand.begin(), cand.begin() + m, cand.end());
-            for (int k = 0; k < m; ++k) res.knn[(size_t)i * kNN + k] = cand[k].second;
-        });
+    std::vector<glm::vec3> disp(n);
+    for (int i = 0; i < n; ++i) disp[i] = res.end[i].mean - res.start[i].mean;
+    {
+        Eigen::SparseMatrix<double> L;
+        Eigen::VectorXd mass;
+        SplatGraphLaplacian(aPos, res.knn, kNN, L, mass);
+        Eigen::MatrixXd d(n, 3);
+        for (int i = 0; i < n; ++i) d.row(i) = Eigen::RowVector3d(disp[i].x, disp[i].y, disp[i].z);
+        Eigen::MatrixXd smooth = HeatStep(L, mass, d, 0.5 * kChunkSigma * kChunkSigma);
+        res.smoothDisp.resize(n);
+        for (int i = 0; i < n; ++i)
+            res.smoothDisp[i] = glm::vec3((float)smooth(i, 0), (float)smooth(i, 1), (float)smooth(i, 2));
     }
     g_bakeDone++;
 
-    std::vector<glm::vec3> disp(n), cur, next(n);
-    for (int i = 0; i < n; ++i) disp[i] = res.end[i].mean - res.start[i].mean;
-    cur = disp;
-    for (int it = 0; it < kSmoothIters; ++it) {
-        std::for_each(std::execution::par, idx.begin(), idx.end(), [&](int i) {
-            glm::vec3 sum = cur[i];
-            int cnt = 1;
-            for (int k = 0; k < kNN; ++k) {
-                int j = res.knn[(size_t)i * kNN + k];
-                if (j >= 0) { sum += cur[j]; ++cnt; }
-            }
-            next[i] = sum / (float)cnt;
-        });
-        std::swap(cur, next);
-        g_bakeDone++;
-    }
-    res.smoothDisp = std::move(cur);
+    // Heat wave: when heat spreading from A's lowest splats (the pan) reaches
+    // each splat. Only needed when the Heat Wave slider is above 0.
+    res.waveCell = 2.0f * radiusA;
+    if (st.heatWave) res.delay = HeatWaveDelay(aPos, res.waveCell, kWaveSigma, kWaveSeedFraction);
+    g_bakeDone++;
 
     // How differently neighbours move: mean |d_i - d_j| over neighbour pairs
     auto neighborSpread = [&](const std::vector<glm::vec3>& d) {
@@ -1268,6 +1289,36 @@ static std::future<SplatBakeResult> g_bakeFuture;
 static int g_bakeEpoch  = 0;   // bumped by Clear / mode switches; a running bake is then dropped
 static int g_bakeLaunchEpoch = 0;   // epoch when the running bake started
 
+// What the scene's current bakes were made from: Bake with the same shapes and
+// settings just plays them again instead of baking again
+static std::string g_bakedSplatKey;   // empty = nothing baked
+static std::string g_bakedMorphKey;
+static std::string g_launchKey;       // the running bake's
+static std::vector<Splat> g_restSplatsA, g_restSplatsB;   // full captures at rest (the preview reuses g_fullSplats[0])
+
+static std::string SplatBakeKey(const SplatBakeSettings& st) {
+    return CaptureKey(st.pathA, st.ply) + "|" + CaptureKey(st.pathB, st.ply) + "|" +
+           std::to_string(st.splatCount) + "|" + std::to_string(st.sampleCount) + "|" +
+           std::to_string(st.mixtureK) + "|" + std::to_string(st.sizeMul) + "|" +
+           std::to_string(st.sinkhornEps) + "|" + std::to_string(st.posteriorTemp) + "|" +
+           std::to_string(st.colorMatch);
+}
+
+// Starts the baked splat morph from A (after a bake, or Bake again unchanged)
+static void PlaySplatMorph() {
+    Window::splatCurrent = Window::splatStart;
+    if (Window::gpuAvailable) {
+        g_fullSplats[0]->UploadKeyframes(g_restSplatsA, g_restSplatsA, {});   // empty = none
+        g_fullSplats[1]->UploadKeyframes(g_restSplatsB, g_restSplatsB, {});
+    }
+    // The animator only provides the timeline (easing, duration, state)
+    Window::animator->InitializeWithEndPoints({}, {});
+    Window::animator->StartTransport();
+    Window::splatMorphActive    = true;
+    Window::trueMorphActive     = false;
+    Window::particleMorphActive = false;
+}
+
 void Window::BakeSplatMorph(const std::string& pathA, const std::string& pathB) {
     if (splatBaking || morphBaking) return;
 
@@ -1282,6 +1333,14 @@ void Window::BakeSplatMorph(const std::string& pathA, const std::string& pathB) 
     st.posteriorTemp = posteriorTemp;
     st.colorMatch    = colorMatch;
     st.ply           = plyOptions;
+    st.heatWave      = splatWave > 0.0f;
+
+    std::string key = SplatBakeKey(st);
+    if (key == g_bakedSplatKey) {   // already baked: play it again
+        PlaySplatMorph();
+        return;
+    }
+    g_launchKey = key;
 
     g_stageNames = kBakeStageNames;
     g_stageCount = 6;
@@ -1318,27 +1377,38 @@ void Window::PollSplatBake() {
     splatEnd        = std::move(res.end);
     splatSmoothDisp = std::move(res.smoothDisp);
     splatStretch    = std::move(res.stretch);
-    splatCurrent    = splatStart;
+    splatDelay      = std::move(res.delay);
+    g_splatWaveCell = res.waveCell;
+    g_restSplatsA   = std::move(res.restA);
+    g_restSplatsB   = std::move(res.restB);
+    g_bakedSplatKey = g_launchKey;
 
     // GPU path: the keyframes go up once; each frame then only sends the time
-    if (gpuAvailable) {
-        splatRenderer->UploadKeyframes(splatStart, splatEnd, splatSmoothDisp, splatStretch);
-        g_fullSplats[0]->UploadKeyframes(res.restA, res.restA, {});   // empty = none
-        g_fullSplats[1]->UploadKeyframes(res.restB, res.restB, {});
-    }
+    if (gpuAvailable)
+        splatRenderer->UploadKeyframes(splatStart, splatEnd, splatSmoothDisp, splatStretch, splatDelay);
 
-    // The animator only provides the timeline (easing, duration, state)
-    animator->InitializeWithEndPoints({}, {});
-    animator->StartTransport();
-    splatMorphActive    = true;
-    trueMorphActive     = false;
-    particleMorphActive = false;
+    PlaySplatMorph();
     lastBakeMs          = (float)res.ms;
     g_perf.ObserveBake((int)splatStart.size(), res.ms - res.loadMs);
     g_refitQuality = true;
 
     std::cout << "[Splats] baked " << splatStart.size() << " matched splats, K=" << mixtureK
               << ", mean match distance " << res.meanMatchDist << ", " << res.ms << " ms\n";
+}
+
+// The heat wave's delays, computed the first time the Heat Wave slider is
+// above 0 for this bake (the bake skips them while it's at 0)
+static void EnsureSplatDelay() {
+    const std::vector<Splat>& start = Window::splatStart;
+    if (Window::splatWave <= 0.0f || start.empty() || g_splatWaveCell <= 0.0f) return;
+    if (Window::splatDelay.size() == start.size()) return;
+
+    std::vector<glm::vec3> pos(start.size());
+    for (size_t i = 0; i < start.size(); ++i) pos[i] = start[i].mean;
+    Window::splatDelay = HeatWaveDelay(pos, g_splatWaveCell, kWaveSigma, kWaveSeedFraction);
+    if (Window::gpuAvailable)   // the delays live in the GPU keyframes too
+        Window::splatRenderer->UploadKeyframes(start, Window::splatEnd, Window::splatSmoothDisp,
+                                               Window::splatStretch, Window::splatDelay);
 }
 
 // What the preview worker hands back for a capture.
@@ -1603,6 +1673,7 @@ struct TrueMorphResult {
     MeshData dataA, dataB;               // the files as loaded (with materials), if coloured
     std::vector<glm::vec3> colorsA, colorsB;               // per vertex of a / b (empty: no colours)
     std::vector<glm::vec3> sharedColorStart, sharedColorEnd;
+    std::vector<CornerUV>  sharedCorners;   // textured meshes: each template corner's uv on A and B
     bool shared = false;
     std::vector<unsigned int> sharedIndices;
     std::vector<glm::vec3>    sharedStart, sharedEnd;
@@ -1692,6 +1763,14 @@ static TrueMorphResult RunTrueMorphBake(TrueMorphSettings st) {
         if (colored) {
             res.sharedColorStart = colorA.At(res.sharedStart);
             res.sharedColorEnd   = colorB.At(res.sharedEnd);
+            bool textured = false;
+            for (const MeshData* data : { &res.dataA, &res.dataB }) {
+                for (const Material& m : data->materials) {
+                    if (m.texture) textured = true;
+                }
+            }
+            if (textured)
+                res.sharedCorners = PullBackCorners(res.sharedStart, res.sharedEnd, res.sharedIndices, colorA, colorB);
         }
 
         snprintf(buf, sizeof(buf),
@@ -1730,6 +1809,27 @@ static TrueMorphResult RunTrueMorphBake(TrueMorphSettings st) {
 
 static std::future<TrueMorphResult> g_morphFuture;
 
+static std::string MorphBakeKey(const TrueMorphSettings& st) {
+    return st.pathA + "|" + st.pathB + "|" + std::to_string((int)st.method) + "|" +
+           std::to_string(st.sdfResolution) + "|" + std::to_string(st.sampleCount) + "|" +
+           std::to_string(st.fitStiffness) + "|" + std::to_string((int)st.fitCotan) + "|" +
+           std::to_string(st.fallbackColor.x) + "," + std::to_string(st.fallbackColor.y) + "," +
+           std::to_string(st.fallbackColor.z);
+}
+
+// Starts the baked topology morph from A (after a bake, or Bake again unchanged)
+static void PlayTrueMorph() {
+    // The animator only provides the timeline (easing, duration, state)
+    Window::animator->InitializeWithEndPoints({}, {});
+    Window::animator->StartTransport();
+    g_morphShown                = MorphShown::None;
+    g_lastSdfT                  = -1.0f;
+    g_sdfOnGpu                  = false;
+    Window::trueMorphActive     = true;
+    Window::particleMorphActive = false;
+    Window::UpdateTrueMorph();
+}
+
 // Starts the topology bake on a background thread; PollTrueMorphBake picks
 // up the result, so the UI keeps running meanwhile.
 void Window::BakeTrueMorph(const std::string& pathA, const std::string& pathB) {
@@ -1744,6 +1844,13 @@ void Window::BakeTrueMorph(const std::string& pathA, const std::string& pathB) {
     st.fitStiffness  = fitStiffness;
     st.fitCotan      = fitCotan;
     st.fallbackColor = glm::sqrt(meshRenderer->diffuseColor);   // shader.frag's grey, as a display value
+
+    std::string key = MorphBakeKey(st);
+    if (key == g_bakedMorphKey) {   // already baked: play it again
+        PlayTrueMorph();
+        return;
+    }
+    g_launchKey = key;
 
     g_stageNames = kMorphStageNames;
     g_stageCount = 3;
@@ -1792,6 +1899,17 @@ void Window::PollTrueMorphBake() {
     g_dataA              = std::move(res.dataA);
     g_dataB              = std::move(res.dataB);
     g_restTextured       = false;
+    g_bakedMorphKey      = g_launchKey;
+    g_morphTextures.Clear();   // the old meshes' images (g_restMesh re-initializes below)
+    // the textured in-between surface (GL work, so here on the main thread)
+    g_morphTexturedOn = res.shared && !res.sharedCorners.empty();
+    if (g_morphTexturedOn) {
+        if (!g_morphTextured) g_morphTextured = new MorphTexturedRenderer();
+        g_morphTextured->Initialize(g_sharedStart, g_sharedEnd, g_sharedIndices,
+                                    g_sharedColorStart, g_sharedColorEnd, res.sharedCorners, g_dataA, g_dataB,
+                                    g_morphTextures);
+        g_morphTexturedOn = g_morphTextured->IsInitialized();
+    }
     if (!res.shared) {
         g_sdfMorph = std::move(res.sdf);
         if (gpuAvailable) g_gpuSdf->Upload(g_sdfMorph, res.sdfVertCap, res.sdfIndexCap);
@@ -1801,16 +1919,7 @@ void Window::PollTrueMorphBake() {
     delete otMap;
     otMap = new OTMap(res.map);
     morphStatus = res.status;
-
-    // The animator only provides the timeline (easing, duration, state)
-    animator->InitializeWithEndPoints({}, {});
-    animator->StartTransport();
-    g_morphShown        = MorphShown::None;
-    g_lastSdfT          = -1.0f;
-    g_sdfOnGpu          = false;
-    trueMorphActive     = true;
-    particleMorphActive = false;
-    UpdateTrueMorph();
+    PlayTrueMorph();
 }
 
 // Gets this frame's surface ready to draw: the real A or B mesh at the ends
@@ -1842,7 +1951,7 @@ void Window::UpdateTrueMorph() {
             g_restTextured = data.HasAppearance();
             if (g_restTextured) {
                 if (!g_restMesh) g_restMesh = new TexturedMeshRenderer();
-                g_restMesh->Initialize(data);
+                g_restMesh->Initialize(data, g_morphTextures);
             }
             g_morphShown = want;
         }
@@ -1851,6 +1960,13 @@ void Window::UpdateTrueMorph() {
     g_restTextured = false;
 
     if (g_morphShared) {
+        // textured: the vertex shader blends the shapes, the fragment shader
+        // the two textures (needs only GL 3.3, so on the CPU path too)
+        if (g_morphTexturedOn) {
+            g_morphTexT  = e;
+            g_morphShown = MorphShown::Blend;
+            return;
+        }
         if (gpu) {
             if (g_morphShown != MorphShown::Blend || !meshRenderer->IsMorphTarget()) {
                 meshRenderer->InitializeMorph(g_sharedStart, g_sharedEnd, g_sharedIndices,
@@ -2136,6 +2252,10 @@ void Window::DrawMainGUI() {
                 ImGui::Checkbox("Area-preserving splats", &splatAreaPreserve);
                 ImGui::SetItemTooltip("Mid-flight, grow or shrink each splat by how much the OT map\n"
                                       "stretches its patch of surface (exact size at both ends)");
+                ImGui::SliderFloat("Heat Wave", &splatWave, 0.0f, 0.6f, "%.2f");
+                ImGui::SetItemTooltip("0 = every splat leaves at once\n"
+                                      "Higher = splats leave as heat spreads up from the bottom,\n"
+                                      "like a cake baking from the pan");
                 if (ImGui::SliderInt("Mixture K", &mixtureK, 1, 128)) autoQuality = false;
                 ImGui::SetItemTooltip("Gaussians fitted per shape for the OT map\n1 = original single-Gaussian map");
                 ImGui::SliderFloat("Sinkhorn eps", &sinkhornEps, 0.005f, 0.5f, "%.3f", ImGuiSliderFlags_Logarithmic);

@@ -31,41 +31,12 @@ void TexturedMeshRenderer::Release() {
     if (vbo) glDeleteBuffers(1, &vbo);
     if (ebo) glDeleteBuffers(1, &ebo);
     vao = vbo = ebo = 0;
-    for (auto& entry : uploaded) glDeleteTextures(1, &entry.second);
-    uploaded.clear();
     ranges.clear();
     materialColors.clear();
     materialTextures.clear();
 }
 
-// Texels are display values in [0, 1], row 0 = the image top. Uploading row 0
-// first puts it at t = 0, which is where our uv (v = 0 at the top) looks.
-GLuint TexturedMeshRenderer::Upload(const Texture& tex) {
-    auto it = uploaded.find(&tex);
-    if (it != uploaded.end()) return it->second;
-
-    std::vector<unsigned char> rgb(tex.Texels().size() * 3);
-    for (size_t i = 0; i < tex.Texels().size(); ++i)
-        for (int ch = 0; ch < 3; ++ch)
-            rgb[3 * i + ch] = (unsigned char)std::lround(glm::clamp(tex.Texels()[i][ch], 0.0f, 1.0f) * 255.0f);
-
-    GLuint id;
-    glGenTextures(1, &id);
-    glBindTexture(GL_TEXTURE_2D, id);
-    glPixelStorei(GL_UNPACK_ALIGNMENT, 1);   // rows of 3-byte pixels aren't 4-byte aligned
-    glTexImage2D(GL_TEXTURE_2D, 0, GL_RGB8, tex.Width(), tex.Height(), 0, GL_RGB, GL_UNSIGNED_BYTE, rgb.data());
-    glGenerateMipmap(GL_TEXTURE_2D);         // smaller copies, so a far-away mesh doesn't shimmer
-    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR_MIPMAP_LINEAR);
-    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
-    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_REPEAT);
-    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_REPEAT);
-    glPixelStorei(GL_UNPACK_ALIGNMENT, 4);
-    glBindTexture(GL_TEXTURE_2D, 0);
-    uploaded[&tex] = id;
-    return id;
-}
-
-void TexturedMeshRenderer::Initialize(const MeshData& mesh) {
+void TexturedMeshRenderer::Initialize(const MeshData& mesh, TextureCache& textures) {
     Release();
     if (mesh.tris.empty()) return;
 
@@ -73,7 +44,7 @@ void TexturedMeshRenderer::Initialize(const MeshData& mesh) {
     const int noMaterial = (int)mesh.materials.size();
     for (const Material& m : mesh.materials) {
         materialColors.push_back(m.baseColor);
-        materialTextures.push_back(m.texture ? Upload(*m.texture) : 0);
+        materialTextures.push_back(m.texture ? textures.Get(m.texture) : 0);
     }
     materialColors.push_back(glm::vec3(1.0f));
     materialTextures.push_back(0);

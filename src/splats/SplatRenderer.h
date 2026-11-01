@@ -36,14 +36,20 @@ public:
 
     // start[i] travels to end[i]; smoothDisp may be empty (straight paths).
     // stretch: per-splat halfway size factor (empty = 1 for every splat).
+    // delay: per-splat heat-wave delay in [0, 1] (empty = 0 for every splat).
     void UploadKeyframes(const std::vector<Splat>& start, const std::vector<Splat>& end,
                          const std::vector<glm::vec3>& smoothDisp,
-                         const std::vector<float>& stretch = {});
+                         const std::vector<float>& stretch = {},
+                         const std::vector<float>& delay = {});
 
-    // e = eased time, g = cohesion weight, grow = mid-flight size factor
-    // (the same values the CPU loop in Window::idleCallback uses).
+    // How each splat's clock follows the timeline in the next DrawMorph
+    // (SplatClockAt in SplatHeat.h): heat-wave width (0 = off), cohesion
+    // exponent and mid-flight growth. The defaults are a plain lerp.
+    void SetClock(float wave, float cohesionExp, float midGrow);
+
+    // e = eased time, sizeMul scales every splat,
     // stretchOn = 1 applies the per-splat stretch, 0 ignores it
-    void DrawMorph(float e, float g, float grow, float stretchOn, const glm::mat4& view, const glm::mat4& proj);
+    void DrawMorph(float e, float sizeMul, float stretchOn, const glm::mat4& view, const glm::mat4& proj);
 
     bool HasKeyframes() const { return gpuCount > 0; }
     int  Count() const { return gpuCount; }
@@ -79,6 +85,7 @@ private:
     void   SortByDepth();
 
     GpuTimer prepTimer, drawTimer;
+    float  waveWidth = 0.0f, waveCohesionExp = 1.0f, waveMidGrow = 0.0f;   // SetClock
 
     void   SetBlendState(bool begin);
 };

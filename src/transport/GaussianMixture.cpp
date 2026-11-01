@@ -4,11 +4,6 @@
 #include <cmath>
 #include <limits>
 
-static float Dist2(const glm::vec3& a, const glm::vec3& b) {
-    glm::vec3 d = a - b;
-    return glm::dot(d, d);
-}
-
 void GaussianMixture::FromSingle(const Gaussian& g) {
     components = { g };
     weights    = { 1.0 };

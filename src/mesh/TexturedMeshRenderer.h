@@ -17,7 +17,8 @@ class TexturedMeshRenderer {
 public:
     ~TexturedMeshRenderer();
 
-    void Initialize(const MeshData& mesh);
+    // The GL textures come from (and stay in) `textures`.
+    void Initialize(const MeshData& mesh, TextureCache& textures);
     void Draw(GLuint shaderProgram, const glm::mat4& viewProj);
     bool IsInitialized() const { return vao != 0; }
 
@@ -27,9 +28,7 @@ private:
     GLuint vao = 0, vbo = 0, ebo = 0;
     std::vector<Range> ranges;
     std::vector<glm::vec3> materialColors;
-    std::vector<GLuint> materialTextures;           // 0 = untextured
-    std::unordered_map<const Texture*, GLuint> uploaded;   // one GL texture per image
+    std::vector<GLuint> materialTextures;           // 0 = untextured (owned by the TextureCache)
 
     void Release();
-    GLuint Upload(const Texture& tex);
 };
