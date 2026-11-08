@@ -26,6 +26,9 @@ Dowson & Landau 1982, The Fréchet distance between multivariate normal distribu
 
 Peyré & Cuturi 2019, Computational Optimal Transport. arXiv:1803.00567
 
+<img width="5600" height="1200" alt="image" src="https://github.com/user-attachments/assets/5b862766-9de2-43d1-9f02-86fc5f8303cc" />
+<img width="2400" height="1800" alt="image" src="https://github.com/user-attachments/assets/b80fda21-aa75-47da-83df-9cea7d13711a" />
+
 
 ## Inspiration
 This project is inspired by the mathematical problem of **Optimal Transport (OT)**, which seeks a mapping between two distributions that minimizes a specified transport cost. 
