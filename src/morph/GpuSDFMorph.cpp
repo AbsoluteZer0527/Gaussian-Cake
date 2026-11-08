@@ -46,7 +46,8 @@ bool GpuSDFMorph::Init() {
 }
 
 void GpuSDFMorph::Release() {
-    for (GLuint* t : { &texA, &texB, &gradTexA, &gradTexB, &colorTexA, &colorTexB })
+    for (GLuint* t : { &texA, &texB, &gradTexA, &gradTexB, &colorTexA, &colorTexB,
+                       &warpTex[0], &warpTex[1], &warpTex[2], &warpTex[3] })
         if (*t) { glDeleteTextures(1, t); *t = 0; }
     for (GLuint* buf : { &fieldBuf, &cellBuf, &vertBuf, &indexBuf, &counterBuf })
         if (*buf) { glDeleteBuffers(1, buf); *buf = 0; }
@@ -130,6 +131,25 @@ static GLuint MakeColorTexture(const ColorGrid& g) {
     return tex;
 }
 
+// One vec3 per grid point as RGBA32F (alpha unused): the mixture map and
+// its Jacobian columns need full float precision.
+static GLuint MakeVec3Texture(int n, const std::vector<glm::vec3>& v) {
+    std::vector<float> rgba(v.size() * 4, 0.0f);
+    for (size_t i = 0; i < v.size(); ++i)
+        for (int ch = 0; ch < 3; ++ch) rgba[4 * i + ch] = v[i][ch];
+    GLuint tex;
+    glGenTextures(1, &tex);
+    glBindTexture(GL_TEXTURE_3D, tex);
+    glPixelStorei(GL_UNPACK_ALIGNMENT, 4);
+    glTexImage3D(GL_TEXTURE_3D, 0, GL_RGBA32F, n, n, n, 0, GL_RGBA, GL_FLOAT, rgba.data());
+    glTexParameteri(GL_TEXTURE_3D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+    glTexParameteri(GL_TEXTURE_3D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+    for (GLenum w : { GL_TEXTURE_WRAP_S, GL_TEXTURE_WRAP_T, GL_TEXTURE_WRAP_R })
+        glTexParameteri(GL_TEXTURE_3D, w, GL_CLAMP_TO_EDGE);
+    glBindTexture(GL_TEXTURE_3D, 0);
+    return tex;
+}
+
 static GLuint MakeBuffer(GLenum target, size_t bytes, GLenum usage, const void* data = nullptr) {
     GLuint buf;
     glGenBuffers(1, &buf);
@@ -158,6 +178,16 @@ void GpuSDFMorph::Upload(const SDFMorph& morph, int vertCapHint, int indexCapHin
     if (morph.HasColor()) {
         colorTexA = MakeColorTexture(morph.ColorGridA());
         colorTexB = MakeColorTexture(morph.ColorGridB());
+    }
+
+    if (morph.HasWarp()) {
+        const WarpGrid& w = morph.Warp();
+        warpTex[0] = MakeVec3Texture(w.n, w.T);
+        for (int c = 0; c < 3; ++c) {
+            std::vector<glm::vec3> col(w.J.size());
+            for (size_t i = 0; i < col.size(); ++i) col[i] = w.J[i][c];
+            warpTex[1 + c] = MakeVec3Texture(w.n, col);
+        }
     }
 
     const size_t points = (size_t)n * n * n;
@@ -200,8 +230,13 @@ void GpuSDFMorph::Allocate(int newVertCap, int newIndexCap) {
 static void SetCommonUniforms(GLuint p, int n, const glm::vec3& lo, float h, float t,
                               const glm::mat3& LtInv, const glm::vec3& shift,
                               const glm::mat3& A, const glm::vec3& b,
-                              int vertCap, int indexCap, bool hasColor) {
+                              int vertCap, int indexCap, bool hasColor, bool hasWarp) {
     glUseProgram(p);
+    glUniform1i(glGetUniformLocation(p, "hasWarp"), hasWarp ? 1 : 0);
+    glUniform1i(glGetUniformLocation(p, "warpT"), 6);
+    glUniform1i(glGetUniformLocation(p, "warpJ0"), 7);
+    glUniform1i(glGetUniformLocation(p, "warpJ1"), 8);
+    glUniform1i(glGetUniformLocation(p, "warpJ2"), 9);
     glUniform1i(glGetUniformLocation(p, "colorA"), 4);
     glUniform1i(glGetUniformLocation(p, "colorB"), 5);
     glUniform1i(glGetUniformLocation(p, "hasColor"), hasColor ? 1 : 0);
@@ -251,10 +286,14 @@ void GpuSDFMorph::Extract(float t) {
     glBindTexture(GL_TEXTURE_3D, colorTexA);
     glActiveTexture(GL_TEXTURE5);
     glBindTexture(GL_TEXTURE_3D, colorTexB);
+    for (int w = 0; w < 4; ++w) {
+        glActiveTexture(GL_TEXTURE6 + w);
+        glBindTexture(GL_TEXTURE_3D, warpTex[w]);
+    }
     glActiveTexture(GL_TEXTURE0);
 
     auto run = [&](GLuint prog, int count) {
-        SetCommonUniforms(prog, n, lo, h, t, LtInv, shift, A, b, vertCap, indexCap, colorTexA != 0);
+        SetCommonUniforms(prog, n, lo, h, t, LtInv, shift, A, b, vertCap, indexCap, colorTexA != 0, warpTex[0] != 0);
         glDispatchCompute(Groups(count), Groups(count), Groups(count));
         // a memory barrier: the next pass reads what this one wrote
         glMemoryBarrier(GL_SHADER_STORAGE_BARRIER_BIT);
@@ -263,7 +302,7 @@ void GpuSDFMorph::Extract(float t) {
     run(progCells, n - 1);   // one thread per cell
     run(progQuads, n);       // one thread per grid point (its 3 edges)
 
-    SetCommonUniforms(progFinalize, n, lo, h, t, LtInv, shift, A, b, vertCap, indexCap, colorTexA != 0);
+    SetCommonUniforms(progFinalize, n, lo, h, t, LtInv, shift, A, b, vertCap, indexCap, colorTexA != 0, warpTex[0] != 0);
     glDispatchCompute(1, 1, 1);
 
     // the draw reads vertices, indices and its count from these buffers

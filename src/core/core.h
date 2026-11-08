@@ -1,6 +1,7 @@
 #pragma once
-#define GLEW_STATIC
-#include <GL/glew.h>
+// glad must come before GLFW so GLFW does not pull in the system GL header
+#include <glad/gl.h>
+#define GLFW_INCLUDE_NONE
 #include <GLFW/glfw3.h>
 
 #include <glm/glm.hpp>

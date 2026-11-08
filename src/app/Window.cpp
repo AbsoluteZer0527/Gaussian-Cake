@@ -1,4 +1,6 @@
 #include "Window.h"
+#include "Parallel.h"
+#include "PiecewiseMorph.h"
 
 #include "imgui.h"
 #include "imgui_impl_glfw.h"
@@ -23,7 +25,7 @@
 #include <glm/gtc/quaternion.hpp>
 #include <chrono>
 #include <atomic>
-#include <execution>
+#include <fstream>
 #include <future>
 #include <mutex>
 #include <array>
@@ -170,6 +172,11 @@ bool             Window::particleMorphActive = false;
 int              Window::particleCount = 3000;
 std::vector<std::string> Window::meshNames;
 std::vector<std::string> Window::meshPaths;
+std::string Window::screenshotPath;
+bool Window::hideGui = false;
+ParticleTransport Window::particleTransport = ParticleTransport::Auto;
+int Window::particleMixtureK = 8;
+int Window::morphMixtureK = 8;
 int              Window::meshIndexA    = 0;
 int              Window::meshIndexB    = 0;
 int              Window::sampleCount   = 5000;
@@ -366,6 +373,8 @@ static TexturedMeshRenderer* g_previewTextured = nullptr;   // the preview of a 
 static bool g_previewIsTextured = false;
 static int g_previewGen = 0;   // bump to force the preview to rebuild
 
+static std::vector<glm::vec3> ParticleSamples(int index, int count, unsigned int seed);
+
 static void UpdateModePreview() {
     static int lastIndex = -1, lastCount = -1, lastMode = -1, lastGen = -1;
     int mode = (int)Window::renderMode;
@@ -412,6 +421,9 @@ static void UpdateModePreview() {
     if (hasMesh) {
         // same samples the mesh-to-mesh particle bake starts from
         Window::particleSystem->SpawnAt(MeshSampler::Sample(tris, Window::particleCount));
+    } else if (idx > 0 && idx <= (int)Window::meshPaths.size()) {
+        // a .ply capture: points drawn from its splats
+        Window::particleSystem->SpawnAt(ParticleSamples(idx, Window::particleCount, 42u));
     } else {
         SetBlob(*Window::gaussianA);
         Window::particleSystem->SpawnFromGaussian(*Window::gaussianA, Window::particleCount);
@@ -508,6 +520,7 @@ bool Window::initializeObjects() {
 }
 
 void Window::cleanUp() {
+    if (particleSystem) particleSystem->ReleaseGL();
     delete particleSystem;
     delete meshRenderer;
     delete splatRenderer;
@@ -538,6 +551,16 @@ GLFWwindow* Window::createWindow(int width, int height) {
 
     glfwWindowHint(GLFW_SAMPLES, 4);
 
+    // Windows and Linux: no hints, so the driver gives its newest context
+    // (4.3+ turns on the compute-shader paths). macOS only offers a 4.1 core
+    // context, so ask for exactly that; the CPU paths run there instead.
+#ifdef __APPLE__
+    glfwWindowHint(GLFW_CONTEXT_VERSION_MAJOR, 4);
+    glfwWindowHint(GLFW_CONTEXT_VERSION_MINOR, 1);
+    glfwWindowHint(GLFW_OPENGL_PROFILE, GLFW_OPENGL_CORE_PROFILE);
+    glfwWindowHint(GLFW_OPENGL_FORWARD_COMPAT, GLFW_TRUE);
+#endif
+
     GLFWwindow* window = glfwCreateWindow(width, height, windowTitle, NULL, NULL);
 
     if (!window) {
@@ -547,7 +570,12 @@ GLFWwindow* Window::createWindow(int width, int height) {
     }
 
     glfwMakeContextCurrent(window);
-    glewInit();
+    if (!gladLoadGL(glfwGetProcAddress)) {
+        std::cerr << "Failed to load OpenGL functions." << std::endl;
+        glfwTerminate();
+        return NULL;
+    }
+    std::cout << "[GL] " << glGetString(GL_VERSION) << " on " << glGetString(GL_RENDERER) << "\n";
     glfwSwapInterval(0);
 
     Cam = new Camera();
@@ -616,6 +644,7 @@ void Window::idleCallback() {
         bool stretch = splatAreaPreserve && splatStretch.size() == splatCurrent.size();
         g_splatStretchOn = splatAreaPreserve ? 1.0f : 0.0f;
 
+        const glm::vec3 camPos = glm::vec3(glm::inverse(Cam->GetViewMtx())[3]);
         for (size_t i = 0; i < cpuCount; ++i) {
             const Splat& a = splatStart[i];
             const Splat& b = splatEnd[i];
@@ -637,8 +666,18 @@ void Window::idleCallback() {
                 s.scale.x *= k;
                 s.scale.y *= k;   // z is the thin axis
             }
-            s.color   = glm::mix(a.color, b.color, clock.e);
             s.opacity = glm::mix(a.opacity, b.opacity, clock.e);
+            if (SplatRenderer::shDegree > 0 && (!SH::IsZero(a.sh) || !SH::IsZero(b.sh))) {
+                // view-dependent colour, turned with the splat (as in splat_prep.comp)
+                glm::vec3 local = glm::transpose(glm::mat3_cast(s.rot)) * glm::normalize(s.mean - camPos);
+                int deg = SplatRenderer::shDegree;
+                glm::vec3 ca = glm::max(a.color + SH::Eval(a.sh, deg, glm::mat3_cast(a.rot) * local), 0.0f);
+                glm::vec3 cb = glm::max(b.color + SH::Eval(b.sh, deg, glm::mat3_cast(b.rot) * local), 0.0f);
+                s.color = glm::clamp(glm::mix(ca, cb, clock.e), 0.0f, 1.0f);
+                s.sh    = SH::Zero();   // already in the colour
+            } else {
+                s.color = glm::mix(a.color, b.color, clock.e);
+            }
         }
     } else if (trueMorphActive) {
         static std::vector<glm::vec3> unused;
@@ -711,7 +750,7 @@ void Window::displayCallback(GLFWwindow* window) {
     ImGui_ImplGlfw_NewFrame();
     ImGui::NewFrame();
 
-    Window::DrawMainGUI();
+    if (!hideGui) Window::DrawMainGUI();
 
     ImGui::Render();
     int display_w, display_h;
@@ -719,19 +758,29 @@ void Window::displayCallback(GLFWwindow* window) {
     glViewport(0, 0, display_w, display_h);
     ImGui_ImplOpenGL3_RenderDrawData(ImGui::GetDrawData());
 
+    if (!screenshotPath.empty()) {
+        SaveScreenshot(screenshotPath, display_w, display_h);
+        screenshotPath.clear();
+    }
+
     glfwPollEvents();
     glfwSwapBuffers(window);
 }
 
-// OT pipeline
-
-// Load an OBJ and fit a Gaussian to its surface. Returns false on failure.
-static bool LoadMeshGaussian(const std::string& path, int N, Gaussian* g) {
-    std::vector<Triangle> tris;
-    if (!LoadNormalized(path, tris)) return false;
-    g->FitFromPoints(MeshSampler::Sample(tris, N));
-    return true;
+// Binary PPM (no image library needed); scripts convert it to PNG if wanted.
+void Window::SaveScreenshot(const std::string& path, int w, int h) {
+    std::vector<unsigned char> px((size_t)w * h * 3);
+    glPixelStorei(GL_PACK_ALIGNMENT, 1);
+    glReadBuffer(GL_BACK);
+    glReadPixels(0, 0, w, h, GL_RGB, GL_UNSIGNED_BYTE, px.data());
+    std::ofstream out(path, std::ios::binary);
+    out << "P6\n" << w << " " << h << "\n255\n";
+    for (int y = h - 1; y >= 0; --y)   // GL rows go bottom-up
+        out.write((const char*)&px[(size_t)y * w * 3], (std::streamsize)w * 3);
+    std::cout << "[Shot] " << path << "\n";
 }
+
+// OT pipeline
 
 // Greedy approximate discrete OT: match each point in ptsA to the nearest
 // unmatched point in ptsB. O(N^2) — fine for N <= 2000 on a single Bake click.
@@ -896,6 +945,27 @@ static std::vector<glm::vec3> SampleSplats(const std::vector<Splat>& splats, int
     return pts;
 }
 
+// Points on shape `index` (0 = the default blob, else meshPaths[index - 1]),
+// whatever kind of shape it is: blob samples, mesh surface samples, or points
+// drawn from a capture's splats. Empty if it can't be loaded.
+static std::vector<glm::vec3> ParticleSamples(int index, int count, unsigned int seed) {
+    if (index <= 0 || index > (int)Window::meshPaths.size()) {
+        Gaussian blob;
+        SetBlob(blob);
+        return blob.Sample(count, seed);
+    }
+    const std::string& path = Window::meshPaths[index - 1];
+    if (IsCapture(path)) {
+        std::lock_guard<std::mutex> lock(g_meshCacheMutex);
+        SplatMeshCache* c = GetMeshCache(path, Window::plyOptions);
+        if (!c || c->splats.empty()) return {};
+        return SampleSplats(c->splats, count, seed);
+    }
+    std::vector<Triangle> tris;
+    if (!LoadNormalized(path, tris)) return {};
+    return MeshSampler::Sample(tris, count);
+}
+
 // n of a capture's m splats, without replacement, in proportion to their
 // weight (weighted reservoir sampling: the n smallest -log(u) / w win). The
 // kept splats widen by sqrt(m / n), so n of them still cover what m did, but
@@ -962,10 +1032,7 @@ static void ForBoth(SplatMeshCache& a, SplatMeshCache& b, F f) {
 // Total squared distance of a matching y[i] -> b[perm[i]].
 static double MatchCost(const std::vector<glm::vec3>& y, const std::vector<glm::vec3>& b,
                         const std::vector<int>& perm) {
-    std::vector<size_t> idx(y.size());
-    std::iota(idx.begin(), idx.end(), size_t(0));
-    return std::transform_reduce(std::execution::par, idx.begin(), idx.end(), 0.0, std::plus<>(),
-                                 [&](size_t i) { return (double)Dist2(y[i], b[perm[i]]); });
+    return ParallelSum((int)y.size(), [&](int i) { return (double)Dist2(y[i], b[perm[i]]); });
 }
 
 // A point as the matching sees it: position, then colour times the colour
@@ -1151,9 +1218,7 @@ static SplatBakeResult RunSplatBake(SplatBakeSettings st) {
     std::vector<double> detJ(n);
     res.stretch.resize(n);
     {
-        std::vector<int> idx(n);
-        std::iota(idx.begin(), idx.end(), 0);
-        std::for_each(std::execution::par, idx.begin(), idx.end(), [&](int i) {
+        ParallelFor(n, [&](int i) {
             Eigen::Matrix3d J;
             OptimalTransport::ApplyMixture(map, splatsA[i].mean, y[i], J);
             bPos[i] = splatsB[i].mean;
@@ -1202,10 +1267,7 @@ static SplatBakeResult RunSplatBake(SplatBakeSettings st) {
     {
         PointGrid g;
         g.Build(bPos, cell);
-        std::vector<int> idx(n);
-        std::iota(idx.begin(), idx.end(), 0);
-        double nn = std::transform_reduce(std::execution::par, idx.begin(), idx.end(), 0.0,
-            std::plus<>(), [&](int i) { return (double)Dist2(y[i], bPos[g.Nearest(y[i])]); });
+        double nn = ParallelSum(n, [&](int i) { return (double)Dist2(y[i], bPos[g.Nearest(y[i])]); });
         res.nearestBound = std::sqrt(nn / n);
     }
 
@@ -1230,8 +1292,6 @@ static SplatBakeResult RunSplatBake(SplatBakeSettings st) {
     const int kNN = kSplatNeighbors;
     const double kChunkSigma = 0.07;   // chunk size (the shapes span about 2 units)
     SetBakeStage(5, 3);
-    std::vector<int> idx(n);
-    std::iota(idx.begin(), idx.end(), 0);
     std::vector<glm::vec3> aPos(n);
     for (int i = 0; i < n; ++i) aPos[i] = res.start[i].mean;
     res.knn = NearestNeighbors(aPos, kNN, 2.0f * radiusA);
@@ -1260,8 +1320,7 @@ static SplatBakeResult RunSplatBake(SplatBakeSettings st) {
 
     // How differently neighbours move: mean |d_i - d_j| over neighbour pairs
     auto neighborSpread = [&](const std::vector<glm::vec3>& d) {
-        return std::transform_reduce(std::execution::par, idx.begin(), idx.end(), 0.0, std::plus<>(),
-            [&](int i) {
+        return ParallelSum(n, [&](int i) {
                 double s = 0.0;
                 for (int k = 0; k < kNN; ++k) {
                     int j = res.knn[(size_t)i * kNN + k];
@@ -1554,50 +1613,59 @@ void Window::ComputeOTAndSpawnParticles() {
     }
 
     // === Particles ===
-    if (hasMeshA && hasMeshB) {
-        // === Discrete mesh-to-mesh OT ===
-        // Particles start exactly on mesh A surface, end exactly on mesh B surface.
-        // The Gaussian OT map is not used — the greedy matching IS the transport.
-        std::vector<Triangle> trisA, trisB;
-        if (!LoadNormalized(pathA, trisA)) return;
-        if (!LoadNormalized(pathB, trisB)) return;
+    // Any shape to any shape (blob, mesh or capture) with any transport.
+    ParticleTransport transport = particleTransport;
+    if (transport == ParticleTransport::Auto)
+        transport = (hasMeshA && hasMeshB) ? ParticleTransport::Greedy : ParticleTransport::Gaussian;
 
-        auto ptsA = MeshSampler::Sample(trisA, particleCount);
-        auto ptsB = MeshSampler::Sample(trisB, particleCount);
+    std::vector<glm::vec3> ptsA = ParticleSamples(meshIndexA, particleCount, 42u);
+    if (ptsA.empty()) return;
 
+    if (transport == ParticleTransport::Greedy) {
+        // Particles start exactly on A and end exactly on B; the matching IS the transport.
+        std::vector<glm::vec3> ptsB = ParticleSamples(meshIndexB, particleCount, 43u);
+        if (ptsB.empty()) return;
         auto endPts = GreedyDiscreteOT(ptsA, ptsB);
-
-        // Place particles directly at mesh A surface positions
+        ptsA.resize(endPts.size());
         particleSystem->SpawnAt(ptsA);
-
         animator->InitializeWithEndPoints(ptsA, endPts);
-        particleSystem->useOTPositions = true;
-        animator->StartTransport();
-        particleMorphActive = true;
-
     } else {
-        // === Gaussian OT (mesh → Gaussian or blob → blob) ===
-        if (hasMeshA) {
-            if (!LoadMeshGaussian(pathA, sampleCount, gaussianA)) return;
+        // Gaussian fits use more samples than there are particles, so the
+        // map doesn't depend on the particle count. The blob keeps its exact
+        // N(0, I) instead of a fit to samples.
+        auto fit = [&](int index, unsigned int seed, Gaussian* g, std::vector<glm::vec3>& pts) {
+            pts = ParticleSamples(index, sampleCount, seed);
+            if (index <= 0) SetBlob(*g);
+            else if (!pts.empty()) g->FitFromPoints(pts, false);
+            return !pts.empty();
+        };
+        std::vector<glm::vec3> fitA, fitB;
+        if (!fit(meshIndexA, 44u, gaussianA, fitA) || !fit(meshIndexB, 45u, gaussianB, fitB)) return;
+
+        if (transport == ParticleTransport::Gaussian) {
+            delete otMap;
+            otMap = new OTMap(OptimalTransport::Compute(*gaussianA, *gaussianB));
+            particleSystem->SpawnAt(ptsA);
+            animator->Initialize(ptsA, *otMap);
         } else {
-            SetBlob(*gaussianA);
+            // Mixture: K parts on each side, a Sinkhorn plan between the parts
+            // (Bures cost), and every particle carried by its parts' maps.
+            GaussianMixture mixA, mixB;
+            if (meshIndexA <= 0) mixA.FromSingle(*gaussianA); else mixA.Fit(fitA, particleMixtureK);
+            if (meshIndexB <= 0) mixB.FromSingle(*gaussianB); else mixB.Fit(fitB, particleMixtureK);
+            MixtureOTMap map = OptimalTransport::ComputeMixture(mixA, mixB, sinkhornEps, posteriorTemp);
+            std::vector<glm::vec3> endPts(ptsA.size());
+            ParallelFor((int)ptsA.size(), [&](int i) {
+                Eigen::Matrix3d J;
+                OptimalTransport::ApplyMixture(map, ptsA[i], endPts[i], J);
+            });
+            particleSystem->SpawnAt(ptsA);
+            animator->InitializeWithEndPoints(ptsA, endPts);
         }
-
-        if (hasMeshB) {
-            if (!LoadMeshGaussian(pathB, sampleCount, gaussianB)) return;
-        } else {
-            SetBlob(*gaussianB);
-        }
-
-        delete otMap;
-        otMap = new OTMap(OptimalTransport::Compute(*gaussianA, *gaussianB));
-
-        particleSystem->SpawnFromGaussian(*gaussianA, particleCount);
-        animator->Initialize(particleSystem->transportPositions, *otMap);
-        particleSystem->useOTPositions = true;
-        animator->StartTransport();
-        particleMorphActive = true;
     }
+    particleSystem->useOTPositions = true;
+    animator->StartTransport();
+    particleMorphActive = true;
 }
 
 // ---- True morph: one surface going from A to B ----
@@ -1664,6 +1732,8 @@ struct TrueMorphSettings {
     int   sdfResolution, sampleCount;
     float fitStiffness;
     bool  fitCotan;
+    int   mixtureK;
+    float sinkhornEps, posteriorTemp;
     glm::vec3 fallbackColor;   // display colour of a mesh without colours, beside one with them
 };
 
@@ -1678,11 +1748,18 @@ struct TrueMorphResult {
     std::vector<unsigned int> sharedIndices;
     std::vector<glm::vec3>    sharedStart, sharedEnd;
     SDFMorph sdf;
+    bool piecewise = false;
+    PiecewiseMorph pieces;               // Piecewise: the meshes that follow the SDF surface
     int sdfVertCap = 0, sdfIndexCap = 0; // GPU buffer sizes that fit every frame (with room)
     Gaussian gA, gB;
     OTMap map;
     std::string status;
 };
+
+// The baked Piecewise morph (main thread)
+static PiecewiseMorph g_piecewise;
+static bool g_morphPiecewise = false;
+static int  g_pieceShown = -1;   // segment the mesh renderer holds
 
 // The slow part of a topology bake. Runs on a background thread, so it only
 // touches its own data (no GL, no Window state).
@@ -1721,9 +1798,23 @@ static TrueMorphResult RunTrueMorphBake(TrueMorphSettings st) {
                  (st.method == MorphMethod::Auto && mismatch.empty());
 
     SetBakeStage(1, 1);
-    res.gA.FitFromPoints(MeshSampler::Sample(trisA, st.sampleCount));
-    res.gB.FitFromPoints(MeshSampler::Sample(trisB, st.sampleCount));
+    std::vector<glm::vec3> samplesA = MeshSampler::Sample(trisA, st.sampleCount);
+    std::vector<glm::vec3> samplesB = MeshSampler::Sample(trisB, st.sampleCount);
+    res.gA.FitFromPoints(samplesA);
+    res.gB.FitFromPoints(samplesB);
     res.map = OptimalTransport::Compute(res.gA, res.gB);
+
+    // Part-by-part alignment: a Gaussian mixture on each shape, a Sinkhorn
+    // plan between the parts, one map per matched pair (K = 1: just res.map).
+    // Used by the SDF morph.
+    MixtureOTMap mixAB;
+    const bool useMixture = st.mixtureK > 1 && !res.shared;
+    if (useMixture) {
+        GaussianMixture mA, mB;
+        mA.Fit(samplesA, st.mixtureK);
+        mB.Fit(samplesB, st.mixtureK);
+        mixAB = OptimalTransport::ComputeMixture(mA, mB, st.sinkhornEps, st.posteriorTemp);
+    }
 
     SetBakeStage(2, 1);
     char buf[512];
@@ -1744,7 +1835,10 @@ static TrueMorphResult RunTrueMorphBake(TrueMorphSettings st) {
             subdivided = true;
         }
 
-        // Rough affine alignment by the Gaussian OT map, template -> target
+        // Rough affine alignment by the Gaussian OT map, template -> target.
+        // (The part-by-part mixture map was tried here: its seams between
+        // parts make the template fold more, so the fit starts from the
+        // smooth affine map and does the fine alignment itself.)
         OTMap toTarget = templateIsA ? res.map : OptimalTransport::Compute(res.gB, res.gA);
         std::vector<glm::vec3> aligned(tmpl.verts.size());
         for (size_t i = 0; i < aligned.size(); ++i)
@@ -1781,8 +1875,14 @@ static TrueMorphResult RunTrueMorphBake(TrueMorphSettings st) {
                  stats.ms, stats.meanDist, stats.flipped,
                  mismatch.empty() ? "" : " Warning: ", mismatch.c_str());
     } else {
+        res.piecewise = st.method == MorphMethod::Piecewise ||
+                        (st.method == MorphMethod::Auto && !mismatch.empty());
         res.sdf.Build(trisA, trisB, res.map, st.sdfResolution,
-                      colored ? &colorA : nullptr, colored ? &colorB : nullptr);
+                      colored ? &colorA : nullptr, colored ? &colorB : nullptr,
+                      useMixture ? &mixAB : nullptr);
+        std::vector<glm::vec3> probe(samplesA.begin(), samplesA.begin() + std::min<size_t>(samplesA.size(), 4000));
+        float errAffine = res.sdf.AlignmentError(probe, true);
+        float errUsed   = res.sdf.AlignmentError(probe, false);
 
         // Size the GPU buffers from a few CPU extractions, with room to spare
         size_t maxVerts = 0, maxIndices = 0;
@@ -1796,9 +1896,44 @@ static TrueMorphResult RunTrueMorphBake(TrueMorphSettings st) {
         res.sdfVertCap  = (int)(2 * maxVerts + 1024);
         res.sdfIndexCap = (int)(2 * maxIndices + 6 * 1024);
 
-        snprintf(buf, sizeof(buf), "SDF morph (%d^3 grid) built in %.0f ms%s%s",
+        char align[160];
+        if (useMixture)
+            snprintf(align, sizeof(align), " Aligned by %d parts (%.0f%% strength, no folds): "
+                     "A lands %.3f from B (one affine map: %.3f).",
+                     st.mixtureK, 100.0f * res.sdf.warpStrength, errUsed, errAffine);
+        else
+            snprintf(align, sizeof(align), " Aligned by one affine map: A lands %.3f from B.", errAffine);
+        snprintf(buf, sizeof(buf), "SDF morph (%d^3 grid) built in %.0f ms%s%s.%s",
                  st.sdfResolution, res.sdf.buildMs,
-                 mismatch.empty() ? "" : ": ", mismatch.c_str());
+                 mismatch.empty() ? "" : ": ", mismatch.c_str(), align);
+
+        if (res.piecewise) {
+            // real meshes following the SDF surface, switching at topology events
+            SetBakeStage(2, 1);
+            PiecewiseMorph::Params pp;
+            pp.fit.stiffnessScale = st.fitStiffness;
+            pp.fit.cotanLaplacian = st.fitCotan;
+            // Each fit starts close (from the last keyframe), so fewer stiffness
+            // stages, and it stays stiffer: following a surface, not finding it
+            pp.fit.stages = 4;
+            pp.fit.stiffnessEnd = 1.5f;
+            pp.fit.relaxRounds = 3;
+            res.piecewise = res.pieces.Build(res.sdf, res.a, res.b, res.colorsA, res.colorsB,
+                                             colored ? &colorA : nullptr, colored ? &colorB : nullptr, pp);
+            if (res.piecewise) {
+                std::string ev;
+                for (const PiecewiseEvent& e : res.pieces.events) {
+                    char one[96];
+                    if (e.what.empty()) snprintf(one, sizeof(one), " switch at t = %.2f (same topology)", e.t);
+                    else snprintf(one, sizeof(one), " %s at t = %.2f;", e.what.c_str(), e.t);
+                    ev += one;
+                }
+                std::string sdfPart = buf;
+                snprintf(buf, sizeof(buf), "Piecewise: %d meshes (%d fits, %.0f ms):%s %s",
+                         (int)res.pieces.segments.size(), res.pieces.fits, res.pieces.ms, ev.c_str(),
+                         sdfPart.c_str());
+            }
+        }
     }
     res.status = buf;
     SetBakeStage(3, 1);
@@ -1813,6 +1948,8 @@ static std::string MorphBakeKey(const TrueMorphSettings& st) {
     return st.pathA + "|" + st.pathB + "|" + std::to_string((int)st.method) + "|" +
            std::to_string(st.sdfResolution) + "|" + std::to_string(st.sampleCount) + "|" +
            std::to_string(st.fitStiffness) + "|" + std::to_string((int)st.fitCotan) + "|" +
+           std::to_string(st.mixtureK) + "|" + std::to_string(st.sinkhornEps) + "|" +
+           std::to_string(st.posteriorTemp) + "|" +
            std::to_string(st.fallbackColor.x) + "," + std::to_string(st.fallbackColor.y) + "," +
            std::to_string(st.fallbackColor.z);
 }
@@ -1843,6 +1980,9 @@ void Window::BakeTrueMorph(const std::string& pathA, const std::string& pathB) {
     st.sampleCount   = sampleCount;
     st.fitStiffness  = fitStiffness;
     st.fitCotan      = fitCotan;
+    st.mixtureK      = morphMixtureK;
+    st.sinkhornEps   = sinkhornEps;
+    st.posteriorTemp = posteriorTemp;
     st.fallbackColor = glm::sqrt(meshRenderer->diffuseColor);   // shader.frag's grey, as a display value
 
     std::string key = MorphBakeKey(st);
@@ -1910,6 +2050,9 @@ void Window::PollTrueMorphBake() {
                                     g_morphTextures);
         g_morphTexturedOn = g_morphTextured->IsInitialized();
     }
+    g_morphPiecewise = res.piecewise;
+    g_piecewise      = std::move(res.pieces);
+    g_pieceShown     = -1;
     if (!res.shared) {
         g_sdfMorph = std::move(res.sdf);
         if (gpuAvailable) g_gpuSdf->Upload(g_sdfMorph, res.sdfVertCap, res.sdfIndexCap);
@@ -1991,6 +2134,24 @@ void Window::UpdateTrueMorph() {
 
     // SDF: re-mesh only when t moved (bounce easing can overshoot; clamp it)
     float t = glm::clamp(e, 0.0f, 1.0f);
+
+    // Piecewise: the segment's mesh, between its fitted keyframes (CPU; the
+    // meshes are small, and switching segments swaps the connectivity)
+    if (g_morphPiecewise && !g_piecewise.segments.empty()) {
+        if (g_morphShown == MorphShown::Blend && t == g_lastSdfT) return;
+        int seg = g_piecewise.SegmentAt(t);
+        static std::vector<glm::vec3> pos, col;
+        g_piecewise.Evaluate(seg, t, pos, col);
+        if (g_morphShown != MorphShown::Blend || seg != g_pieceShown || meshRenderer->IsMorphTarget())
+            meshRenderer->Initialize(pos, g_piecewise.segments[seg].indices, col);
+        else
+            meshRenderer->UpdatePositions(pos, col);
+        g_pieceShown = seg;
+        g_sdfOnGpu   = false;
+        g_morphShown = MorphShown::Blend;
+        g_lastSdfT   = t;
+        return;
+    }
     bool onGpu = gpu && g_gpuSdf->IsReady();
     if (g_morphShown == MorphShown::Blend && t == g_lastSdfT && onGpu == g_sdfOnGpu) return;
     if (onGpu) {
@@ -2013,6 +2174,10 @@ void Window::UpdateTrueMorph() {
 static void VerifyGpuAgainstCpu() {
     char buf[256];
     if (Window::renderMode == RenderMode::TriangleMorph && Window::trueMorphActive) {
+        if (g_morphPiecewise) {
+            g_verifyText = "Piecewise: keyframe meshes are interpolated on the CPU, nothing to compare.";
+            return;
+        }
         if (g_morphShared) {
             g_verifyText = "Shared topology: both paths compute start + t (end - start) per vertex "
                            "(GPU in morph.vert), nothing to read back.";
@@ -2109,7 +2274,7 @@ void Window::DrawMainGUI() {
 
     bool hasA = meshIndexA > 0, hasB = meshIndexB > 0;
     bool needsMeshes = renderMode != RenderMode::Particles;
-    bool captureOutsideSplats = renderMode != RenderMode::Splats &&
+    bool captureOutsideSplats = renderMode == RenderMode::TriangleMorph &&
         ((hasA && IsCapture(meshPaths[meshIndexA - 1])) || (hasB && IsCapture(meshPaths[meshIndexB - 1])));
     bool baking  = splatBaking || morphBaking;
     bool canBake = !baking && !captureOutsideSplats && (!needsMeshes || (hasA && hasB));
@@ -2148,7 +2313,7 @@ void Window::DrawMainGUI() {
     if (needsMeshes && !(hasA && hasB))
         ImGui::TextColored(ImVec4(1.0f, 0.55f, 0.4f, 1.0f), "Pick a mesh for both A and B to bake.");
     if (captureOutsideSplats)
-        ImGui::TextColored(ImVec4(1.0f, 0.55f, 0.4f, 1.0f), ".ply captures only work in Splats mode.");
+        ImGui::TextColored(ImVec4(1.0f, 0.55f, 0.4f, 1.0f), ".ply captures work in Splats and Particles modes.");
 
     // Status: bake progress while baking, then the timeline position
     if (baking) {
@@ -2221,23 +2386,44 @@ void Window::DrawMainGUI() {
             const char* upAxes[] = { "As is", "Flip Y (COLMAP)", "Rotate X +90", "Rotate X -90" };
             int up = (int)plyOptions.up;
             if (ImGui::Combo("Up Axis", &up, upAxes, 4)) plyOptions.up = (PlyLoadOptions::Up)up;
+            ImGui::SliderInt("Colour Detail (SH)", &SplatRenderer::shDegree, 0, 3);
+            ImGui::SetItemTooltip("Spherical-harmonic degree of a capture's view-dependent colour:\n"
+                                  "0 = one flat colour per splat, 3 = full 3DGS shading\n"
+                                  "(highlights and reflections change as you orbit)");
         }
 
         // Advanced: every setting by hand. Editing a costly one turns Auto off,
         // so a model change doesn't overwrite it.
         if (ImGui::TreeNode("Advanced")) {
             if (renderMode == RenderMode::Particles) {
+                const char* transports[] = { "Auto", "Greedy (discrete)", "Gaussian", "Gaussian Mixture" };
+                int tr = (int)particleTransport;
+                if (ImGui::Combo("Transport", &tr, transports, 4)) particleTransport = (ParticleTransport)tr;
+                HintText(particleTransport == ParticleTransport::Auto ? "Greedy between two shapes, Gaussian with the blob" :
+                         particleTransport == ParticleTransport::Greedy ? "Match surface samples one-to-one" :
+                         particleTransport == ParticleTransport::Gaussian ? "One closed-form map T(x) = muB + A(x - muA)" :
+                                                                            "K parts matched by Sinkhorn, one map per pair");
+                if (particleTransport == ParticleTransport::Mixture)
+                    ImGui::SliderInt("Mixture K", &particleMixtureK, 1, 32);
                 if (ImGui::SliderInt("Particles", &particleCount, 100, 10000)) autoQuality = false;
                 ImGui::SliderFloat("Particle Radius", &particleSystem->particleRadius, 0.01f, 1.0f);
             } else if (renderMode == RenderMode::TriangleMorph) {
-                const char* methods[] = { "Auto", "Shared Topology", "SDF" };
+                const char* methods[] = { "Auto", "Shared Topology", "SDF", "Piecewise" };
                 int m = (int)morphMethod;
-                if (ImGui::Combo("Method", &m, methods, 3)) morphMethod = (MorphMethod)m;
-                HintText(morphMethod == MorphMethod::Auto ? "Shared topology if both meshes match, else SDF" :
+                if (ImGui::Combo("Method", &m, methods, 4)) morphMethod = (MorphMethod)m;
+                HintText(morphMethod == MorphMethod::Auto ? "Shared topology if both meshes match, else Piecewise" :
                          morphMethod == MorphMethod::SharedTopology ? "Fit the denser mesh onto the other" :
-                                                                      "Distance-field blend: any genus / parts");
+                         morphMethod == MorphMethod::SDF ? "Distance-field blend: any genus / parts" :
+                                                           "A's mesh, then B's, along the SDF path;\n"
+                                                           "they switch where a hole opens or parts merge");
                 ImGui::SliderFloat("Fit Stiffness", &fitStiffness, 0.1f, 10.0f, "%.2f", ImGuiSliderFlags_Logarithmic);
                 ImGui::SetItemTooltip("Shared topology: how stiffly the template keeps its shape while fitting");
+                ImGui::SliderInt("Align Parts (K)", &morphMixtureK, 1, 24);
+                ImGui::SetItemTooltip("SDF: how finely A and B are lined up for the blend.\n"
+                                      "1 = one affine Gaussian OT map for the whole shape,\n"
+                                      "K = a Gaussian mixture on each shape, matched part to part\n"
+                                      "by Sinkhorn (in-between shapes stay closer to A and B).\n"
+                                      "Used only as strongly as it can be without folding.");
                 ImGui::Checkbox("Cotan Laplacian", &fitCotan);
                 ImGui::SetItemTooltip("Shared topology: weight the shape-keeping term by triangle angles\n"
                                       "(cotan Laplacian) instead of treating every neighbour the same");

@@ -8,9 +8,13 @@ Two new OT morphing mode were building on top of the Original Gaussian Cake.
 https://github.com/user-attachments/assets/783fe288-cc6e-4bae-aed0-1fa1abfe2696
 
 
-**Topology Mode**: We first check whether the two models have the sharing topology first, then we uses OT to determine the path for the two mesh's triangle topology and morph into another shape. It uses mesh with more faces as the template, and fits that topology to the other model and show the morph animation.If they don't share the same topology, such as mismatch or different number of genus, it will use the SDF path instead.
+**Topology Mode**: We first check whether the two models have the sharing topology first, then we uses OT to determine the path for the two mesh's triangle topology and morph into another shape. It uses mesh with more faces as the template, and fits that topology to the other model and show the morph animation.If they don't share the same topology, such as mismatch or different number of genus, it uses the **piecewise** path (below) instead; the SDF path is still there as its own method.
+
+**Piecewise (across a change of genus, holes or parts):** the SDF morph decides where the shape goes, and its in-between solids show *when* the topology changes (parts, genus and cavities are read off the SDF grid with the Euler characteristic, and each change is found by bisection). Between two changes the topology is fixed, so a real mesh can follow the surface: A's mesh up to the first change, B's mesh after the last, and an SDF-surface mesh for any segment in between. The morph switches meshes at each change, so a hole opens at one visible moment and both ends are the exact original meshes. Try `Guassian.obj` → `torus.obj` (genus 0 → 1).
 
 SDF: in-between shapes are aligned by two lerp: M_t = (1−t)·I + t·T, making each model a signed distance field and match the surfaces so it creates a smooth morphing effect, but still slightly off the original shapes visually.
+
+*Part-by-part alignment (Align Parts K, default 8):* one affine Gaussian map can only stretch the whole shape, so parts drift (a teapot's handle melts away early). With K > 1, T is the Gaussian-mixture OT map: K Gaussians per shape, matched part to part by Sinkhorn. Where neighbouring parts go different ways that map can fold space, so the morph uses `T = affine + λ(u)·(mixture − affine)` with λ as large as possible while every M_t stays one-to-one. M_t⁻¹ then has no closed form and is found by Newton's method on the GPU. On teapot → bunny, A's surface lands 0.089 from B's instead of 0.116, and the handle survives well into the morph. K = 1 is the plain affine morph.
 
 
 https://github.com/user-attachments/assets/e1673f76-3a3e-4a30-afbe-c6a0df6a19c8
@@ -18,6 +22,8 @@ https://github.com/user-attachments/assets/e1673f76-3a3e-4a30-afbe-c6a0df6a19c8
 **Splats Mode**: Each Particles is getting replaced by 3D Gaussian blobs, it stores a center, covariance, color and opacity. Then we applies OT between the mixtures of the two models: we first estimate the moving cost for each blob(Bures cost), and matches them after (Sinkhorn), where it shifts and streches each of those blobs to the other location. At the end, we simulate morphing animation and show the cooking.
 
 Currently supports .obj, .glb, .ply files.
+
+**Real 3DGS captures (.ply):** trained 3D Gaussian Splatting captures load with their view-dependent colour (spherical harmonics up to degree 3), so highlights change as you orbit, also mid-morph. *Colour Detail (SH)* under Settings goes from flat colour (0) to full shading (3). Captures also work in Particles mode. No capture at hand? `python3 tools/make_capture.py meshes/bunny.obj meshes/bunny_capture.ply` makes a synthetic one from a mesh (set *Up Axis* to *As is* for it).
 
 References: 
 Chen, Georgiou, Tannenbaum 2019, Optimal Transport for Gaussian Mixture Models. arXiv:1710.07876
@@ -42,7 +48,7 @@ And if you have ever heard of this website: https://obamify.com/, it shares a si
 ## What it does
 This is an experimental graphic project that mainly serves the purpose of applying the math concept of Optimal Transport into an actual computer animation pipeline.
 
-A low-level C++ OpenGL program that takes in **any .obj imported models** : A and B. Once you click "Bake It!", the program shows either (1) a **smooth animation of the model morphing from A to B**, or (2) transport animation of a **Gaussian distribution sampling from A to B**(so far the program only supports default -> model and model -> default). This is a particle system animation project that showcases the concept of optimal transport in two ways: GreedyDiscrete OT for the mesh and Gaussian OT for the distribution.
+A low-level C++ OpenGL program that takes in **any .obj imported models** : A and B. Once you click "Bake It!", the program shows either (1) a **smooth animation of the model morphing from A to B**, or (2) transport animation of a **Gaussian distribution sampling from A to B**(any shape to any shape: the default blob, a mesh, or a .ply capture; pick **Greedy**, **Gaussian** or **Gaussian Mixture** transport under Advanced). This is a particle system animation project that showcases the concept of optimal transport in two ways: GreedyDiscrete OT for the mesh and Gaussian OT for the distribution.
 
 The **Greedy discrete optimal transport** is a simple approximation for the surface points that allows the model to go from A to B (mesh-mesh transport).
 
@@ -100,7 +106,27 @@ _For this project, I really want to show how theoretical concepts can actually b
 ## How to Run
 Download the release, unzip it, and run the menv.exe.
 
-To import your own .obj models: Add to the `meshes` folder.
+Or build it yourself (Windows, Linux or macOS) with CMake 3.16+ and a C++17 compiler:
+
+```bash
+cmake -B build -DCMAKE_BUILD_TYPE=Release
+cmake --build build --config Release --parallel
+```
+
+Run it from the build folder (shaders and meshes are copied next to the program):
+
+```bash
+cd build && ./menv
+```
+
+* Windows uses the prebuilt GLFW in `external/lib`. Linux and macOS download and build GLFW 3.3.8 the first time you configure (pass `-DGC_SYSTEM_GLFW=ON` to use an installed one). On Linux, install the X11 headers first: `sudo apt-get install libxrandr-dev libxinerama-dev libxcursor-dev libxi-dev libgl-dev`.
+* OpenGL is loaded with glad (`third_party/glad`), so no GLEW is needed.
+* macOS only offers OpenGL 4.1, so the compute-shader playback is off there and the CPU paths run instead (same results, slower at high counts).
+
+To import your own models (.obj, .glb, .gltf, or 3DGS .ply captures): add them to the `meshes` folder.
+
+### Scripted runs
+`menv --shot out/name --mode topology --a teapot.obj --b bunny.obj --times 0,0.5,1` bakes the morph without clicking, saves `out/name_t0.50.ppm` etc., and exits. Options: `--mode particles|topology|splats`, `--method auto|shared|sdf|piecewise`, `--transport greedy|gaussian|mixture`, `--k <components>`, `--size 1280x800`, `--nogui 1`.
 
 ### Input Bindings
 * ESC — Close application

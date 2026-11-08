@@ -107,7 +107,7 @@ GLuint LoadComputeShader(const char* computeFilePath, const char* commonFilePath
 }
 
 bool GpuComputeAvailable() {
-    return GLEW_VERSION_4_3 != 0;
+    return GLAD_GL_VERSION_4_3 != 0;
 }
 
 GLuint LoadShaders(const char* vertexFilePath, const char* fragmentFilePath) {

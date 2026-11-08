@@ -2,11 +2,14 @@
 #include "Shader.h"
 
 #include <glm/gtc/type_ptr.hpp>
+#include <glm/gtc/packing.hpp>
 #include <algorithm>
 #include <iostream>
 
 // Per-instance layout: center(3) | cov xx,xy,xz (3) | cov yy,yz,zz (3) | rgba (4)
 static const int kFloatsPerSplat = 13;
+
+int SplatRenderer::shDegree = 3;
 
 SplatRenderer::SplatRenderer()
     : isInitialized(false), program(0), vao(0), quadVbo(0), instanceVbo(0),
@@ -83,6 +86,9 @@ void SplatRenderer::Draw(const std::vector<Splat>& splats,
               [](const auto& a, const auto& b) { return a.first < b.first; });
 
     // 2. Build the 3D covariance Sigma = (R S)(R S)^T per splat, in sorted order.
+    //    Captures add their view-dependent colour for this camera (3DGS: the
+    //    direction from the camera to the splat).
+    const glm::vec3 camPos = glm::vec3(glm::inverse(view)[3]);
     instanceData.resize(n * kFloatsPerSplat);
     for (size_t k = 0; k < n; ++k) {
         const Splat& s = splats[depthKeys[k].second];
@@ -96,7 +102,10 @@ void SplatRenderer::Draw(const std::vector<Splat>& splats,
         d[0] = s.mean.x;   d[1] = s.mean.y;   d[2] = s.mean.z;
         d[3] = cov[0][0];  d[4] = cov[1][0];  d[5] = cov[2][0];
         d[6] = cov[1][1];  d[7] = cov[2][1];  d[8] = cov[2][2];
-        d[9] = s.color.r;  d[10] = s.color.g; d[11] = s.color.b;
+        glm::vec3 c = s.color;
+        if (shDegree > 0 && !SH::IsZero(s.sh))
+            c = glm::clamp(c + SH::Eval(s.sh, shDegree, glm::normalize(s.mean - camPos)), 0.0f, 1.0f);
+        d[9] = c.r;        d[10] = c.g;       d[11] = c.b;
         d[12] = s.opacity * opacityScale;
     }
 
@@ -156,6 +165,7 @@ struct GpuSplatKeyframes {
 };
 static const size_t kPreparedBytes = 12 * sizeof(float);   // Prepared in splat_prep.comp
 static const GLuint kSortBlock = 1024;                     // kBlock in radix_common.glsl
+static const int    kShWords   = (3 * SH::kCoeffs + 1) / 2; // 45 half floats, 2 per uint
 
 bool SplatRenderer::InitializeGpu() {
     if (gpuDrawProgram) return true;
@@ -182,7 +192,7 @@ bool SplatRenderer::InitializeGpu() {
 }
 
 void SplatRenderer::ReleaseGpuBuffers() {
-    for (GLuint* b : { &keyframeBuf, &prepBuf, &histBuf, &sortKeys[0], &sortKeys[1],
+    for (GLuint* b : { &keyframeBuf, &prepBuf, &histBuf, &shBuf, &sortKeys[0], &sortKeys[1],
                        &sortVals[0], &sortVals[1] })
         if (*b) { glDeleteBuffers(1, b); *b = 0; }
     gpuCount = 0;
@@ -231,6 +241,28 @@ void SplatRenderer::UploadKeyframes(const std::vector<Splat>& start, const std::
         k[i].colorB     = glm::vec4(b.color, 1.0f);
         float s = (stretch.size() == n) ? stretch[i] : 1.0f;
         k[i].smoothDisp = glm::vec4(gpuHasSmooth ? smoothDisp[i] : glm::vec3(0.0f), s);
+    }
+
+    // View-dependent colour: 15 RGB coefficients per end as half floats,
+    // kShWords uints per end (matches ShCoeffs in splat_prep.comp). Only
+    // allocated when a capture with SH is involved.
+    bool anySH = false;
+    for (size_t i = 0; i < n && !anySH; ++i)
+        anySH = !SH::IsZero(start[i].sh) || !SH::IsZero(end[i].sh);
+    if (anySH) {
+        std::vector<GLuint> words(n * 2 * kShWords, 0u);
+        for (size_t i = 0; i < n; ++i) {
+            for (int side = 0; side < 2; ++side) {
+                const SH::Coeffs& sh = side == 0 ? start[i].sh : end[i].sh;
+                GLuint* w = &words[(i * 2 + side) * kShWords];
+                for (int h = 0; h < 3 * SH::kCoeffs; h += 2) {
+                    float lo = sh[h / 3][h % 3];
+                    float hi = (h + 1 < 3 * SH::kCoeffs) ? sh[(h + 1) / 3][(h + 1) % 3] : 0.0f;
+                    w[h / 2] = glm::packHalf2x16(glm::vec2(lo, hi));
+                }
+            }
+        }
+        shBuf = MakeStorage(words.size() * sizeof(GLuint), words.data());
     }
 
     const GLuint blocks = (GLuint)((n + kSortBlock - 1) / kSortBlock);
@@ -291,6 +323,9 @@ void SplatRenderer::DrawMorph(float e, float sizeMul, float stretchOn,
     glUniformMatrix4fv(glGetUniformLocation(progPrep, "view"), 1, GL_FALSE, glm::value_ptr(view));
     glUniformMatrix4fv(glGetUniformLocation(progPrep, "proj"), 1, GL_FALSE, glm::value_ptr(proj));
     glUniform2fv(glGetUniformLocation(progPrep, "viewport"), 1, glm::value_ptr(viewport));
+    glUniform3fv(glGetUniformLocation(progPrep, "camPos"), 1, glm::value_ptr(glm::vec3(glm::inverse(view)[3])));
+    glUniform1i(glGetUniformLocation(progPrep, "shDegree"), shBuf ? shDegree : 0);
+    glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 5, shBuf);
     glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 0, keyframeBuf);
     glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 1, prepBuf);
     glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 2, sortKeys[0]);
@@ -315,7 +350,7 @@ void SplatRenderer::DrawMorph(float e, float sizeMul, float stretchOn,
     SetBlendState(false);
     drawTimer.End();
 
-    for (GLuint b = 0; b < 5; ++b) glBindBufferBase(GL_SHADER_STORAGE_BUFFER, b, 0);
+    for (GLuint b = 0; b < 6; ++b) glBindBufferBase(GL_SHADER_STORAGE_BUFFER, b, 0);
     glUseProgram(0);
 }
 

@@ -1,5 +1,8 @@
 #include "Window.h"
 #include "core.h"
+#include <cstdio>
+#include <string>
+#include <vector>
 
 #include "imgui.h"
 #include "imgui_impl_glfw.h"
@@ -13,6 +16,8 @@ extern "C" {
     __declspec(dllexport) int AmdPowerXpressRequestHighPerformance = 1;
 }
 #endif
+
+extern Camera* Cam;   // Window.cpp
 
 void error_callback(int error, const char* description) {
     // Print error.
@@ -56,10 +61,128 @@ void print_versions() {
 #endif
 }
 
+// ---- Scripted runs (for testing without clicking) ----
+//   menv --shot out/prefix --mode topology|particles|splats --a teapot.obj --b bunny.obj
+//        [--method auto|shared|sdf|piecewise] [--transport greedy|gaussian|mixture]
+//        [--k 8] [--times 0,0.5,1] [--size 1280x800] [--nogui 1]
+//        [--sh 0..3] [--azimuth deg] [--distance d] [--up asis|flipy] [--gpu 0] [--temp x]
+// Bakes A -> B, then saves <prefix>_t<time>.ppm for every time and exits.
+struct ScriptArgs {
+    std::string shot, mode, a, b, method, transport;
+    std::vector<float> times = { 0.0f, 0.5f, 1.0f };
+    int width = 800, height = 600, k = -1;
+    int gpu = -1;               // 0 = force the CPU paths
+    float azimuth = -1000.0f;   // camera azimuth in degrees (unset: the default view)
+    float distance = -1.0f;     // camera distance (unset: the default view)
+};
+
+static bool ParseArgs(int argc, char** argv, ScriptArgs& args) {
+    for (int i = 1; i + 1 < argc; i += 2) {
+        std::string key = argv[i], val = argv[i + 1];
+        if      (key == "--shot")      args.shot = val;
+        else if (key == "--mode")      args.mode = val;
+        else if (key == "--a")         args.a = val;
+        else if (key == "--b")         args.b = val;
+        else if (key == "--method")    args.method = val;
+        else if (key == "--transport") args.transport = val;
+        else if (key == "--k")         args.k = std::stoi(val);
+        else if (key == "--nogui")     Window::hideGui = (val == "1");
+        else if (key == "--sh")        SplatRenderer::shDegree = std::stoi(val);
+        else if (key == "--gpu")       args.gpu = std::stoi(val);
+        else if (key == "--temp")      Window::posteriorTemp = std::stof(val);
+        else if (key == "--distance")  args.distance = std::stof(val);
+        else if (key == "--azimuth")   args.azimuth = std::stof(val);
+        else if (key == "--up")        Window::plyOptions.up = val == "asis" ? PlyLoadOptions::Up::AsIs
+                                                                             : PlyLoadOptions::Up::FlipY;
+        else if (key == "--size")      sscanf(val.c_str(), "%dx%d", &args.width, &args.height);
+        else if (key == "--times") {
+            args.times.clear();
+            size_t pos = 0;
+            while (pos < val.size()) {
+                size_t comma = val.find(',', pos);
+                if (comma == std::string::npos) comma = val.size();
+                args.times.push_back(std::stof(val.substr(pos, comma - pos)));
+                pos = comma + 1;
+            }
+        } else {
+            std::cerr << "Unknown option " << key << "\n";
+            return false;
+        }
+    }
+    return true;
+}
+
+static int MeshIndexByName(const std::string& name) {
+    if (name.empty() || name == "blob") return 0;
+    for (size_t i = 0; i < Window::meshNames.size(); ++i)
+        if (Window::meshNames[i] == name) return (int)i + 1;   // index 0 is the blob
+    std::cerr << "[Script] no mesh named " << name << "\n";
+    return -1;
+}
+
+static void Frame(GLFWwindow* window) {
+    Window::idleCallback();
+    Window::displayCallback(window);
+}
+
+static int RunScript(GLFWwindow* window, const ScriptArgs& args) {
+    if (args.mode == "topology")       Window::renderMode = RenderMode::TriangleMorph;
+    else if (args.mode == "particles") Window::renderMode = RenderMode::Particles;
+    else if (args.mode == "splats")    Window::renderMode = RenderMode::Splats;
+    if (args.method == "auto")      Window::morphMethod = MorphMethod::Auto;
+    if (args.method == "shared")    Window::morphMethod = MorphMethod::SharedTopology;
+    if (args.method == "sdf")       Window::morphMethod = MorphMethod::SDF;
+    if (args.method == "piecewise") Window::morphMethod = MorphMethod::Piecewise;
+    if (args.transport == "greedy")   Window::particleTransport = ParticleTransport::Greedy;
+    if (args.transport == "gaussian") Window::particleTransport = ParticleTransport::Gaussian;
+    if (args.transport == "mixture")  Window::particleTransport = ParticleTransport::Mixture;
+    if (args.k > 0) Window::mixtureK = Window::particleMixtureK = Window::morphMixtureK = args.k;
+
+    int a = MeshIndexByName(args.a), b = MeshIndexByName(args.b);
+    if (a < 0 || b < 0) return EXIT_FAILURE;
+    Window::meshIndexA = a;
+    Window::meshIndexB = b;
+
+    if (args.azimuth > -999.0f) Cam->SetAzimuth(args.azimuth);
+    if (args.gpu == 0) Window::useGpu = false;
+    if (args.distance > 0.0f) Cam->SetDistance(args.distance);
+    for (int i = 0; i < 5; ++i) Frame(window);
+    Window::ComputeOTAndSpawnParticles();
+
+    double start = glfwGetTime();
+    for (;;) {
+        Frame(window);
+        bool busy = Window::morphBaking || Window::splatBaking;
+        bool ready = Window::trueMorphActive || Window::splatMorphActive || Window::particleMorphActive;
+        if (!busy && ready) break;
+        if (!busy && glfwGetTime() - start > 2.0) {
+            std::cerr << "[Script] bake produced nothing\n";
+            return EXIT_FAILURE;
+        }
+        if (glfwGetTime() - start > 900.0) {
+            std::cerr << "[Script] bake timed out\n";
+            return EXIT_FAILURE;
+        }
+    }
+    std::cout << "[Script] bake finished in " << glfwGetTime() - start << " s\n";
+
+    for (float t : args.times) {
+        Window::animator->Seek(t);
+        for (int i = 0; i < 4; ++i) Frame(window);
+        char name[64];
+        snprintf(name, sizeof(name), "_t%.2f.ppm", t);
+        Window::screenshotPath = args.shot + name;
+        Frame(window);
+    }
+    return EXIT_SUCCESS;
+}
+
 int main(int argc, char** argv) {
+    ScriptArgs script;
+    if (!ParseArgs(argc, argv, script)) exit(EXIT_FAILURE);
 
     // Create the GLFW window.
-    GLFWwindow* window = Window::createWindow(800, 600);
+    GLFWwindow* window = Window::createWindow(script.width, script.height);
     if (!window) exit(EXIT_FAILURE);
 
     // Print OpenGL and GLSL versions.
@@ -90,7 +213,10 @@ int main(int argc, char** argv) {
     ImGui_ImplGlfw_InitForOpenGL(window, true);
 
     // GL 3.0 + GLSL 130
-    const char* glsl_version = "#version 130";
+    // A core profile (macOS) needs GLSL 150 for ImGui's shaders
+    GLint profile = 0;
+    glGetIntegerv(GL_CONTEXT_PROFILE_MASK, &profile);
+    const char* glsl_version = (profile & GL_CONTEXT_CORE_PROFILE_BIT) ? "#version 150" : "#version 130";
     ImGui_ImplOpenGL3_Init(glsl_version);
 
 
@@ -98,6 +224,14 @@ int main(int argc, char** argv) {
     if (!Window::initializeProgram()) exit(EXIT_FAILURE);
     // Initialize objects/pointers for rendering; exit if initialization fails.
     if (!Window::initializeObjects()) exit(EXIT_FAILURE);
+
+    if (!script.shot.empty()) {
+        int code = RunScript(window, script);
+        Window::cleanUp();
+        glfwDestroyWindow(window);
+        glfwTerminate();
+        exit(code);
+    }
 
     // Loop while GLFW window should stay open.
     while (!glfwWindowShouldClose(window)) {

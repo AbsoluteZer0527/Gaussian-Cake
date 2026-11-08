@@ -16,6 +16,11 @@ uniform mat3  LtInv;          // inverse of L_t = (1 - t) I + t A
 uniform vec3  shift;          // t b
 uniform mat3  Amat;           // OT map T(x) = A x + b
 uniform vec3  bvec;
+uniform int   hasWarp;        // 1: T is the mixture map sampled on the grid (WarpGrid)
+uniform sampler3D warpT;      // T(u) at every grid point (rgb)
+uniform sampler3D warpJ0;     // columns of its Jacobian J(u)
+uniform sampler3D warpJ1;
+uniform sampler3D warpJ2;
 uniform uint  vertCap;        // room in the vertex buffer
 uniform uint  indexCap;       // room in the index buffer
 
@@ -50,11 +55,45 @@ float SampleGrid(sampler3D g, vec3 p) {
     return texture(g, (qc + 0.5) / float(n)).r + outside;
 }
 
+// T(u) and J(u) from the warp textures, continued linearly past the grid
+// (WarpGrid::Sample)
+vec3 WarpSample(vec3 u, out mat3 J) {
+    vec3 q  = (u - lo) / h;
+    vec3 qc = clamp(q, vec3(0.0), vec3(float(n - 1)));
+    vec3 tc = (qc + 0.5) / float(n);
+    J = mat3(texture(warpJ0, tc).rgb, texture(warpJ1, tc).rgb, texture(warpJ2, tc).rgb);
+    return texture(warpT, tc).rgb + J * (h * (q - qc));
+}
+
+// u = M_t^-1(y), with Tu = T(u) and J = J(u) (SDFMorph::Preimage). Affine T:
+// one matrix product. Mixture T: Newton on (1 - t) u + t T(u) = y from the
+// affine answer.
+vec3 Preimage(vec3 y, out vec3 Tu, out mat3 J) {
+    vec3 u = LtInv * (y - shift);
+    if (hasWarp == 0) {
+        Tu = Amat * u + bvec;
+        J = Amat;
+        return u;
+    }
+    Tu = WarpSample(u, J);
+    for (int it = 0; it < 10; ++it) {
+        vec3 F = (1.0 - t) * u + t * Tu - y;
+        if (dot(F, F) < 1e-12) break;
+        mat3 D = (1.0 - t) * mat3(1.0) + t * J;
+        if (abs(determinant(D)) < 1e-6) break;
+        u -= inverse(D) * F;
+        Tu = WarpSample(u, J);
+    }
+    return u;
+}
+
 // phi_t(y) = (1 - t) phi_A(u) + t phi_B(T(u)),  u = M_t^-1(y)
 float Phi(vec3 y) {
-    vec3 u = LtInv * (y - shift);
+    vec3 Tu;
+    mat3 J;
+    vec3 u = Preimage(y, Tu, J);
     float fa = (t < 1.0) ? SampleGrid(gridA, u) : 0.0;
-    float fb = (t > 0.0) ? SampleGrid(gridB, Amat * u + bvec) : 0.0;
+    float fb = (t > 0.0) ? SampleGrid(gridB, Tu) : 0.0;
     return (1.0 - t) * fa + t * fb;
 }
 
@@ -76,21 +115,27 @@ vec3 SampleGrad(sampler3D grad, vec3 p) {
 // Gradient of phi_t, by the pullback rule: phi_t is phi pulled back through
 // M_t^-1 (and phi_B through T), and d commutes with pullback, so the gradient
 // (a 1-form) transforms by the inverse transpose of each linear map:
-//   grad phi_t(y) = M_t^-T [ (1 - t) grad phi_A(u) + t A^T grad phi_B(T(u)) ]
+//   grad phi_t(y) = M_t'^-T [ (1 - t) grad phi_A(u) + t J^T grad phi_B(T(u)) ]
+// with M_t' = (1 - t) I + t J; J = A for the affine map (then M_t'^-1 = LtInv).
 vec3 PhiGrad(vec3 y) {
-    vec3 u = LtInv * (y - shift);
+    vec3 Tu;
+    mat3 J;
+    vec3 u = Preimage(y, Tu, J);
     vec3 g = vec3(0.0);
     if (t < 1.0) g += (1.0 - t) * SampleGrad(gradA, u);
-    if (t > 0.0) g += t * (transpose(Amat) * SampleGrad(gradB, Amat * u + bvec));
-    return transpose(LtInv) * g;
+    if (t > 0.0) g += t * (transpose(J) * SampleGrad(gradB, Tu));
+    mat3 DInv = (hasWarp == 0) ? LtInv : inverse((1.0 - t) * mat3(1.0) + t * J);
+    return transpose(DInv) * g;
 }
 
 // Colour of the t-surface at y: A's colour where y came from on A, B's at
 // the matching point on B, blended like Phi (same as SDFMorph::Extract).
 vec3 ColorAt(vec3 y) {
-    vec3 u  = LtInv * (y - shift);
+    vec3 Tu;
+    mat3 J;
+    vec3 u  = Preimage(y, Tu, J);
     vec3 qa = clamp((u - lo) / h, vec3(0.0), vec3(float(n - 1)));
-    vec3 qb = clamp((Amat * u + bvec - lo) / h, vec3(0.0), vec3(float(n - 1)));
+    vec3 qb = clamp((Tu - lo) / h, vec3(0.0), vec3(float(n - 1)));
     vec3 ca = texture(colorA, (qa + 0.5) / float(n)).rgb;
     vec3 cb = texture(colorB, (qb + 0.5) / float(n)).rgb;
     return mix(ca, cb, t);

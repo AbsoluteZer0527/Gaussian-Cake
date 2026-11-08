@@ -11,7 +11,7 @@ project(menv)
 #   morph      signed-distance-field morph (CPU and GPU)
 #   splats     Gaussian splats: generation and rendering
 #   particles  the particle system
-# Third-party code (imgui, Eigen, glm, GLEW, GLFW and their .lib files) is in external/.
+# Third-party code: external/ (headers, imgui, Windows GLFW), third_party/glad, see below.
 set(MODULES app core io mesh transport morph splats particles)
 
 set(
@@ -40,6 +40,7 @@ set(
     src/transport/TransportAnimator.cpp
     src/morph/SDFMorph.cpp
     src/morph/GpuSDFMorph.cpp
+    src/morph/PiecewiseMorph.cpp
     src/splats/SplatGenerator.cpp
     src/splats/SplatRenderer.cpp
     src/splats/SplatHeat.cpp
@@ -48,41 +49,69 @@ set(
     src/particles/ParticleSystem.cpp
 )
 
+# ---- Third-party code ----
+# external/: header-only libraries and imgui. third_party/glad: the OpenGL loader.
+# GLFW: the prebuilt external/lib/glfw3.lib with MSVC; elsewhere an installed
+# one (GC_SYSTEM_GLFW=ON) or 3.3.8 (the version of external/GLFW) built from source.
+find_package(OpenGL REQUIRED)
+find_package(Threads REQUIRED)
+
+add_library(glad STATIC third_party/glad/src/gl.c)
+target_include_directories(glad PUBLIC third_party/glad/include)
+
+option(GC_SYSTEM_GLFW "Use an installed GLFW (find_package) instead of downloading it" OFF)
+if(MSVC AND EXISTS "${PROJECT_SOURCE_DIR}/external/lib/glfw3.lib")
+    add_library(glfw STATIC IMPORTED)
+    set_target_properties(glfw PROPERTIES
+        IMPORTED_LOCATION "${PROJECT_SOURCE_DIR}/external/lib/glfw3.lib"
+        INTERFACE_INCLUDE_DIRECTORIES "${PROJECT_SOURCE_DIR}/external")
+elseif(GC_SYSTEM_GLFW)
+    find_package(glfw3 3.3 REQUIRED)
+else()
+    include(FetchContent)
+    set(GLFW_BUILD_DOCS     OFF CACHE BOOL "" FORCE)
+    set(GLFW_BUILD_TESTS    OFF CACHE BOOL "" FORCE)
+    set(GLFW_BUILD_EXAMPLES OFF CACHE BOOL "" FORCE)
+    set(GLFW_INSTALL        OFF CACHE BOOL "" FORCE)
+    FetchContent_Declare(glfw
+        GIT_REPOSITORY https://github.com/glfw/glfw.git
+        GIT_TAG        3.3.8
+        GIT_SHALLOW    TRUE)
+    FetchContent_MakeAvailable(glfw)
+endif()
+
+set(IMGUI_DIR ${PROJECT_SOURCE_DIR}/external/imgui)
 set(
     IMGUI_SOURCES
-    external/imgui/imgui.cpp
-    external/imgui/imgui_demo.cpp
-    external/imgui/imgui_draw.cpp
-    external/imgui/imgui_tables.cpp
-    external/imgui/imgui_widgets.cpp
-    external/imgui/imgui_impl_glfw.cpp
-    external/imgui/imgui_impl_opengl3.cpp
-)
-
-# Require GL
-find_package(OpenGL REQUIRED)
-
-# Every module folder is on the include path, so "#include \"Window.h\"" works anywhere
-include_directories(external external/Eigen external/imgui)
-foreach(module ${MODULES})
-    include_directories(src/${module})
-endforeach()
-
-# Add library directories
-link_directories(
-    external/lib
+    ${IMGUI_DIR}/imgui.cpp
+    ${IMGUI_DIR}/imgui_demo.cpp
+    ${IMGUI_DIR}/imgui_draw.cpp
+    ${IMGUI_DIR}/imgui_tables.cpp
+    ${IMGUI_DIR}/imgui_widgets.cpp
+    ${IMGUI_DIR}/imgui_impl_glfw.cpp
+    ${IMGUI_DIR}/imgui_impl_opengl3.cpp
 )
 
 # Headers too, so Visual Studio lists them, grouped by folder as on disk
 file(GLOB HEADERS src/*/*.h)
 source_group(TREE ${PROJECT_SOURCE_DIR}/src FILES ${SOURCES} ${HEADERS})
 
-# Add executable
-add_executable(${PROJECT_NAME} ${SOURCES} ${HEADERS} ${IMGUI_SOURCES})
-set_property(TARGET ${PROJECT_NAME} PROPERTY CXX_STANDARD 17)
+# Settings shared by the app and the tests
+add_library(gc_settings INTERFACE)
+target_compile_features(gc_settings INTERFACE cxx_std_17)
+# Every module folder is on the include path, so "#include \"Window.h\"" works anywhere
+target_include_directories(gc_settings INTERFACE external external/Eigen ${IMGUI_DIR})
+foreach(module ${MODULES})
+    target_include_directories(gc_settings INTERFACE src/${module})
+endforeach()
+target_compile_definitions(gc_settings INTERFACE GLM_ENABLE_EXPERIMENTAL _USE_MATH_DEFINES NOMINMAX)
+if(MSVC)
+    target_compile_options(gc_settings INTERFACE /bigobj /utf-8)
+endif()
+target_link_libraries(gc_settings INTERFACE glad glfw OpenGL::GL Threads::Threads ${CMAKE_DL_LIBS})
 
-# Link libraries
-target_link_libraries(${PROJECT_NAME} ${OPENGL_LIBRARIES} glew32s.lib glfw3)
+add_executable(${PROJECT_NAME} ${SOURCES} ${HEADERS} ${IMGUI_SOURCES})
+target_link_libraries(${PROJECT_NAME} PRIVATE gc_settings)
 
 # Move assets to .exe
 add_custom_target(CopyShaders ALL
@@ -100,3 +129,12 @@ if(EXISTS "${CMAKE_SOURCE_DIR}/meshes")
     )
     add_dependencies(${PROJECT_NAME} CopyMeshes)
 endif()
+
+# ---- Tests (no window or GPU needed): ctest --test-dir build ----
+enable_testing()
+# everything but the app itself (window, GUI)
+set(TEST_SOURCES ${SOURCES})
+list(FILTER TEST_SOURCES EXCLUDE REGEX "src/app/")
+add_executable(gc_tests tests/tests.cpp ${TEST_SOURCES} ${IMGUI_SOURCES})
+target_link_libraries(gc_tests PRIVATE gc_settings)
+add_test(NAME gc_tests COMMAND gc_tests WORKING_DIRECTORY ${CMAKE_BINARY_DIR})

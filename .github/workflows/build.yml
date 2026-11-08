@@ -1,0 +1,38 @@
+name: build
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install GLFW build dependencies (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libxrandr-dev libxinerama-dev libxcursor-dev libxi-dev libgl-dev xvfb
+
+      - name: Configure
+        run: cmake -B build -DCMAKE_BUILD_TYPE=Release
+
+      - name: Build
+        run: cmake --build build --config Release --parallel
+
+      - name: Unit tests
+        run: ctest --test-dir build -C Release --output-on-failure
+
+      - name: Smoke test (Linux, software OpenGL)
+        if: runner.os == 'Linux'
+        working-directory: build
+        run: |
+          xvfb-run -a -s "-screen 0 1280x800x24" ./menv --shot ci_particles --mode particles --a teapot.obj --b bunny.obj --times 0.5
+          xvfb-run -a -s "-screen 0 1280x800x24" ./menv --shot ci_topology --mode topology --a teapot.obj --b bunny.obj --times 0.5
+          ls -la ci_*.ppm

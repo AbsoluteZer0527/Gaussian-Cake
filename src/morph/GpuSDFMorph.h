@@ -53,6 +53,7 @@ private:
     GLuint texA = 0, texB = 0;
     GLuint gradTexA = 0, gradTexB = 0;   // grid gradients, for the analytic surface normal
     GLuint colorTexA = 0, colorTexB = 0; // colour grids (0 when the morph has no colours)
+    GLuint warpTex[4] = {};              // mixture map: T, then J's three columns (0 = affine map)
     GLuint fieldBuf = 0, cellBuf = 0, vertBuf = 0, indexBuf = 0, counterBuf = 0;
     GLuint vao = 0;
 

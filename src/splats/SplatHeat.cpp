@@ -3,7 +3,7 @@
 
 #include <Eigen/IterativeLinearSolvers>
 #include <algorithm>
-#include <execution>
+#include "Parallel.h"
 #include <cmath>
 #include <iostream>
 #include <numeric>
@@ -19,9 +19,7 @@ std::vector<int> NearestNeighbors(const std::vector<glm::vec3>& pos, int k, floa
     PointGrid grid;
     grid.Build(pos, cellSize);
 
-    std::vector<int> idx(n);
-    std::iota(idx.begin(), idx.end(), 0);
-    std::for_each(std::execution::par, idx.begin(), idx.end(), [&](int i) {
+    ParallelFor(n, [&](int i) {
         std::vector<std::pair<float, int>> cand;
         grid.ForEachNear(pos[i], [&](int j) {
             if (j != i) cand.push_back({ Dist2(pos[i], pos[j]), j });
@@ -102,9 +100,7 @@ Eigen::MatrixXd HeatStep(const SpMat& L, const Eigen::VectorXd& mass,
     // guess: heat only smooths it. A loose tolerance is plenty for smoothing.
     Eigen::MatrixXd rhs = mass.asDiagonal() * b;
     Eigen::MatrixXd x(n, b.cols());
-    std::vector<int> cols(b.cols());
-    std::iota(cols.begin(), cols.end(), 0);
-    std::for_each(std::execution::par, cols.begin(), cols.end(), [&](int c) {
+    ParallelFor((int)b.cols(), [&](int c) {
         // Each thread needs its own solver: solving writes the iteration count
         // and error into it. Setting one up is cheap (the preconditioner is
         // just A's diagonal).
@@ -115,7 +111,7 @@ Eigen::MatrixXd HeatStep(const SpMat& L, const Eigen::VectorXd& mass,
         x.col(c) = cg.solveWithGuess(rhs.col(c), guess);
         if (cg.info() != Eigen::Success)
             std::cerr << "[SplatHeat] heat step did not converge (error " << cg.error() << ")\n";
-    });
+    }, 1);
     return x;
 }
 
@@ -180,9 +176,7 @@ std::vector<float> HeatWaveDelay(const std::vector<glm::vec3>& pos, float cellSi
     PointGrid grid;
     grid.Build(sub, subCell);
     std::vector<float> coarse(n);
-    std::vector<int> idx(n);
-    std::iota(idx.begin(), idx.end(), 0);
-    std::for_each(std::execution::par, idx.begin(), idx.end(), [&](int i) {
+    ParallelFor(n, [&](int i) {
         coarse[i] = subDelay[grid.Nearest(pos[i])];
     });
 

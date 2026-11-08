@@ -1,5 +1,8 @@
 #include "ParticleSystem.h"
+#include "Shader.h"
 #include <glm/gtc/type_ptr.hpp>
+
+static const GLenum kPointSprite = 0x8861;   // GL_POINT_SPRITE (not in glad's core header)
 
 ParticleSystem::ParticleSystem() {
     particleRadius = 0.03f;
@@ -28,22 +31,58 @@ void ParticleSystem::Update(float deltaTime) {
     }
 }
 
-// Fixed-function points; the projection matrix stays identity, so the whole
-// view-projection goes on the modelview stack.
+// Round points with a tiny shader: positions are streamed into one VBO per
+// frame (particle counts are small, and they move every frame anyway).
 void ParticleSystem::Draw(glm::mat4 viewProjection) {
-    glEnable(GL_DEPTH_TEST);
-
-    glMatrixMode(GL_MODELVIEW);
-    glLoadMatrixf(glm::value_ptr(viewProjection));
-
-    glColor3f(0.0f, 0.0f, 0.0f);
-
-    // world-space radius -> pixel point size (rough, independent of distance)
-    glPointSize(particleRadius * 100.0f);
-
-    glBegin(GL_POINTS);
-    for (const Particle& p : particles) {
-        glVertex3f(p.position.x, p.position.y, p.position.z);
+    if (particles.empty()) return;
+    if (!program) {
+        program = LoadShaders("shaders/points.vert", "shaders/points.frag");
+        if (!program) return;
+        glGenVertexArrays(1, &vao);
+        glGenBuffers(1, &vbo);
+        glBindVertexArray(vao);
+        glBindBuffer(GL_ARRAY_BUFFER, vbo);
+        glEnableVertexAttribArray(0);
+        glVertexAttribPointer(0, 3, GL_FLOAT, GL_FALSE, sizeof(glm::vec3), (void*)0);
+        glBindVertexArray(0);
+        // A compatibility profile (Windows, Linux) only fills gl_PointCoord
+        // while point sprites are on; without it points.frag discards every
+        // pixel. A core profile (macOS) always fills it and rejects the enum.
+        GLint profile = 0;
+        glGetIntegerv(GL_CONTEXT_PROFILE_MASK, &profile);
+        needsPointSprite = !(profile & GL_CONTEXT_CORE_PROFILE_BIT);
     }
-    glEnd();
+
+    staging.resize(particles.size());
+    for (size_t i = 0; i < particles.size(); ++i) staging[i] = particles[i].position;
+
+    glBindBuffer(GL_ARRAY_BUFFER, vbo);
+    if (staging.size() > vboCapacity) {
+        vboCapacity = staging.size();
+        glBufferData(GL_ARRAY_BUFFER, vboCapacity * sizeof(glm::vec3), nullptr, GL_STREAM_DRAW);
+    }
+    glBufferSubData(GL_ARRAY_BUFFER, 0, staging.size() * sizeof(glm::vec3), staging.data());
+
+    glEnable(GL_DEPTH_TEST);
+    glEnable(GL_PROGRAM_POINT_SIZE);
+    if (needsPointSprite) glEnable(kPointSprite);
+    glUseProgram(program);
+    glUniformMatrix4fv(glGetUniformLocation(program, "viewProj"), 1, GL_FALSE, glm::value_ptr(viewProjection));
+    // world-space radius -> pixel point size (rough, independent of distance)
+    glUniform1f(glGetUniformLocation(program, "pointSize"), particleRadius * 100.0f);
+    glUniform3f(glGetUniformLocation(program, "color"), 0.0f, 0.0f, 0.0f);
+
+    glBindVertexArray(vao);
+    glDrawArrays(GL_POINTS, 0, (GLsizei)staging.size());
+    glBindVertexArray(0);
+    glDisable(GL_PROGRAM_POINT_SIZE);
+    if (needsPointSprite) glDisable(kPointSprite);
+}
+
+void ParticleSystem::ReleaseGL() {
+    if (vbo) glDeleteBuffers(1, &vbo);
+    if (vao) glDeleteVertexArrays(1, &vao);
+    if (program) glDeleteProgram(program);
+    vbo = vao = program = 0;
+    vboCapacity = 0;
 }

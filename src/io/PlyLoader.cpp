@@ -44,7 +44,8 @@ bool PlyLoader::Load(const std::string& path, std::vector<Splat>& outSplats,
     size_t loaded = outSplats.size();
     CleanAndNormalize(outSplats, options);
     std::cout << "[PlyLoader] " << path << ": " << loaded << " splats, "
-              << outSplats.size() << " kept after cleaning\n";
+              << outSplats.size() << " kept after cleaning, colour SH degree "
+              << header.shDegree << "\n";
     return !outSplats.empty();
 }
 
@@ -119,6 +120,16 @@ bool PlyLoader::ReadHeader(std::ifstream& in, Header& header, std::string& error
         }
     }
 
+    // Higher-order colour: 3DGS writes 3 * ((d+1)^2 - 1) values f_rest_*,
+    // channel-major (all red coefficients, then green, then blue).
+    int rest = 0;
+    while (rest < 3 * SH::kCoeffs && header.offset.count("f_rest_" + std::to_string(rest))) ++rest;
+    for (int d = 3; d >= 1; --d) {
+        if (rest >= 3 * SH::CountForDegree(d)) { header.shDegree = d; break; }
+    }
+    for (int r = 0; r < 3 * SH::CountForDegree(header.shDegree); ++r)
+        header.restOffset[r] = header.offset["f_rest_" + std::to_string(r)];
+
     if (!ended) {
         error = "the header never ends (no end_header)";
         return false;
@@ -156,6 +167,15 @@ Splat PlyLoader::Convert(const char* record, const Header& header) {
     s.color   = glm::clamp(0.5f + kSH0 * glm::vec3(get(DC0), get(DC1), get(DC2)), 0.0f, 1.0f);
     s.opacity = 1.0f / (1.0f + std::exp(-get(Opacity)));
     s.scale   = glm::exp(glm::vec3(get(Scale0), get(Scale1), get(Scale2)));
+
+    const int perChannel = SH::CountForDegree(header.shDegree);
+    for (int k = 0; k < perChannel; ++k) {
+        for (int ch = 0; ch < 3; ++ch) {
+            float v;
+            std::memcpy(&v, record + header.restOffset[ch * perChannel + k], sizeof(float));
+            s.sh[k][ch] = std::isfinite(v) ? v : 0.0f;
+        }
+    }
 
     glm::quat q(get(Rot0), get(Rot1), get(Rot2), get(Rot3));   // glm order: (w, x, y, z)
     float len = glm::length(q);
@@ -207,9 +227,12 @@ void PlyLoader::CleanAndNormalize(std::vector<Splat>& splats, const PlyLoadOptio
         case PlyLoadOptions::Up::AsIs:         break;
     }
     if (options.up != PlyLoadOptions::Up::AsIs) {
+        // the view-dependent colour turns with the capture
+        const auto M = SH::RotationMatrix(glm::mat3_cast(up));
         for (Splat& s : splats) {
             s.mean = up * s.mean;
             s.rot  = up * s.rot;
+            if (!SH::IsZero(s.sh)) SH::Rotate(s.sh, M);
         }
     }
 

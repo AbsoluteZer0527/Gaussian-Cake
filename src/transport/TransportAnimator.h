@@ -36,6 +36,9 @@ public:
     //B -> A return: plays the same timeline backwards. Only fires from GAUSSIAN_B.
     void ReverseTransport();
 
+    //hold the timeline at progress t (0..1) until the next Start/Reverse/Reset.
+    void Seek(float t);
+
     //reset back to GAUSSIAN_A positions.
     void Reset();
 

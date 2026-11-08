@@ -63,6 +63,10 @@ public:
 
     bool isInitialized;
 
+    // Spherical-harmonic degree used for view-dependent colour (0 = flat DC
+    // colour, up to 3); shared by every renderer.
+    static int shDegree;
+
 private:
     GLuint program;
     GLuint vao;
@@ -78,6 +82,7 @@ private:
     GLuint gpuDrawProgram = 0, progPrep = 0, progHist = 0, progScan = 0, progScatter = 0;
     GLuint gpuVao = 0;          // only the quad corners: per-splat data comes from buffers
     GLuint keyframeBuf = 0, prepBuf = 0, histBuf = 0;
+    GLuint shBuf = 0;           // half-float SH coefficients of both ends (only if any splat has them)
     GLuint sortKeys[2] = {}, sortVals[2] = {};
     int    gpuCount = 0;
     bool   gpuHasSmooth = false;

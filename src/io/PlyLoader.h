@@ -41,6 +41,8 @@ private:
         size_t stride = 0;                              // bytes per splat record
         std::unordered_map<std::string, size_t> offset; // property name -> byte offset in a record
         size_t field[kFieldCount] = {};                 // offset of each Field, looked up once
+        int    shDegree = 0;                            // from how many f_rest_* there are
+        size_t restOffset[3 * SH::kCoeffs] = {};        // offset of each f_rest_*
     };
 
     // Reads the text header up to and including "end_header". Afterwards the

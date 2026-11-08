@@ -72,6 +72,12 @@ void TransportAnimator::ReverseTransport() {
     state = AnimationState::BAKING;
 }
 
+void TransportAnimator::Seek(float t) {
+    transportProgress = std::clamp(t, 0.0f, 1.0f);
+    direction = 0.0f;              // Update keeps re-evaluating, but doesn't move
+    state = AnimationState::BAKING;
+}
+
 void TransportAnimator::Reset() {
     state = AnimationState::GAUSSIAN_A;
     transportProgress = 0.0f;

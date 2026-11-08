@@ -23,11 +23,20 @@ enum class RenderMode {
 
 // How TriangleMorph builds the in-between surfaces.
 enum class MorphMethod {
-    Auto           = 0,  // shared topology when both meshes allow it, else SDF
+    Auto           = 0,  // shared topology when both meshes allow it, else Piecewise
     SharedTopology = 1,  // fit the denser mesh onto the other, lerp vertices
     SDF            = 2,  // OT-aligned distance-field blend, re-meshed per frame
+    Piecewise      = 3,  // A's mesh, then B's, following the SDF surface; switch where the topology changes
 };
 
+
+// How Particles mode carries the point cloud from A to B.
+enum class ParticleTransport {
+    Auto     = 0,  // Greedy between two shapes, Gaussian when either side is the blob
+    Greedy   = 1,  // discrete matching of surface samples (exact shapes at both ends)
+    Gaussian = 2,  // one closed-form Gaussian OT map, T(x) = muB + A (x - muA)
+    Mixture  = 3,  // Gaussian-mixture OT: Sinkhorn plan between K parts, blended maps
+};
 
 class Window {
 public:
@@ -47,6 +56,7 @@ public:
     static int         sdfResolution;    // SDF grid points per axis
     static float       fitStiffness;     // multiplier on the template-fit stiffness schedule
     static bool        fitCotan;         // cotan vs uniform Laplacian in the template fit
+    static int         morphMixtureK;    // parts the OT alignment matches (1 = one affine map)
     static bool        trueMorphActive;
     static bool        morphBaking;      // a background Topology bake is running
     static std::string morphStatus;      // which method ran, and why
@@ -92,6 +102,8 @@ public:
     static TransportAnimator* animator;
     static bool particleMorphActive;   // particle transport owns the animator
     static int particleCount;
+    static ParticleTransport particleTransport;
+    static int particleMixtureK;     // mixture components for ParticleTransport::Mixture
 
     // Mesh selection: index 0 = blob, indices 1..N = entries in meshPaths
     static std::vector<std::string> meshNames;  // display names (filenames)
@@ -134,4 +146,9 @@ public:
     static void UpdateSplatPreview();
     static void PollSplatBake();
     static void DrawMainGUI();
+
+    // Set to a path: the next frame is saved there as a .ppm (scripted runs).
+    static std::string screenshotPath;
+    static bool hideGui;               // scripted runs: draw the scene only
+    static void SaveScreenshot(const std::string& path, int w, int h);
 };

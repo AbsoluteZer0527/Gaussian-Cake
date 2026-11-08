@@ -24,7 +24,15 @@ layout(std430, binding = 1) writeonly buffer Prep      { Prepared prep[]; };
 layout(std430, binding = 2) writeonly buffer SortKeys  { uint sortKeys[]; };
 layout(std430, binding = 3) writeonly buffer SortVals  { uint sortVals[]; };
 
+// View-dependent colour (3DGS spherical harmonics, degrees 1..3): per splat,
+// 23 uints for the start and 23 for the end, each two half floats, in the
+// order coefficient 1 r g b, coefficient 2 r g b, ... Bound only for captures.
+layout(std430, binding = 5) readonly buffer ShCoeffs { uint shWords[]; };
+const uint kShWords = 23u;
+
 uniform uint  count;
+uniform vec3  camPos;
+uniform int   shDegree;   // 0 = no view-dependent colour (or no buffer bound)
 uniform float e;          // eased time
 uniform float sizeMul;    // scales every splat (a capture shown at rest)
 uniform float stretchOn;  // 1 = apply the per-splat area stretch, 0 = ignore it
@@ -53,6 +61,38 @@ mat3 QuatToMat(vec4 q) {
     return mat3(1.0 - 2.0 * (yy + zz), 2.0 * (xy + wz),       2.0 * (xz - wy),
                 2.0 * (xy - wz),       1.0 - 2.0 * (xx + zz), 2.0 * (yz + wx),
                 2.0 * (xz + wy),       2.0 * (yz - wx),       1.0 - 2.0 * (xx + yy));
+}
+
+// Sum of Y_k(d) sh_k, k = 1..15 (SphericalHarmonics.h, same constants)
+vec3 EvalSH(uint base, vec3 d) {
+    float c[46];
+    for (uint w = 0u; w < kShWords; ++w) {
+        vec2 h = unpackHalf2x16(shWords[base + w]);
+        c[2u * w] = h.x;
+        c[2u * w + 1u] = h.y;
+    }
+    #define COEF(k) vec3(c[3 * (k)], c[3 * (k) + 1], c[3 * (k) + 2])
+    float x = d.x, y = d.y, z = d.z;
+    vec3 r = 0.4886025119029199 * (-y * COEF(0) + z * COEF(1) - x * COEF(2));
+    if (shDegree >= 2) {
+        float xx = x * x, yy = y * y, zz = z * z;
+        r += 1.0925484305920792 * x * y * COEF(3)
+           - 1.0925484305920792 * y * z * COEF(4)
+           + 0.31539156525252005 * (2.0 * zz - xx - yy) * COEF(5)
+           - 1.0925484305920792 * x * z * COEF(6)
+           + 0.5462742152960396 * (xx - yy) * COEF(7);
+        if (shDegree >= 3) {
+            r += -0.5900435899266435 * y * (3.0 * xx - yy) * COEF(8)
+               + 2.890611442640554 * x * y * z * COEF(9)
+               - 0.4570457994644658 * y * (4.0 * zz - xx - yy) * COEF(10)
+               + 0.3731763325901154 * z * (2.0 * zz - 3.0 * xx - 3.0 * yy) * COEF(11)
+               - 0.4570457994644658 * x * (4.0 * zz - xx - yy) * COEF(12)
+               + 1.445305721320277 * z * (xx - yy) * COEF(13)
+               - 0.5900435899266435 * x * (xx - 3.0 * yy) * COEF(14);
+        }
+    }
+    #undef COEF
+    return r;
 }
 
 // Float -> uint whose integer order is the float's order (flip all bits of
@@ -97,11 +137,24 @@ void main() {
     vec4  rot     = Slerp(k.rotA, k.rotB, ei);
     vec3  scale   = growi * exp(mix(k.logScaleA.xyz, k.logScaleB.xyz, ei));
     scale.xy     *= pow(k.smoothDisp.w, stretchOn * bump);   // z is the thin axis
-    vec3  color   = mix(k.colorA.rgb, k.colorB.rgb, ei);
     float opacity = mix(k.logScaleA.w, k.logScaleB.w, ei);
+    mat3  Rt      = QuatToMat(rot);
+
+    // Colour. A capture's view-dependent colour turns with its splat: each
+    // end's SH is read in the direction that, in that end's own frame, points
+    // where the view direction points in the current frame (R_end R_t^T d).
+    // Exact at both ends, and for every degree.
+    vec3 colorA = k.colorA.rgb, colorB = k.colorB.rgb;
+    if (shDegree > 0) {
+        vec3 d = normalize(mean - camPos);
+        vec3 local = transpose(Rt) * d;
+        colorA = max(colorA + EvalSH(i * 2u * kShWords, QuatToMat(k.rotA) * local), 0.0);
+        colorB = max(colorB + EvalSH((i * 2u + 1u) * kShWords, QuatToMat(k.rotB) * local), 0.0);
+    }
+    vec3 color = clamp(mix(colorA, colorB, ei), 0.0, 1.0);
 
     // Sigma = (R S)(R S)^T
-    mat3 M = QuatToMat(rot) * mat3(scale.x, 0.0, 0.0, 0.0, scale.y, 0.0, 0.0, 0.0, scale.z);
+    mat3 M = Rt * mat3(scale.x, 0.0, 0.0, 0.0, scale.y, 0.0, 0.0, 0.0, scale.z);
     mat3 Sigma = M * transpose(M);
 
     // ---- project (splat.vert) ----

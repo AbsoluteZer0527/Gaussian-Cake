@@ -24,4 +24,13 @@ public:
 
     void Update(float deltaTime);
     void Draw(glm::mat4 viewProjection);
+
+    // Frees the GL objects (needs the context; safe to call twice).
+    void ReleaseGL();
+
+private:
+    GLuint program = 0, vao = 0, vbo = 0;
+    size_t vboCapacity = 0;          // particles the VBO has room for
+    bool needsPointSprite = false;   // compatibility profile: see Draw
+    std::vector<glm::vec3> staging;  // positions uploaded each frame
 };
