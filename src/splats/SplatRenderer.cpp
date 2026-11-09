@@ -207,7 +207,13 @@ static GLuint MakeStorage(size_t bytes, const void* data = nullptr) {
     return buf;
 }
 
-void SplatRenderer::SetClock(float wave, float cohesionExp, float midGrow) {
+void SplatRenderer::SetClock(float wave, float cohesionExp, float midGrow,
+                             const MorphCurve* early, const MorphCurve* late) {
+    useCurves = early && late;
+    if (useCurves) {
+        curveEarly = glm::vec4(early->p1, early->p2);
+        curveLate  = glm::vec4(late->p1, late->p2);
+    }
     waveWidth       = wave;
     waveCohesionExp = cohesionExp;
     waveMidGrow     = midGrow;
@@ -318,6 +324,9 @@ void SplatRenderer::DrawMorph(float e, float sizeMul, float stretchOn,
     glUniform1f(glGetUniformLocation(progPrep, "stretchOn"), stretchOn);
     glUniform1f(glGetUniformLocation(progPrep, "wave"), waveWidth);
     glUniform1f(glGetUniformLocation(progPrep, "cohesionExp"), waveCohesionExp);
+    glUniform1i(glGetUniformLocation(progPrep, "useCurves"), useCurves ? 1 : 0);
+    glUniform4fv(glGetUniformLocation(progPrep, "curveEarly"), 1, &curveEarly[0]);
+    glUniform4fv(glGetUniformLocation(progPrep, "curveLate"), 1, &curveLate[0]);
     glUniform1f(glGetUniformLocation(progPrep, "midGrow"), waveMidGrow);
     glUniform1i(glGetUniformLocation(progPrep, "hasSmooth"), gpuHasSmooth ? 1 : 0);
     glUniformMatrix4fv(glGetUniformLocation(progPrep, "view"), 1, GL_FALSE, glm::value_ptr(view));

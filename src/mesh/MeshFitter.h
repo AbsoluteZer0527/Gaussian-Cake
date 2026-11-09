@@ -19,12 +19,19 @@ struct FitParams {
     float backwardWeight  = 1.0f;   // pull from target samples to nearest template vertex
     int   relaxRounds     = 3;      // tangential relax + reproject after the fit
     bool  cotanLaplacian  = true;   // cotan (geometry-aware) vs uniform Laplacian regularizer
+
+    // Pins (landmarks): template vertex -> the target point it must land on,
+    // e.g. "this nose goes to that spout". The shape-keeping term carries the
+    // region around each pin along, so a few pins steer the whole fit.
+    std::vector<std::pair<int, glm::vec3>> pins;
+    float pinWeight       = 50.0f;
 };
 
 struct FitStats {
     float meanDist = 0.0f;   // template-to-target distance before the final lock
     float maxDist  = 0.0f;
     int   flipped  = 0;      // faces whose normal turned > 90 deg vs. the pre-aligned template
+    float pinError = 0.0f;   // mean distance of the pinned vertices to their targets, before the lock
     double ms      = 0.0;
 };
 

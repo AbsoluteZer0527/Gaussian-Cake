@@ -1,5 +1,6 @@
 #pragma once
 #include "core.h"
+#include "MorphCurve.h"
 #include <Eigen/Sparse>
 #include <vector>
 
@@ -34,6 +35,13 @@ Eigen::MatrixXd HeatStep(const Eigen::SparseMatrix<double>& L, const Eigen::Vect
 std::vector<float> HeatWaveDelay(const std::vector<glm::vec3>& pos, float cellSize,
                                  double sigma, double seedFraction, int maxSolve = 20000);
 
+// The same wave from another source: the highest points (Top), or the points
+// nearest seedPoint (Point; e.g. where the user clicked). Bottom is the above.
+enum class WaveSeed { Bottom, Top, Point };
+std::vector<float> HeatWaveDelay(const std::vector<glm::vec3>& pos, float cellSize,
+                                 double sigma, double seedFraction,
+                                 WaveSeed seed, const glm::vec3& seedPoint, int maxSolve = 20000);
+
 // A splat's own time on the timeline e when it leaves after `delay` of a wave
 // of width `wave` (0 = everyone leaves together, then this returns e). Exact
 // at the ends (e = 0 -> 0, e = 1 -> 1); easing overshoot past either end is kept.
@@ -47,4 +55,7 @@ struct SplatClock {
     float grow;         // mid-flight size factor, 1 + midGrow 4e(1-e)
     float stretchExp;   // exponent of its area stretch, 4e(1-e)
 };
-SplatClock SplatClockAt(float e, float wave, float delay, float cohesionExp, float midGrow);
+// early / late: the style's timing curves (MorphCurve), applied after the wave
+// and blended by the delay; null = e is already eased (no curves).
+SplatClock SplatClockAt(float e, float wave, float delay, float cohesionExp, float midGrow,
+                        const MorphCurve* early = nullptr, const MorphCurve* late = nullptr);

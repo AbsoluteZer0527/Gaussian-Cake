@@ -18,6 +18,7 @@ out vec2 fragUV;
 out vec2 fragUVB;            // shader.frag's morph-texture inputs: same as above here
 out vec3 fragAlbedoA;
 out vec3 fragAlbedoB;
+out float fragT;             // shader.frag's per-vertex morph time: unused here
 
 
 void main()
@@ -32,4 +33,5 @@ void main()
 	fragUVB = uv;
 	fragAlbedoA = color;
 	fragAlbedoB = color;
+	fragT = 0.0;
 }

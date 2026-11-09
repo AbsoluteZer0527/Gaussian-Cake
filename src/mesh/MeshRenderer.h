@@ -37,6 +37,13 @@ public:
     void UpdatePositions(const std::vector<glm::vec3>& positions,
                          const std::vector<glm::vec3>& colors = {});
 
+    // Morph-target mode: give every vertex its own time (the Morph Director's
+    // wave, curves and springs), one float per vertex, sent each frame. The
+    // vertex shader then blends with these instead of morphT.
+    void SetVertexTimes(const std::vector<float>& times);
+    void ClearVertexTimes();
+    bool HasVertexTimes() const { return hasVertexTimes; }
+
     // Render as GL_TRIANGLES using the provided shader program.
     void Draw(GLuint shaderProgram, const glm::mat4& viewProj);
 
@@ -44,6 +51,7 @@ public:
     glm::vec3 diffuseColor;
     float     alpha;          // 0.0 = fully transparent, 1.0 = fully opaque
     float     morphT;         // blend between the two shapes in morph-target mode
+    float     sag = 0.0f;     // morph-target mode: mid-flight droop (morph.vert)
 
     bool isInitialized;
     bool IsMorphTarget() const { return morphTarget; }
@@ -60,6 +68,9 @@ private:
     GLuint vboColor;      // per-vertex colours (location 4), end colours (location 5)
     GLuint vboColorEnd;
     GLuint ebo;
+    GLuint vboTime = 0;   // per-vertex times (location 8), SetVertexTimes
+    int    timeCapacity = 0;
+    bool   hasVertexTimes = false;
 
     int vertexCount;
     int indexCount;

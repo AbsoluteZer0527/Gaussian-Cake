@@ -52,6 +52,12 @@ public:
                     const MeshData& dataA, const MeshData& dataB,
                     TextureCache& textures);
 
+    // Per-vertex times (Morph Director), one per template vertex; each
+    // corner takes its vertex's time. Clear to go back to morphT.
+    void SetVertexTimes(const std::vector<float>& times);
+    void ClearVertexTimes();
+    float sag = 0.0f;   // mid-flight droop (morph.vert)
+
     // Draw with a program built from morph.vert + shader.frag.
     void Draw(GLuint shaderProgram, const glm::mat4& viewProj, float morphT);
     bool IsInitialized() const { return vao != 0; }
@@ -76,6 +82,10 @@ private:
     };
 
     GLuint vao = 0, vbo = 0;       // no index buffer: corners aren't shared
+    GLuint vboTime = 0;            // per-corner times (location 8)
+    std::vector<unsigned int> cornerVertex;   // template vertex of every uploaded corner
+    std::vector<float> cornerTimes;
+    bool hasVertexTimes = false;
     std::vector<Range> ranges;
     std::vector<GLuint> texturesA, texturesB;   // per material of A / B (0 = untextured; owned by the TextureCache)
 

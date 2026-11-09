@@ -167,6 +167,13 @@ std::vector<glm::vec3> MeshFitter::Fit(const IndexedMesh& tmpl,
     std::vector<float>     fwdW(n);
     std::vector<Eigen::Matrix3d> R(n);
 
+    // pinned vertices: pulled to their target only (not to the closest point)
+    std::vector<int> pinOf(n, -1);
+    for (size_t k = 0; k < params.pins.size(); ++k) {
+        int v = params.pins[k].first;
+        if (v >= 0 && v < n) pinOf[v] = (int)k;
+    }
+
     const float cosMin = params.normalCosMin;
     const float kReg = 1e-4f;   // keeps parts without matches from drifting
 
@@ -217,6 +224,10 @@ std::vector<glm::vec3> MeshFitter::Fit(const IndexedMesh& tmpl,
                 double w = fwdW[i] + wb + kReg;
                 Eigen::Vector3d c = fwdW[i] * ToE(fwdPoint[i]) + kReg * ToE(X[i]);
                 if (bwdCount[i] > 0) c += wb * ToE(bwdSum[i] / (float)bwdCount[i]);
+                if (pinOf[i] >= 0) {
+                    w = params.pinWeight + kReg;
+                    c = params.pinWeight * ToE(params.pins[pinOf[i]].second) + kReg * ToE(X[i]);
+                }
                 W(i) = w;
                 rhs.row(i) += c.transpose();
             }
@@ -240,14 +251,24 @@ std::vector<glm::vec3> MeshFitter::Fit(const IndexedMesh& tmpl,
     std::vector<float> dist(n);
     ParallelFor(n, [&](int i) { dist[i] = std::sqrt(bvh.Closest(X[i]).dist2); });
 
+    float pinSum = 0.0f;
+    int pinCount = 0;
+    for (int i = 0; i < n; ++i) {
+        if (pinOf[i] < 0) continue;
+        pinSum += glm::length(X[i] - params.pins[pinOf[i]].second);
+        ++pinCount;
+    }
+
     // final lock: exactly onto the target, then even out the triangles by
-    // tangential relaxation + reprojection
-    ParallelFor(n, [&](int i) { X[i] = bvh.Closest(X[i]).point; });
+    // tangential relaxation + reprojection (pins land exactly on their points)
+    ParallelFor(n, [&](int i) {
+        X[i] = pinOf[i] >= 0 ? params.pins[pinOf[i]].second : bvh.Closest(X[i]).point;
+    });
     for (int r = 0; r < params.relaxRounds; ++r) {
         std::vector<glm::vec3> nrm = MeshTopology::VertexNormals(tmpl, X);
         std::vector<glm::vec3> next = X;
         ParallelFor(n, [&](int i) {
-            if (rings[i].empty()) return;
+            if (rings[i].empty() || pinOf[i] >= 0) return;
             glm::vec3 c(0.0f);
             for (int j : rings[i]) c += X[j];
             c /= (float)rings[i].size();
@@ -273,6 +294,7 @@ std::vector<glm::vec3> MeshFitter::Fit(const IndexedMesh& tmpl,
             if (glm::dot(n0, n1) < 0.0f) ++flipped;
         }
         stats->flipped = flipped;
+        stats->pinError = pinCount ? pinSum / pinCount : 0.0f;
         stats->ms = std::chrono::duration<double, std::milli>(
                         std::chrono::high_resolution_clock::now() - t0).count();
     }

@@ -66,9 +66,19 @@ void print_versions() {
 //        [--method auto|shared|sdf|piecewise] [--transport greedy|gaussian|mixture]
 //        [--k 8] [--times 0,0.5,1] [--size 1280x800] [--nogui 1]
 //        [--sh 0..3] [--azimuth deg] [--distance d] [--up asis|flipy] [--gpu 0] [--temp x]
+//        Morph Director: [--keys a.obj,b.obj,c.obj] [--style classic|bake|ripple|melt|pop|dissolve]
+//        [--origin x,y,z] [--pin ax,ay,az:bx,by,bz] (repeatable) [--jiggle 0..1] [--wave 0..0.8]
+//        [--sag x] [--tool origin|paint|pin] (show the tool overlay)
+//        [--click x,y] (repeatable: a click of the tool at that pixel, after the bake, at time 0)
 // Bakes A -> B, then saves <prefix>_t<time>.ppm for every time and exits.
 struct ScriptArgs {
     std::string shot, mode, a, b, method, transport;
+    std::vector<std::string> keys;          // Morph Director timeline (overrides a / b)
+    std::string style, tool;
+    std::vector<glm::vec3> origin;          // 0 or 1 entries
+    std::vector<MorphPin> pins;
+    float jiggle = -1.0f, wave = -1.0f, sag = -1.0f;
+    std::vector<glm::vec2> clicks;          // tool clicks (window pixels) before the shots
     std::vector<float> times = { 0.0f, 0.5f, 1.0f };
     int width = 800, height = 600, k = -1;
     int gpu = -1;               // 0 = force the CPU paths
@@ -95,6 +105,33 @@ static bool ParseArgs(int argc, char** argv, ScriptArgs& args) {
         else if (key == "--up")        Window::plyOptions.up = val == "asis" ? PlyLoadOptions::Up::AsIs
                                                                              : PlyLoadOptions::Up::FlipY;
         else if (key == "--size")      sscanf(val.c_str(), "%dx%d", &args.width, &args.height);
+        else if (key == "--style")     args.style = val;
+        else if (key == "--tool")      args.tool = val;
+        else if (key == "--jiggle")    args.jiggle = std::stof(val);
+        else if (key == "--wave")      args.wave = std::stof(val);
+        else if (key == "--sag")       args.sag = std::stof(val);
+        else if (key == "--click") {
+            glm::vec2 c;
+            if (sscanf(val.c_str(), "%f,%f", &c.x, &c.y) != 2) { std::cerr << "--click x,y\n"; return false; }
+            args.clicks.push_back(c);
+        } else if (key == "--origin") {
+            glm::vec3 o;
+            if (sscanf(val.c_str(), "%f,%f,%f", &o.x, &o.y, &o.z) != 3) { std::cerr << "--origin x,y,z\n"; return false; }
+            args.origin = { o };
+        } else if (key == "--pin") {
+            MorphPin p;
+            if (sscanf(val.c_str(), "%f,%f,%f:%f,%f,%f", &p.onA.x, &p.onA.y, &p.onA.z,
+                       &p.onB.x, &p.onB.y, &p.onB.z) != 6) { std::cerr << "--pin ax,ay,az:bx,by,bz\n"; return false; }
+            args.pins.push_back(p);
+        } else if (key == "--keys") {
+            size_t pos = 0;
+            while (pos < val.size()) {
+                size_t comma = val.find(',', pos);
+                if (comma == std::string::npos) comma = val.size();
+                args.keys.push_back(val.substr(pos, comma - pos));
+                pos = comma + 1;
+            }
+        }
         else if (key == "--times") {
             args.times.clear();
             size_t pos = 0;
@@ -143,6 +180,41 @@ static int RunScript(GLFWwindow* window, const ScriptArgs& args) {
     Window::meshIndexA = a;
     Window::meshIndexB = b;
 
+    // Morph Director: the shape timeline and the first step's style
+    MorphTimeline& tl = Window::timeline;
+    tl.keys = { a, b };
+    if (!args.keys.empty()) {
+        tl.keys.clear();
+        for (const std::string& k : args.keys) {
+            int idx = MeshIndexByName(k);
+            if (idx < 0) return EXIT_FAILURE;
+            tl.keys.push_back(idx);
+        }
+        Window::meshIndexA = tl.keys[0];
+        Window::meshIndexB = tl.keys[1];
+    }
+    tl.SyncSegments();
+    for (size_t k = 0; k < tl.segs.size(); ++k) {
+        if (!args.style.empty()) {
+            int st = FindStyle(args.style);
+            if (st < 0) { std::cerr << "[Script] no style named " << args.style << "\n"; return EXIT_FAILURE; }
+            tl.ApplyPreset((int)k, st);
+        }
+        MorphStyle& style = tl.segs[k].style;
+        if (args.jiggle >= 0.0f) style.jiggle = args.jiggle;
+        if (args.wave >= 0.0f)   style.wave = args.wave;
+        if (args.sag >= 0.0f)    style.sag = args.sag;
+    }
+    tl.segs[0].pins = args.pins;
+    if (!args.origin.empty()) {
+        Window::director.origin = args.origin[0];
+        Window::director.hasOrigin = true;
+        for (auto& seg : tl.segs) seg.style.origin = OriginMode::Clicked;
+    }
+    if (args.tool == "origin") Window::director.tool = MorphDirector::Tool::Origin;
+    if (args.tool == "paint")  Window::director.tool = MorphDirector::Tool::PaintEarly;
+    if (args.tool == "pin")    Window::director.tool = MorphDirector::Tool::Pin;
+
     if (args.azimuth > -999.0f) Cam->SetAzimuth(args.azimuth);
     if (args.gpu == 0) Window::useGpu = false;
     if (args.distance > 0.0f) Cam->SetDistance(args.distance);
@@ -165,6 +237,18 @@ static int RunScript(GLFWwindow* window, const ScriptArgs& args) {
         }
     }
     std::cout << "[Script] bake finished in " << glfwGetTime() - start << " s\n";
+
+    if (!args.clicks.empty()) {
+        Window::animator->Seek(0.0f);
+        for (int i = 0; i < 3; ++i) Frame(window);
+        for (const glm::vec2& c : args.clicks) {
+            Window::ToolClick(c.x, c.y);
+            Frame(window);
+        }
+        std::cout << "[Script] origin " << (Window::director.hasOrigin ? "set" : "not set") << " at "
+                  << Window::director.origin.x << ", " << Window::director.origin.y << ", "
+                  << Window::director.origin.z << "; " << Window::timeline.segs[0].pins.size() << " pins\n";
+    }
 
     for (float t : args.times) {
         Window::animator->Seek(t);

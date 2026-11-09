@@ -19,6 +19,7 @@ MeshRenderer::~MeshRenderer() {
     if (vboColor)   glDeleteBuffers(1, &vboColor);
     if (vboColorEnd) glDeleteBuffers(1, &vboColorEnd);
     if (ebo)        glDeleteBuffers(1, &ebo);
+    if (vboTime)    glDeleteBuffers(1, &vboTime);
 }
 
 // Upload one vec3 attribute buffer and bind it to a vertex attribute location
@@ -61,6 +62,8 @@ void MeshRenderer::Initialize(const std::vector<glm::vec3>& positions,
     glDisableVertexAttribArray(2);
     glDisableVertexAttribArray(3);
     glDisableVertexAttribArray(5);
+    glDisableVertexAttribArray(8);
+    hasVertexTimes = false;
 
     // Colours at location 4, if there's one per vertex
     hasColors = (colors.size() == positions.size());
@@ -140,6 +143,31 @@ void MeshRenderer::UpdatePositions(const std::vector<glm::vec3>& positions,
     }
 }
 
+void MeshRenderer::SetVertexTimes(const std::vector<float>& times) {
+    if (!isInitialized || (int)times.size() != vertexCount) return;
+    glBindVertexArray(vao);
+    if (!vboTime) glGenBuffers(1, &vboTime);
+    glBindBuffer(GL_ARRAY_BUFFER, vboTime);
+    if (timeCapacity < vertexCount) {
+        glBufferData(GL_ARRAY_BUFFER, times.size() * sizeof(float), times.data(), GL_DYNAMIC_DRAW);
+        timeCapacity = vertexCount;
+    } else {
+        glBufferSubData(GL_ARRAY_BUFFER, 0, times.size() * sizeof(float), times.data());
+    }
+    glEnableVertexAttribArray(8);
+    glVertexAttribPointer(8, 1, GL_FLOAT, GL_FALSE, sizeof(float), (void*)0);
+    glBindVertexArray(0);
+    hasVertexTimes = true;
+}
+
+void MeshRenderer::ClearVertexTimes() {
+    if (!hasVertexTimes) return;
+    glBindVertexArray(vao);
+    glDisableVertexAttribArray(8);
+    glBindVertexArray(0);
+    hasVertexTimes = false;
+}
+
 void MeshRenderer::Draw(GLuint shaderProgram, const glm::mat4& viewProj) {
     if (!isInitialized) return;
 
@@ -160,6 +188,10 @@ void MeshRenderer::Draw(GLuint shaderProgram, const glm::mat4& viewProj) {
     if (locAlpha >= 0) glUniform1f(locAlpha, alpha);
     if (locMorph >= 0) glUniform1f(locMorph, morphT);
     if (locColor >= 0) glUniform1i(locColor, hasColors ? 1 : 0);
+    GLint locPerVertex = glGetUniformLocation(shaderProgram, "usePerVertexT");
+    GLint locSag       = glGetUniformLocation(shaderProgram, "sag");
+    if (locPerVertex >= 0) glUniform1i(locPerVertex, (morphTarget && hasVertexTimes) ? 1 : 0);
+    if (locSag       >= 0) glUniform1f(locSag, morphTarget ? sag : 0.0f);
 
     glEnable(GL_DEPTH_TEST);
 

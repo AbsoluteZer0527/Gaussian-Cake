@@ -115,9 +115,20 @@ Eigen::MatrixXd HeatStep(const SpMat& L, const Eigen::VectorXd& mass,
     return x;
 }
 
-// Delay by heat on exactly these points: rank of the heat from the bottom
+// Where the wave starts: the seed key orders the points from the source
+// outward (lowest y, highest y, or nearest the seed point first).
+static float SeedKey(const glm::vec3& p, WaveSeed seed, const glm::vec3& point) {
+    switch (seed) {
+        case WaveSeed::Top:   return -p.y;
+        case WaveSeed::Point: return Dist2(p, point);
+        default:              return p.y;
+    }
+}
+
+// Delay by heat on exactly these points: rank of the heat from the source
 static std::vector<float> SolvedWaveDelay(const std::vector<glm::vec3>& pos, float cellSize,
-                                          double sigma, double seedFraction) {
+                                          double sigma, double seedFraction,
+                                          WaveSeed seed, const glm::vec3& seedPoint) {
     const int n = (int)pos.size();
     const int k = 8;
     std::vector<int> knn = NearestNeighbors(pos, k, cellSize);
@@ -125,12 +136,14 @@ static std::vector<float> SolvedWaveDelay(const std::vector<glm::vec3>& pos, flo
     Eigen::VectorXd mass;
     SplatGraphLaplacian(pos, knn, k, L, mass);
 
-    // Order the points from the bottom up
+    // Order the points from the source outward (bottom up for the default)
+    std::vector<float> key(n);
+    for (int i = 0; i < n; ++i) key[i] = SeedKey(pos[i], seed, seedPoint);
     std::vector<int> byHeight(n);
     std::iota(byHeight.begin(), byHeight.end(), 0);
-    std::sort(byHeight.begin(), byHeight.end(), [&](int a, int b) { return pos[a].y < pos[b].y; });
+    std::sort(byHeight.begin(), byHeight.end(), [&](int a, int b) { return key[a] < key[b]; });
 
-    // Heat source: the lowest points (the "pan")
+    // Heat source: the lowest points (the "pan"), or the ones nearest the seed
     int seeds = std::max(1, (int)std::lround(seedFraction * n));
     Eigen::MatrixXd source = Eigen::MatrixXd::Zero(n, 1);
     for (int r = 0; r < seeds; ++r) source(byHeight[r], 0) = 1.0;
@@ -161,16 +174,22 @@ static std::vector<float> SolvedWaveDelay(const std::vector<glm::vec3>& pos, flo
 
 std::vector<float> HeatWaveDelay(const std::vector<glm::vec3>& pos, float cellSize,
                                  double sigma, double seedFraction, int maxSolve) {
+    return HeatWaveDelay(pos, cellSize, sigma, seedFraction, WaveSeed::Bottom, glm::vec3(0.0f), maxSolve);
+}
+
+std::vector<float> HeatWaveDelay(const std::vector<glm::vec3>& pos, float cellSize,
+                                 double sigma, double seedFraction,
+                                 WaveSeed seed, const glm::vec3& seedPoint, int maxSolve) {
     const int n = (int)pos.size();
     if (n < 2) return std::vector<float>(n, 0.0f);
-    if (n <= maxSolve) return SolvedWaveDelay(pos, cellSize, sigma, seedFraction);
+    if (n <= maxSolve) return SolvedWaveDelay(pos, cellSize, sigma, seedFraction, seed, seedPoint);
 
     // Every stride-th point; they're spaced sqrt(stride) times wider apart
     const int stride = (n + maxSolve - 1) / maxSolve;
     std::vector<glm::vec3> sub;
     for (int i = 0; i < n; i += stride) sub.push_back(pos[i]);
     float subCell = cellSize * std::sqrt((float)stride);
-    std::vector<float> subDelay = SolvedWaveDelay(sub, subCell, sigma, seedFraction);
+    std::vector<float> subDelay = SolvedWaveDelay(sub, subCell, sigma, seedFraction, seed, seedPoint);
 
     // Each point takes its nearest solved point's delay...
     PointGrid grid;
@@ -180,12 +199,14 @@ std::vector<float> HeatWaveDelay(const std::vector<glm::vec3>& pos, float cellSi
         coarse[i] = subDelay[grid.Nearest(pos[i])];
     });
 
-    // ...then re-rank, so delays are evenly spread again (ties: bottom first)
+    // ...then re-rank, so delays are evenly spread again (ties: nearest the source first)
+    std::vector<float> key(n);
+    for (int i = 0; i < n; ++i) key[i] = SeedKey(pos[i], seed, seedPoint);
     std::vector<int> order(n);
     std::iota(order.begin(), order.end(), 0);
     std::sort(order.begin(), order.end(), [&](int a, int b) {
         if (coarse[a] != coarse[b]) return coarse[a] < coarse[b];
-        return pos[a].y < pos[b].y;
+        return key[a] < key[b];
     });
     std::vector<float> delay(n);
     for (int r = 0; r < n; ++r) delay[order[r]] = (float)r / (float)(n - 1);
@@ -200,9 +221,14 @@ float WaveTime(float e, float wave, float delay) {
     return std::clamp(local, 0.0f, 1.0f) + overshoot;
 }
 
-SplatClock SplatClockAt(float e, float wave, float delay, float cohesionExp, float midGrow) {
+SplatClock SplatClockAt(float e, float wave, float delay, float cohesionExp, float midGrow,
+                        const MorphCurve* early, const MorphCurve* late) {
     SplatClock clock;
     clock.e = WaveTime(e, wave, delay);
+    if (early && late) {   // the style's timing curves (e is then the linear timeline)
+        float d = std::clamp(delay, 0.0f, 1.0f);
+        clock.e = (1.0f - d) * early->Eval(clock.e) + d * late->Eval(clock.e);
+    }
     clock.g = std::pow(std::max(clock.e, 0.0f), cohesionExp);
     float t = std::clamp(clock.e, 0.0f, 1.0f);
     float bump = 4.0f * t * (1.0f - t);   // 0 at both ends, 1 halfway

@@ -40,6 +40,9 @@ uniform float wave;       // heat-wave width, 0 = off (all splats share e)
 uniform float cohesionExp;   // cohesion weight g = e^cohesionExp
 uniform float midGrow;    // mid-flight size boost: grow = 1 + midGrow 4e(1-e)
 uniform int   hasSmooth;
+uniform int   useCurves;    // 1: e is the linear timeline, eased per splat by the curves below
+uniform vec4  curveEarly;   // MorphCurve handles (p1.x, p1.y, p2.x, p2.y) of the first splats
+uniform vec4  curveLate;    // ...and of the last ones the wave reaches
 uniform mat4  view;
 uniform mat4  proj;
 uniform vec2  viewport;   // pixels
@@ -108,6 +111,24 @@ void Cull(uint i) {
     sortVals[i] = i;
 }
 
+// MorphCurve::Eval (MorphCurve.cpp), line for line: bisection on x(s), then y(s)
+const int kCurveSteps = 20;
+float Bez(float a, float b, float s) {
+    float r = 1.0 - s;
+    return 3.0 * r * r * s * a + 3.0 * r * s * s * b + s * s * s;
+}
+float CurveEval(vec4 c, float x) {
+    if (x <= 0.0) return 0.0;
+    if (x >= 1.0) return 1.0;
+    float x1 = clamp(c.x, 0.0, 1.0), x2 = clamp(c.z, 0.0, 1.0);
+    float lo = 0.0, hi = 1.0;
+    for (int i = 0; i < kCurveSteps; ++i) {
+        float mid = 0.5 * (lo + hi);
+        if (Bez(x1, x2, mid) < x) lo = mid; else hi = mid;
+    }
+    return Bez(c.y, c.w, 0.5 * (lo + hi));
+}
+
 void main() {
     uint i = gl_GlobalInvocationID.x;
     if (i >= count) return;
@@ -119,6 +140,10 @@ void main() {
         float inside = clamp(e, 0.0, 1.0);
         float local = (inside - wave * k.colorA.w) / (1.0 - wave);
         ei = clamp(local, 0.0, 1.0) + (e - inside);   // keeps easing overshoot
+    }
+    if (useCurves == 1) {
+        float d = clamp(k.colorA.w, 0.0, 1.0);
+        ei = (1.0 - d) * CurveEval(curveEarly, ei) + d * CurveEval(curveLate, ei);
     }
     float gi = pow(max(ei, 0.0), cohesionExp);
     float tc = clamp(ei, 0.0, 1.0);

@@ -9,6 +9,7 @@ in vec2 fragUV;
 in vec3 fragAlbedoA;         // morph.vert: the start and end colours, unmixed
 in vec3 fragAlbedoB;
 in vec2 fragUVB;             // morph.vert: B's uv
+in float fragT;              // morph.vert: the vertex's own time (Morph Director)
 
 // uniforms used for lighting
 uniform vec3 AmbientColor = vec3(0.2);
@@ -26,6 +27,7 @@ uniform int   useMorphTexture = 0;
 uniform int   useTextureB = 0;     // 1: side B multiplies by albedoTexB at fragUVB
 uniform sampler2D albedoTexB;
 uniform float morphT;
+uniform int   usePerVertexT = 0;   // 1: blend the textures by fragT instead of morphT
 
 out vec4 fragColor;
 
@@ -45,7 +47,8 @@ void main()
 		if (useTexture != 0) a *= texture(albedoTex, fragUV).rgb;
 		vec3 b = fragAlbedoB;
 		if (useTextureB != 0) b *= texture(albedoTexB, fragUVB).rgb;
-		vec3 c = mix(a, b, clamp(morphT, 0.0, 1.0));   // easing can overshoot
+		float t = (usePerVertexT == 1) ? fragT : morphT;
+		vec3 c = mix(a, b, clamp(t, 0.0, 1.0));   // easing can overshoot
 		albedo = c * c;
 	} else if (useVertexColor != 0) {
 		vec3 c = fragAlbedo * MaterialColor;

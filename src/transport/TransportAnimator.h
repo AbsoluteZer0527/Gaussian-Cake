@@ -45,6 +45,9 @@ public:
     bool IsTransporting() const { return state == AnimationState::BAKING; }
     float GetProgress()   const { return transportProgress; }
     bool  IsReversing()   const { return direction < 0.0f; }
+    // Held by Seek (anywhere on the timeline, ends included) until the next
+    // Start / Reverse / Reset.
+    bool  IsHeld()        const { return held; }
 
     // Eased blend weight toward B for the current point on the timeline.
     // 0 = fully A, 1 = fully B, in both playback directions.
@@ -64,4 +67,5 @@ private:
     std::vector<glm::vec3> startPos;
     std::vector<glm::vec3> destPos;
     float direction;           // +1 playing A -> B, -1 playing B -> A
+    bool  held = false;        // Seek put it here
 };

@@ -8,6 +8,7 @@ TransportAnimator::TransportAnimator() {
     transportDuration = 3.0f;
     transportProgress = 0.0f;
     direction = 1.0f;
+    held = false;
     easingMode = EasingMode::EASE_IN_OUT;
 }
 
@@ -24,6 +25,7 @@ void TransportAnimator::Initialize(const std::vector<glm::vec3>& startPositions,
     state = AnimationState::GAUSSIAN_A;
     transportProgress = 0.0f;
     direction = 1.0f;
+    held = false;
 }
 
 void TransportAnimator::Update(float deltaTime, std::vector<glm::vec3>& outPositions) {
@@ -55,12 +57,14 @@ void TransportAnimator::InitializeWithEndPoints(const std::vector<glm::vec3>& st
     state = AnimationState::GAUSSIAN_A;
     transportProgress = 0.0f;
     direction = 1.0f;
+    held = false;
 }
 
 void TransportAnimator::StartTransport() {
     if (state != AnimationState::GAUSSIAN_A) return;
     transportProgress = 0.0f;
     direction = 1.0f;
+    held = false;
     state = AnimationState::BAKING;
 }
 
@@ -69,12 +73,14 @@ void TransportAnimator::ReverseTransport() {
     //play the same timeline backwards; endpoints stay A -> B
     transportProgress = 1.0f;
     direction = -1.0f;
+    held = false;
     state = AnimationState::BAKING;
 }
 
 void TransportAnimator::Seek(float t) {
     transportProgress = std::clamp(t, 0.0f, 1.0f);
     direction = 0.0f;              // Update keeps re-evaluating, but doesn't move
+    held = true;
     state = AnimationState::BAKING;
 }
 
@@ -82,6 +88,7 @@ void TransportAnimator::Reset() {
     state = AnimationState::GAUSSIAN_A;
     transportProgress = 0.0f;
     direction = 1.0f;
+    held = false;
 }
 
 float TransportAnimator::ApplyEasing(float t) const {

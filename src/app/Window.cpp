@@ -21,6 +21,9 @@
 #include "TexturedMeshRenderer.h"
 #include "MorphTexturedRenderer.h"
 #include "SplatHeat.h"
+#include "MorphDirector.h"
+#include "MorphTimeline.h"
+#include "Picking.h"
 
 #include <glm/gtc/quaternion.hpp>
 #include <chrono>
@@ -96,6 +99,32 @@ enum class MorphShown { None, A, Blend, B };
 static MorphShown                g_morphShown = MorphShown::None;
 static float                     g_lastSdfT   = -1.0f;
 
+// ---- Morph Director ----
+MorphTimeline Window::timeline;
+MorphDirector Window::director;
+// What is on screen right now, in the normalized space the morph works in:
+// the tools pick from these points, and the overlay recolours them.
+static std::vector<glm::vec3>    g_pickPoints;
+static std::vector<unsigned int> g_pickIndices;   // its triangles (empty: points only)
+static int  g_pickGen = 0;                        // bumped when the points change
+static MeshRenderer* g_overlayMesh = nullptr;     // the shown surface, coloured by the director
+static int  g_previewIndexOverride = -1;          // Pin tool: preview this mesh instead of A
+static bool g_toolDragging = false;               // a paint stroke is in progress
+static bool g_directorBoundToPreview = false;     // director holds the preview's points
+
+static void SetPickSurface(const std::vector<glm::vec3>& pts, const std::vector<unsigned int>& idx) {
+    g_pickPoints  = pts;
+    g_pickIndices = idx;
+    ++g_pickGen;
+}
+
+static void ShowPinStage(bool endShape);
+
+static bool OverlayActive() {
+    return Window::director.tool != MorphDirector::Tool::Orbit &&
+           Window::renderMode == RenderMode::TriangleMorph && !g_pickIndices.empty();
+}
+
 // Performance readout: smoothed CPU times (ms) and GPU timers
 static double    g_cpuUpdateMs = -1.0;   // idleCallback
 static double    g_cpuDrawMs   = -1.0;   // submitting this frame's scene draw
@@ -113,7 +142,7 @@ static double MsSince(std::chrono::steady_clock::time_point t0) {
 
 // Splat attributes for this frame on the GPU path (computed in idleCallback)
 static float g_splatE = 0.0f, g_splatStretchOn = 1.0f;
-static const float kSplatMidGrow = 0.3f;   // splats grow up to +30% halfway (SplatClockAt)
+static float g_splatMidGrow = 0.3f;   // splats grow up to +30% halfway (SplatClockAt); set by the style
 
 // Heat wave (HeatWaveDelay): only computed once the Heat Wave slider is above 0
 static const double kWaveSigma        = 0.6;    // how far the source's heat spreads (the shapes span about 2 units)
@@ -378,17 +407,18 @@ static std::vector<glm::vec3> ParticleSamples(int index, int count, unsigned int
 static void UpdateModePreview() {
     static int lastIndex = -1, lastCount = -1, lastMode = -1, lastGen = -1;
     int mode = (int)Window::renderMode;
-    if (lastIndex == Window::meshIndexA && lastCount == Window::particleCount &&
+    // the Pin tool shows the segment's end shape while it waits for the second click
+    int idx = g_previewIndexOverride >= 0 ? g_previewIndexOverride : Window::meshIndexA;
+    if (lastIndex == idx && lastCount == Window::particleCount &&
         lastMode == mode && lastGen == g_previewGen)
         return;
-    lastIndex = Window::meshIndexA; lastCount = Window::particleCount;
+    lastIndex = idx; lastCount = Window::particleCount;
     lastMode = mode; lastGen = g_previewGen;
 
     // keep the loaded source so changing the particle count doesn't reload it
     static MeshData mesh;
     const std::vector<Triangle>& tris = mesh.tris;
     static int loadedIndex = -1;
-    int idx = Window::meshIndexA;
     bool hasMesh = idx > 0 && idx <= (int)Window::meshPaths.size() &&
                    !IsCapture(Window::meshPaths[idx - 1]);   // captures: Splats mode only
     if (hasMesh && loadedIndex != idx) {
@@ -409,6 +439,7 @@ static void UpdateModePreview() {
         }
         g_previewMesh->alpha = 1.0f;
         g_previewMesh->Initialize(m.verts, m.indices);
+        SetPickSurface(m.verts, m.indices);
         g_previewIsTextured = mesh.HasAppearance();
         if (g_previewIsTextured) {
             if (!g_previewTextured) g_previewTextured = new TexturedMeshRenderer();
@@ -599,6 +630,33 @@ void Window::resizeCallback(GLFWwindow* window, int width, int height) {
 }
 
 //update and draw functions
+// The timeline's first two keys and Source / Target are the same shapes:
+// in Topology mode the timeline leads, in the other modes the combos do.
+static void SyncTimelineKeys() {
+    MorphTimeline& tl = Window::timeline;
+    tl.SyncSegments();
+    if (Window::renderMode == RenderMode::TriangleMorph) {
+        Window::meshIndexA = tl.keys[0];
+        Window::meshIndexB = tl.keys[1];
+    } else {
+        tl.keys[0] = Window::meshIndexA;
+        tl.keys[1] = Window::meshIndexB;
+    }
+    // Before a bake the director works on the preview's points, so the wave
+    // and paint can be seen (and placed) on the source shape right away
+    static int boundGen = -1;
+    bool baked = Window::trueMorphActive || Window::splatMorphActive;
+    if (!baked && Window::renderMode == RenderMode::TriangleMorph && !g_pickPoints.empty() &&
+        (!g_directorBoundToPreview || boundGen != g_pickGen)) {
+        boundGen = g_pickGen;
+        // slot 0: the preview is the first key; -1 while the Pin tool shows the end shape
+        Window::director.Bind(g_pickPoints, 0.0f, g_previewIndexOverride >= 0 ? -1 : 0);
+        g_directorBoundToPreview = true;
+    }
+    if (g_directorBoundToPreview && Window::renderMode == RenderMode::TriangleMorph)
+        Window::director.UpdateDelay(tl.segs[tl.selected].style.origin);
+}
+
 void Window::idleCallback() {
     Cam->Update();
 
@@ -610,6 +668,7 @@ void Window::idleCallback() {
     deltaTime = glm::min(deltaTime, 0.05f);
 
     auto cpuStart = std::chrono::steady_clock::now();
+    SyncTimelineKeys();
     PollSplatBake();
     PollTrueMorphBake();
 
@@ -619,7 +678,14 @@ void Window::idleCallback() {
         static std::vector<glm::vec3> unused;
         animator->Update(deltaTime, unused);
 
-        float e = animator->GetBlend();
+        // Splats play the timeline's first segment, in its style: progress is
+        // linear here, each splat eases itself (wave, then the style's curves)
+        const MorphStyle& style = timeline.segs[0].style;
+        animator->transportDuration = timeline.segs[0].duration;
+        float e = animator->GetProgress();
+        splatWave     = style.wave;
+        splatCohesion = style.cohesion;
+        g_splatMidGrow = style.midGrow;
         EnsureSplatDelay();
 
         // Each splat's clock this frame (SplatClockAt):
@@ -629,14 +695,16 @@ void Window::idleCallback() {
         //   grow: splats spread apart while travelling, so they grow a little
         //     mid-flight (exact size at both ends).
         //   heat wave: each splat starts when the wave reaches it (its delay).
+        //   curves: then the style's timing curve (early / late blended by the delay).
         float cohesionExp = 1.0f + 4.0f * splatCohesion;
         bool smooth = splatSmoothDisp.size() == splatCurrent.size();
-        bool wave = splatWave > 0.0f && splatDelay.size() == splatCurrent.size();
+        bool hasDelay = splatDelay.size() == splatCurrent.size();
+        bool wave = splatWave > 0.0f && hasDelay;
         float waveWidth = wave ? splatWave : 0.0f;
 
         // GPU path: splat_prep.comp runs the loop below for every splat
         g_splatE = e;
-        splatRenderer->SetClock(waveWidth, cohesionExp, kSplatMidGrow);
+        splatRenderer->SetClock(waveWidth, cohesionExp, g_splatMidGrow, &style.early, &style.late);
         size_t cpuCount = SplatsOnGpu() ? 0 : splatCurrent.size();
 
         // Area-preserving size: each splat's tangent size also follows the OT
@@ -650,8 +718,9 @@ void Window::idleCallback() {
             const Splat& b = splatEnd[i];
             Splat& s = splatCurrent[i];
 
-            float delay = wave ? splatDelay[i] : 0.0f;
-            SplatClock clock = SplatClockAt(e, waveWidth, delay, cohesionExp, kSplatMidGrow);
+            float delay = hasDelay ? splatDelay[i] : 0.0f;
+            SplatClock clock = SplatClockAt(e, waveWidth, delay, cohesionExp, g_splatMidGrow,
+                                            &style.early, &style.late);
 
             if (smooth) {
                 glm::vec3 d = b.mean - a.mean;
@@ -681,8 +750,9 @@ void Window::idleCallback() {
         }
     } else if (trueMorphActive) {
         static std::vector<glm::vec3> unused;
+        animator->transportDuration = timeline.Total();
         animator->Update(deltaTime, unused);
-        UpdateTrueMorph();
+        UpdateTrueMorph(deltaTime);
     } else if (particleMorphActive) {
         animator->Update(deltaTime, particleSystem->transportPositions);
     }
@@ -690,6 +760,44 @@ void Window::idleCallback() {
     // after the animator, so particles show this frame's transport positions
     particleSystem->Update(deltaTime);
     SmoothMs(g_cpuUpdateMs, MsSince(cpuStart));
+}
+
+// With a Director tool active, draws the shown surface coloured by the
+// director (warm = leaves early, cool = late; origin and pins as dots).
+static void DrawDirectorOverlay() {
+    const MorphTimeline& tl = Window::timeline;
+    // which segment's pins, and which end of them, are on screen
+    int seg = tl.selected;
+    bool showB = g_previewIndexOverride >= 0 && g_previewIndexOverride == tl.keys[std::min(seg + 1, (int)tl.keys.size() - 1)];
+    if (Window::trueMorphActive) {
+        MorphTimeline::Place place = tl.Locate(Window::animator->GetProgress());
+        seg = place.seg;
+        showB = place.local >= 0.5f;
+    }
+    std::vector<glm::vec3> pins;
+    for (const MorphPin& p : tl.segs[seg].pins) pins.push_back(showB ? p.onB : p.onA);
+
+    static int lastGen = -1, lastVersion = -1;
+    static size_t lastPins = (size_t)-1;
+    static bool lastWaiting = false;
+    static glm::vec3 lastOrigin(1e9f);
+    const MorphDirector& d = Window::director;
+    if (!g_overlayMesh) {
+        g_overlayMesh = new MeshRenderer();
+        g_overlayMesh->diffuseColor = Window::meshRenderer->diffuseColor;
+    }
+    if (lastGen != g_pickGen || lastVersion != d.DelayVersion() || lastPins != pins.size() ||
+        lastWaiting != d.pinWaitingForB || lastOrigin != d.origin || !g_overlayMesh->isInitialized) {
+        std::vector<glm::vec3> colors = d.OverlayColors(g_pickPoints, pins);
+        if (lastGen == g_pickGen && g_overlayMesh->isInitialized &&
+            g_overlayMesh->VertexCount() == (int)g_pickPoints.size())
+            g_overlayMesh->UpdatePositions(g_pickPoints, colors);
+        else
+            g_overlayMesh->Initialize(g_pickPoints, g_pickIndices, colors);
+        lastGen = g_pickGen; lastVersion = d.DelayVersion(); lastPins = pins.size();
+        lastWaiting = d.pinWaitingForB; lastOrigin = d.origin;
+    }
+    g_overlayMesh->Draw(Window::shaderProgram, Cam->GetViewProjectMtx());
 }
 
 void Window::displayCallback(GLFWwindow* window) {
@@ -712,6 +820,11 @@ void Window::displayCallback(GLFWwindow* window) {
                               Cam->GetViewMtx(), Cam->GetProjectMtx());
         else
             splatRenderer->Draw(splatCurrent, Cam->GetViewMtx(), Cam->GetProjectMtx());
+    } else if (renderMode == RenderMode::TriangleMorph && (trueMorphActive || meshIndexA > 0) &&
+               OverlayActive()) {
+        // a Director tool is active: the shown surface, coloured by when each part leaves
+        if (!trueMorphActive) UpdateModePreview();
+        DrawDirectorOverlay();
     } else if (renderMode == RenderMode::TriangleMorph && trueMorphActive) {
         if (g_sdfOnGpu && g_morphShown == MorphShown::Blend)
             g_gpuSdf->Draw(shaderProgram, Cam->GetViewProjectMtx(), meshRenderer->diffuseColor);
@@ -1392,7 +1505,7 @@ void Window::BakeSplatMorph(const std::string& pathA, const std::string& pathB) 
     st.posteriorTemp = posteriorTemp;
     st.colorMatch    = colorMatch;
     st.ply           = plyOptions;
-    st.heatWave      = splatWave > 0.0f;
+    st.heatWave      = false;   // the director computes the delays (EnsureSplatDelay)
 
     std::string key = SplatBakeKey(st);
     if (key == g_bakedSplatKey) {   // already baked: play it again
@@ -1455,16 +1568,26 @@ void Window::PollSplatBake() {
               << ", mean match distance " << res.meanMatchDist << ", " << res.ms << " ms\n";
 }
 
-// The heat wave's delays, computed the first time the Heat Wave slider is
-// above 0 for this bake (the bake skips them while it's at 0)
+// The splats' delays come from the director: the style's origin (bottom,
+// top, a clicked point) and any paint. Recomputed only when they change;
+// the GPU keyframes carry them, so then those go up again.
+static int g_splatDelayVersion = -1;
 static void EnsureSplatDelay() {
     const std::vector<Splat>& start = Window::splatStart;
-    if (Window::splatWave <= 0.0f || start.empty() || g_splatWaveCell <= 0.0f) return;
-    if (Window::splatDelay.size() == start.size()) return;
-
-    std::vector<glm::vec3> pos(start.size());
-    for (size_t i = 0; i < start.size(); ++i) pos[i] = start[i].mean;
-    Window::splatDelay = HeatWaveDelay(pos, g_splatWaveCell, kWaveSigma, kWaveSeedFraction);
+    if (start.empty()) return;
+    MorphDirector& d = Window::director;
+    if (d.Count() != start.size() || g_directorBoundToPreview) {
+        std::vector<glm::vec3> pos(start.size());
+        for (size_t i = 0; i < start.size(); ++i) pos[i] = start[i].mean;
+        d.Bind(pos, g_splatWaveCell, 0);
+        g_directorBoundToPreview = false;
+        SetPickSurface(pos, {});
+        g_splatDelayVersion = -1;
+    }
+    d.UpdateDelay(Window::timeline.segs[0].style.origin);
+    if (d.DelayVersion() == g_splatDelayVersion && Window::splatDelay.size() == start.size()) return;
+    g_splatDelayVersion = d.DelayVersion();
+    Window::splatDelay = d.Delay();
     if (Window::gpuAvailable)   // the delays live in the GPU keyframes too
         Window::splatRenderer->UploadKeyframes(start, Window::splatEnd, Window::splatSmoothDisp,
                                                Window::splatStretch, Window::splatDelay);
@@ -1607,8 +1730,8 @@ void Window::ComputeOTAndSpawnParticles() {
     splatMorphActive = false;
     trueMorphActive  = false;
 
-    if (renderMode == RenderMode::TriangleMorph && hasMeshA && hasMeshB) {
-        BakeTrueMorph(pathA, pathB);
+    if (renderMode == RenderMode::TriangleMorph) {
+        BakeTimeline();
         return;
     }
 
@@ -1735,6 +1858,7 @@ struct TrueMorphSettings {
     int   mixtureK;
     float sinkhornEps, posteriorTemp;
     glm::vec3 fallbackColor;   // display colour of a mesh without colours, beside one with them
+    std::vector<MorphPin> pins;   // Morph Director: points on A that must land on points on B
 };
 
 struct TrueMorphResult {
@@ -1847,6 +1971,16 @@ static TrueMorphResult RunTrueMorphBake(TrueMorphSettings st) {
         FitParams params;
         params.stiffnessScale = st.fitStiffness;
         params.cotanLaplacian = st.fitCotan;
+        // Pins: the template vertex nearest the pin's end on the template's
+        // shape must land on its other end (on the fitted shape)
+        if (!st.pins.empty()) {
+            PointGrid grid;
+            grid.Build(tmpl.verts, 0.05f);
+            for (const MorphPin& pin : st.pins) {
+                int v = grid.Nearest(templateIsA ? pin.onA : pin.onB);
+                if (v >= 0) params.pins.push_back({ v, templateIsA ? pin.onB : pin.onA });
+            }
+        }
         FitStats stats;
         std::vector<glm::vec3> fitted = MeshFitter::Fit(tmpl, aligned,
                                                         templateIsA ? trisB : trisA, params, &stats);
@@ -1867,12 +2001,16 @@ static TrueMorphResult RunTrueMorphBake(TrueMorphSettings st) {
                 res.sharedCorners = PullBackCorners(res.sharedStart, res.sharedEnd, res.sharedIndices, colorA, colorB);
         }
 
+        char pinText[96] = "";
+        if (!params.pins.empty())
+            snprintf(pinText, sizeof(pinText), " %d pins (off by %.3f before the lock).",
+                     (int)params.pins.size(), stats.pinError);
         snprintf(buf, sizeof(buf),
                  "Shared topology: %s (%d tris%s) fitted onto %s in %.0f ms. "
-                 "Mean error %.4f, %d folded tris.%s%s",
+                 "Mean error %.4f, %d folded tris.%s%s%s",
                  (templateIsA ? nameA : nameB).c_str(), tmpl.FaceCount(),
                  subdivided ? ", subdivided" : "", (templateIsA ? nameB : nameA).c_str(),
-                 stats.ms, stats.meanDist, stats.flipped,
+                 stats.ms, stats.meanDist, stats.flipped, pinText,
                  mismatch.empty() ? "" : " Warning: ", mismatch.c_str());
     } else {
         res.piecewise = st.method == MorphMethod::Piecewise ||
@@ -1936,13 +2074,34 @@ static TrueMorphResult RunTrueMorphBake(TrueMorphSettings st) {
         }
     }
     res.status = buf;
+    if (!res.shared && !st.pins.empty())
+        res.status += " Pins ignored: they only steer a shared-topology fit.";
     SetBakeStage(3, 1);
     std::cout << "[Morph] " << res.status << " (bake " << (int)MsSince(t0) << " ms)\n";
     res.ok = true;
     return res;
 }
 
-static std::future<TrueMorphResult> g_morphFuture;
+static std::string PinKey(const std::vector<MorphPin>& pins) {
+    std::string k;
+    char buf[160];
+    for (const MorphPin& p : pins) {
+        snprintf(buf, sizeof(buf), "|pin%.4f,%.4f,%.4f:%.4f,%.4f,%.4f",
+                 p.onA.x, p.onA.y, p.onA.z, p.onB.x, p.onB.y, p.onB.z);
+        k += buf;
+    }
+    return k;
+}
+
+// The timeline bake: one TrueMorphResult per segment (key k -> key k + 1).
+// Segments whose settings didn't change since the last bake are kept.
+static std::future<std::vector<TrueMorphResult>> g_morphFuture;
+static std::vector<int>         g_launchBakeIdx;   // segments the running bake computes
+static std::vector<std::string> g_launchSegKeys;   // every segment's key at launch
+static std::vector<TrueMorphResult> g_segResults;  // baked segments (CPU data)
+static std::vector<std::string>     g_segKeys;
+static int g_activeSeg = -1;                       // segment whose data is in the g_morph* globals
+static std::atomic<int> g_segBaking{0}, g_segTotal{1};
 
 static std::string MorphBakeKey(const TrueMorphSettings& st) {
     return st.pathA + "|" + st.pathB + "|" + std::to_string((int)st.method) + "|" +
@@ -1951,97 +2110,33 @@ static std::string MorphBakeKey(const TrueMorphSettings& st) {
            std::to_string(st.mixtureK) + "|" + std::to_string(st.sinkhornEps) + "|" +
            std::to_string(st.posteriorTemp) + "|" +
            std::to_string(st.fallbackColor.x) + "," + std::to_string(st.fallbackColor.y) + "," +
-           std::to_string(st.fallbackColor.z);
+           std::to_string(st.fallbackColor.z) + PinKey(st.pins);
 }
 
-// Starts the baked topology morph from A (after a bake, or Bake again unchanged)
-static void PlayTrueMorph() {
-    // The animator only provides the timeline (easing, duration, state)
-    Window::animator->InitializeWithEndPoints({}, {});
-    Window::animator->StartTransport();
-    g_morphShown                = MorphShown::None;
-    g_lastSdfT                  = -1.0f;
-    g_sdfOnGpu                  = false;
-    Window::trueMorphActive     = true;
-    Window::particleMorphActive = false;
-    Window::UpdateTrueMorph();
-}
-
-// Starts the topology bake on a background thread; PollTrueMorphBake picks
-// up the result, so the UI keeps running meanwhile.
-void Window::BakeTrueMorph(const std::string& pathA, const std::string& pathB) {
-    if (splatBaking || morphBaking) return;
-
-    TrueMorphSettings st;
-    st.pathA         = pathA;
-    st.pathB         = pathB;
-    st.method        = morphMethod;
-    st.sdfResolution = sdfResolution;
-    st.sampleCount   = sampleCount;
-    st.fitStiffness  = fitStiffness;
-    st.fitCotan      = fitCotan;
-    st.mixtureK      = morphMixtureK;
-    st.sinkhornEps   = sinkhornEps;
-    st.posteriorTemp = posteriorTemp;
-    st.fallbackColor = glm::sqrt(meshRenderer->diffuseColor);   // shader.frag's grey, as a display value
-
-    std::string key = MorphBakeKey(st);
-    if (key == g_bakedMorphKey) {   // already baked: play it again
-        PlayTrueMorph();
-        return;
-    }
-    g_launchKey = key;
-
-    g_stageNames = kMorphStageNames;
-    g_stageCount = 3;
-    SetBakeStage(0, 1);
-    morphBaking       = true;
-    trueMorphActive   = false;
-    g_bakeLaunchEpoch = g_bakeEpoch;
-    g_morphFuture     = std::async(std::launch::async, RunTrueMorphBake, st);
-}
-
-// Called every frame: when the topology bake has finished, take its result,
-// upload what the GPU path needs and start the animation (main thread only,
-// since it makes GL calls).
-void Window::PollTrueMorphBake() {
-    if (!morphBaking || !g_morphFuture.valid()) return;
-    if (g_morphFuture.wait_for(std::chrono::seconds(0)) != std::future_status::ready) return;
-
-    morphBaking = false;
-    TrueMorphResult res;
-    try {
-        res = g_morphFuture.get();
-    } catch (const std::exception& ex) {
-        morphStatus = std::string("Bake failed: ") + ex.what();
-        std::cerr << "[Morph] " << morphStatus << "\n";
-        return;
-    }
-    if (!res.ok) {
-        morphStatus = "Bake failed: could not load meshes";
-        return;
-    }
-    // user pressed Clear or left Topology mode while the bake was running
-    if (g_bakeLaunchEpoch != g_bakeEpoch || renderMode != RenderMode::TriangleMorph) return;
-
-    g_morphA       = std::move(res.a);
-    g_morphB       = std::move(res.b);
-    g_morphShared  = res.shared;
-    g_sharedIndices = std::move(res.sharedIndices);
-    g_sharedStart   = std::move(res.sharedStart);
-    g_sharedEnd     = std::move(res.sharedEnd);
+// Puts segment k's baked data into the g_morph* globals the playback uses,
+// and does its GL uploads (main thread only). Switching segments while the
+// timeline plays costs one upload, at the key between them.
+static void ActivateSegment(int k) {
+    if (k < 0 || k >= (int)g_segResults.size() || k == g_activeSeg) return;
+    const TrueMorphResult& res = g_segResults[k];
+    g_activeSeg     = k;
+    g_morphA        = res.a;
+    g_morphB        = res.b;
+    g_morphShared   = res.shared;
+    g_sharedIndices = res.sharedIndices;
+    g_sharedStart   = res.sharedStart;
+    g_sharedEnd     = res.sharedEnd;
     g_sharedCurrent = g_sharedStart;
-    g_colorsA            = std::move(res.colorsA);
-    g_colorsB            = std::move(res.colorsB);
-    g_sharedColorStart   = std::move(res.sharedColorStart);
-    g_sharedColorEnd     = std::move(res.sharedColorEnd);
+    g_colorsA            = res.colorsA;
+    g_colorsB            = res.colorsB;
+    g_sharedColorStart   = res.sharedColorStart;
+    g_sharedColorEnd     = res.sharedColorEnd;
     g_sharedColorCurrent = g_sharedColorStart;
-    g_dataA              = std::move(res.dataA);
-    g_dataB              = std::move(res.dataB);
+    g_dataA              = res.dataA;
+    g_dataB              = res.dataB;
     g_restTextured       = false;
-    g_bakedMorphKey      = g_launchKey;
-    g_morphTextures.Clear();   // the old meshes' images (g_restMesh re-initializes below)
-    // the textured in-between surface (GL work, so here on the main thread)
+    g_morphTextures.Clear();   // the old meshes' images (g_restMesh re-initializes on demand)
+    // the textured in-between surface
     g_morphTexturedOn = res.shared && !res.sharedCorners.empty();
     if (g_morphTexturedOn) {
         if (!g_morphTextured) g_morphTextured = new MorphTexturedRenderer();
@@ -2051,17 +2146,165 @@ void Window::PollTrueMorphBake() {
         g_morphTexturedOn = g_morphTextured->IsInitialized();
     }
     g_morphPiecewise = res.piecewise;
-    g_piecewise      = std::move(res.pieces);
+    g_piecewise      = res.pieces;
     g_pieceShown     = -1;
     if (!res.shared) {
-        g_sdfMorph = std::move(res.sdf);
-        if (gpuAvailable) g_gpuSdf->Upload(g_sdfMorph, res.sdfVertCap, res.sdfIndexCap);
+        g_sdfMorph = res.sdf;
+        if (Window::gpuAvailable) g_gpuSdf->Upload(g_sdfMorph, res.sdfVertCap, res.sdfIndexCap);
     }
-    *gaussianA = res.gA;
-    *gaussianB = res.gB;
-    delete otMap;
-    otMap = new OTMap(res.map);
-    morphStatus = res.status;
+    *Window::gaussianA = res.gA;
+    *Window::gaussianB = res.gB;
+    delete Window::otMap;
+    Window::otMap = new OTMap(res.map);
+
+    // The director drives the shared template's vertices, one time each
+    if (res.shared) {
+        Window::director.Bind(g_sharedStart, 0.0f, k);
+        g_directorBoundToPreview = false;
+    }
+    g_morphShown = MorphShown::None;
+    g_lastSdfT   = -1.0f;
+    g_sdfOnGpu   = false;
+}
+
+// Starts the baked timeline from its first key (after a bake, or Bake again unchanged)
+static void PlayTrueMorph() {
+    // The animator only provides the clock: progress 0..1 over the whole
+    // timeline (each segment eases itself with its style's curves)
+    Window::animator->InitializeWithEndPoints({}, {});
+    Window::animator->transportDuration = Window::timeline.Total();
+    Window::animator->StartTransport();
+    g_activeSeg                 = -1;
+    ActivateSegment(0);
+    Window::trueMorphActive     = true;
+    Window::particleMorphActive = false;
+    Window::UpdateTrueMorph();
+}
+
+// One segment's settings: key k -> key k + 1, with that segment's pins
+static TrueMorphSettings SegmentSettings(int k) {
+    TrueMorphSettings st;
+    const MorphTimeline& tl = Window::timeline;
+    st.pathA         = Window::meshPaths[tl.keys[k] - 1];
+    st.pathB         = Window::meshPaths[tl.keys[k + 1] - 1];
+    st.method        = Window::morphMethod;
+    st.sdfResolution = Window::sdfResolution;
+    st.sampleCount   = Window::sampleCount;
+    st.fitStiffness  = Window::fitStiffness;
+    st.fitCotan      = Window::fitCotan;
+    st.mixtureK      = Window::morphMixtureK;
+    st.sinkhornEps   = Window::sinkhornEps;
+    st.posteriorTemp = Window::posteriorTemp;
+    st.fallbackColor = glm::sqrt(Window::meshRenderer->diffuseColor);   // shader.frag's grey, as a display value
+    st.pins          = tl.segs[k].pins;
+    return st;
+}
+
+// True if every key of the timeline is a mesh (not the blob or a capture).
+static bool TimelineBakeable() {
+    for (int key : Window::timeline.keys) {
+        if (key <= 0 || key > (int)Window::meshPaths.size()) return false;
+        if (IsCapture(Window::meshPaths[key - 1])) return false;
+    }
+    return Window::timeline.keys.size() >= 2;
+}
+
+// Starts the timeline bake on a background thread (every segment that
+// changed); PollTrueMorphBake picks up the result, so the UI keeps running.
+void Window::BakeTimeline() {
+    if (splatBaking || morphBaking || !TimelineBakeable()) return;
+    timeline.SyncSegments();
+
+    int n = (int)timeline.segs.size();
+    std::vector<TrueMorphSettings> todo;
+    g_launchSegKeys.clear();
+    g_launchBakeIdx.clear();
+    for (int k = 0; k < n; ++k) {
+        TrueMorphSettings st = SegmentSettings(k);
+        std::string key = MorphBakeKey(st);
+        g_launchSegKeys.push_back(key);
+        bool have = k < (int)g_segKeys.size() && g_segKeys[k] == key;
+        // an unchanged segment may sit at another place in the timeline now
+        for (size_t j = 0; !have && j < g_segKeys.size(); ++j) have = g_segKeys[j] == key;
+        if (!have) {
+            g_launchBakeIdx.push_back(k);
+            todo.push_back(st);
+        }
+    }
+    if (todo.empty()) {   // already baked: reorder what we have and play it again
+        std::vector<TrueMorphResult> results;
+        for (int k = 0; k < n; ++k)
+            for (size_t j = 0; j < g_segKeys.size(); ++j)
+                if (g_segKeys[j] == g_launchSegKeys[k]) { results.push_back(g_segResults[j]); break; }
+        g_segResults = std::move(results);
+        g_segKeys    = g_launchSegKeys;
+        PlayTrueMorph();
+        return;
+    }
+
+    g_stageNames = kMorphStageNames;
+    g_stageCount = 3;
+    SetBakeStage(0, 1);
+    g_segBaking = 0;
+    g_segTotal  = (int)todo.size();
+    morphBaking       = true;
+    trueMorphActive   = false;
+    g_bakeLaunchEpoch = g_bakeEpoch;
+    g_morphFuture = std::async(std::launch::async, [todo]() {
+        std::vector<TrueMorphResult> out;
+        for (size_t i = 0; i < todo.size(); ++i) {
+            g_segBaking = (int)i;
+            out.push_back(RunTrueMorphBake(todo[i]));
+        }
+        return out;
+    });
+}
+
+// Called every frame: when the timeline bake has finished, take its results
+// and start the animation (main thread only, since it makes GL calls).
+void Window::PollTrueMorphBake() {
+    if (!morphBaking || !g_morphFuture.valid()) return;
+    if (g_morphFuture.wait_for(std::chrono::seconds(0)) != std::future_status::ready) return;
+
+    morphBaking = false;
+    std::vector<TrueMorphResult> baked;
+    try {
+        baked = g_morphFuture.get();
+    } catch (const std::exception& ex) {
+        morphStatus = std::string("Bake failed: ") + ex.what();
+        std::cerr << "[Morph] " << morphStatus << "\n";
+        return;
+    }
+    for (const TrueMorphResult& r : baked) {
+        if (!r.ok) {
+            morphStatus = "Bake failed: could not load meshes";
+            return;
+        }
+    }
+    // user pressed Clear or left Topology mode while the bake was running
+    if (g_bakeLaunchEpoch != g_bakeEpoch || renderMode != RenderMode::TriangleMorph) return;
+
+    // the new timeline: fresh bakes where needed, earlier ones elsewhere
+    std::vector<TrueMorphResult> results(g_launchSegKeys.size());
+    for (size_t k = 0; k < g_launchSegKeys.size(); ++k) {
+        auto it = std::find(g_launchBakeIdx.begin(), g_launchBakeIdx.end(), (int)k);
+        if (it != g_launchBakeIdx.end()) {
+            results[k] = std::move(baked[it - g_launchBakeIdx.begin()]);
+        } else {
+            for (size_t j = 0; j < g_segKeys.size(); ++j)
+                if (g_segKeys[j] == g_launchSegKeys[k]) { results[k] = g_segResults[j]; break; }
+        }
+    }
+    g_segResults    = std::move(results);
+    g_segKeys       = g_launchSegKeys;
+    g_bakedMorphKey = g_launchSegKeys.empty() ? "" : g_launchSegKeys[0];
+
+    morphStatus.clear();
+    for (size_t k = 0; k < g_segResults.size(); ++k) {
+        if (g_segResults.size() > 1) morphStatus += "[" + std::to_string(k + 1) + "] ";
+        morphStatus += g_segResults[k].status;
+        if (k + 1 < g_segResults.size()) morphStatus += "\n";
+    }
     PlayTrueMorph();
 }
 
@@ -2071,18 +2314,37 @@ void Window::PollTrueMorphBake() {
 //     blends them (morph.vert); per frame only morphT changes.
 //   SDF, GPU: GpuSDFMorph re-meshes in compute shaders, drawn indirectly.
 //   CPU paths (useGpu off or no GL 4.3): the original lerp / surface nets.
-void Window::UpdateTrueMorph() {
-    float e = animator->GetBlend();
+void Window::UpdateTrueMorph(float dt) {
+    if (g_segResults.empty()) return;
     bool gpu = useGpu && gpuAvailable;
+
+    // Where the timeline is: which segment, how far through it, in what style.
+    // While the clock is held (Seek / scrubbing) the springs rest on their
+    // targets, so a scrubbed frame always looks the same.
+    float progress = animator->GetProgress();
+    MorphTimeline::Place place = timeline.Locate(progress);
+    ActivateSegment(place.seg);
+    const MorphStyle& style = timeline.segs[place.seg].style;
+    float local = place.local;
+    bool held = animator->IsHeld();
+    float springDt = held ? 0.0f : dt;
 
     // counts from a few frames ago; re-mesh if the GPU buffers had to grow
     if (!g_morphShared && g_gpuSdf->IsReady() && g_gpuSdf->PollStats())
         g_lastSdfT = -1.0f;
 
+    // Shared topology: one time per template vertex (wave, curves, springs)
+    const std::vector<float>* u = nullptr;
+    if (g_morphShared && director.Count() == g_sharedStart.size()) {
+        director.UpdateDelay(style.origin);
+        u = &director.Evaluate(local, springDt, style);
+    }
+    bool settled = !u || director.Settled();
+
     MorphShown want = MorphShown::Blend;
-    if (e <= 0.0f && !animator->IsTransporting())
+    if (progress <= 0.0f && !animator->IsTransporting() && settled)
         want = MorphShown::A;
-    else if (e >= 1.0f && !animator->IsTransporting())
+    else if (progress >= 1.0f && !animator->IsTransporting() && settled)
         want = MorphShown::B;
 
     if (want != MorphShown::Blend) {
@@ -2097,16 +2359,32 @@ void Window::UpdateTrueMorph() {
                 g_restMesh->Initialize(data, g_morphTextures);
             }
             g_morphShown = want;
+            SetPickSurface(m.verts, m.indices);
         }
         return;
     }
     g_restTextured = false;
 
     if (g_morphShared) {
+        float t = u ? 0.0f : style.early.Eval(local);   // no director: one time for all
+        bool tools = director.tool != MorphDirector::Tool::Orbit;
+        // the CPU positions: for the CPU path, and for the tools to pick from
+        if (!gpu || tools) {
+            for (size_t i = 0; i < g_sharedCurrent.size(); ++i) {
+                float ui = u ? (*u)[i] : t;
+                float tc = glm::clamp(ui, 0.0f, 1.0f);
+                g_sharedCurrent[i] = g_sharedStart[i] + ui * (g_sharedEnd[i] - g_sharedStart[i]);
+                g_sharedCurrent[i].y -= style.sag * 4.0f * tc * (1.0f - tc);
+            }
+            if (tools) SetPickSurface(g_sharedCurrent, g_sharedIndices);
+        }
         // textured: the vertex shader blends the shapes, the fragment shader
         // the two textures (needs only GL 3.3, so on the CPU path too)
         if (g_morphTexturedOn) {
-            g_morphTexT  = e;
+            if (u) g_morphTextured->SetVertexTimes(*u);
+            else   g_morphTextured->ClearVertexTimes();
+            g_morphTextured->sag = style.sag;
+            g_morphTexT  = t;
             g_morphShown = MorphShown::Blend;
             return;
         }
@@ -2116,13 +2394,16 @@ void Window::UpdateTrueMorph() {
                                               g_sharedColorStart, g_sharedColorEnd);
                 g_morphShown = MorphShown::Blend;
             }
-            meshRenderer->morphT = e;
+            if (u) meshRenderer->SetVertexTimes(*u);
+            else   meshRenderer->ClearVertexTimes();
+            meshRenderer->sag    = style.sag;
+            meshRenderer->morphT = t;
             return;
         }
-        for (size_t i = 0; i < g_sharedCurrent.size(); ++i)
-            g_sharedCurrent[i] = g_sharedStart[i] + e * (g_sharedEnd[i] - g_sharedStart[i]);
-        for (size_t i = 0; i < g_sharedColorCurrent.size(); ++i)
-            g_sharedColorCurrent[i] = glm::mix(g_sharedColorStart[i], g_sharedColorEnd[i], glm::clamp(e, 0.0f, 1.0f));
+        for (size_t i = 0; i < g_sharedColorCurrent.size(); ++i) {
+            float ui = u ? (*u)[i] : t;
+            g_sharedColorCurrent[i] = glm::mix(g_sharedColorStart[i], g_sharedColorEnd[i], glm::clamp(ui, 0.0f, 1.0f));
+        }
         if (g_morphShown != MorphShown::Blend || meshRenderer->IsMorphTarget()) {
             meshRenderer->Initialize(g_sharedCurrent, g_sharedIndices, g_sharedColorCurrent);
             g_morphShown = MorphShown::Blend;
@@ -2132,8 +2413,10 @@ void Window::UpdateTrueMorph() {
         return;
     }
 
-    // SDF: re-mesh only when t moved (bounce easing can overshoot; clamp it)
-    float t = glm::clamp(e, 0.0f, 1.0f);
+    // Piecewise and SDF re-mesh the whole surface at one time, so they take
+    // the style's curve for that time (no per-point wave). Re-mesh only when t
+    // moved (an overshooting curve is clamped: there's no surface past A or B).
+    float t = glm::clamp(style.early.Eval(local), 0.0f, 1.0f);
 
     // Piecewise: the segment's mesh, between its fitted keyframes (CPU; the
     // meshes are small, and switching segments swaps the connectivity)
@@ -2146,6 +2429,7 @@ void Window::UpdateTrueMorph() {
             meshRenderer->Initialize(pos, g_piecewise.segments[seg].indices, col);
         else
             meshRenderer->UpdatePositions(pos, col);
+        SetPickSurface(pos, g_piecewise.segments[seg].indices);
         g_pieceShown = seg;
         g_sdfOnGpu   = false;
         g_morphShown = MorphShown::Blend;
@@ -2158,11 +2442,17 @@ void Window::UpdateTrueMorph() {
         g_morphTimer->Begin();
         g_gpuSdf->Extract(t);
         g_morphTimer->End();
+        // the surface lives on the GPU: pick from the nearer end's real mesh
+        const IndexedMesh& m = (t < 0.5f) ? g_morphA : g_morphB;
+        SetPickSurface(m.verts, m.indices);
     } else {
         std::vector<glm::vec3> verts, colors;
         std::vector<unsigned int> indices;
         g_sdfMorph.Extract(t, verts, indices, &colors);
-        if (!indices.empty()) meshRenderer->Initialize(verts, indices, colors);
+        if (!indices.empty()) {
+            meshRenderer->Initialize(verts, indices, colors);
+            SetPickSurface(verts, indices);
+        }
     }
     g_sdfOnGpu   = onGpu;
     g_morphShown = MorphShown::Blend;
@@ -2223,6 +2513,8 @@ static void StopAllMorphs() {
         Window::splatMorphActive = false;
         splatPreviewGen++;
     }
+    g_previewIndexOverride = -1;
+    Window::director.pinWaitingForB = false;
     g_previewGen++;
 }
 
@@ -2241,6 +2533,148 @@ static bool DrawShapeCombo(const char* label, int& meshIndex) {
 
 static void HintText(const char* text) {
     ImGui::TextDisabled("%s", text);
+}
+
+// The Director panel (Topology and Splats): how the selected step moves,
+// the tools that place its origin, paint and pins, and a scrub bar.
+void Window::DrawDirectorGUI() {
+    MorphTimeline& tl = timeline;
+    tl.SyncSegments();
+    const bool topo = renderMode == RenderMode::TriangleMorph;
+    const int sel = topo ? tl.selected : 0;
+    MorphSegmentSpec& seg = tl.segs[sel];
+    MorphStyle& style = seg.style;
+    bool edited = false;
+
+    ImGui::SeparatorText("Director");
+    if (topo && tl.segs.size() > 1) {
+        auto name = [](int key) {
+            return key > 0 && key <= (int)meshNames.size() ? meshNames[key - 1].c_str() : "blob";
+        };
+        ImGui::Text("Step %d: %s -> %s", sel + 1, name(tl.keys[sel]), name(tl.keys[sel + 1]));
+    }
+    ImGui::SliderFloat("Duration (s)", &seg.duration, 0.3f, 10.0f, "%.1f");
+
+    // ---- style presets ----
+    const auto& styles = BuiltinStyles();
+    float avail = ImGui::GetContentRegionAvail().x, used = 0.0f;
+    for (int i = 0; i < (int)styles.size(); ++i) {
+        float w = ImGui::CalcTextSize(styles[i].name.c_str()).x + 2.0f * ImGui::GetStyle().FramePadding.x;
+        if (i > 0) {
+            if (used + ImGui::GetStyle().ItemSpacing.x + w <= avail) ImGui::SameLine();
+            else used = 0.0f;
+        }
+        used += (used > 0.0f ? ImGui::GetStyle().ItemSpacing.x : 0.0f) + w;
+        bool on = seg.preset == i;
+        if (on) ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(1.0f, 0.4f, 0.7f, 1.0f));
+        if (ImGui::Button(styles[i].name.c_str())) tl.ApplyPreset(sel, i);
+        if (on) ImGui::PopStyleColor();
+        ImGui::SetItemTooltip("%s", styles[i].hint.c_str());
+    }
+    if (seg.preset < 0) HintText("Custom style (edited)");
+    if (style.splatsBest && topo) HintText("This style looks best in Splats mode.");
+
+    // ---- feel ----
+    const char* origins[] = { "Everywhere at once", "The bottom", "The top", "Clicked point" };
+    int o = (int)style.origin;
+    if (ImGui::Combo("Starts from", &o, origins, 4)) { style.origin = (OriginMode)o; edited = true; }
+    if (style.origin == OriginMode::Clicked && !director.hasOrigin)
+        HintText("No point clicked yet: starts from the bottom. Use Set Origin below.");
+    edited |= ImGui::SliderFloat("Wave", &style.wave, 0.0f, 0.8f, "%.2f");
+    ImGui::SetItemTooltip("0 = every part leaves at once\nHigher = parts leave one after another,\n"
+                          "as heat spreads over the surface from the start point");
+    if (topo) {
+        edited |= ImGui::SliderFloat("Jiggle", &style.jiggle, 0.0f, 1.0f, "%.2f");
+        ImGui::SetItemTooltip("0 = parts arrive exactly\n1 = they overshoot and wobble, then settle");
+        edited |= ImGui::SliderFloat("Sag", &style.sag, 0.0f, 0.6f, "%.2f");
+        ImGui::SetItemTooltip("Mid-flight droop (melting), none at either end");
+    } else {
+        edited |= ImGui::SliderFloat("Cohesion", &style.cohesion, 0.0f, 1.0f);
+        ImGui::SetItemTooltip("0 = every splat flies straight\n1 = neighbours move together as chunks");
+        edited |= ImGui::SliderFloat("Mid-flight grow", &style.midGrow, 0.0f, 1.0f);
+        ImGui::SetItemTooltip("How much splats swell while travelling (exact size at both ends)");
+    }
+    if (ImGui::TreeNode("Timing curves")) {
+        HintText("x = time, y = how far. Below the band: pull back first;\nabove it: overshoot.");
+        edited |= DrawCurveEditor("Parts that leave first", style.early);
+        edited |= DrawCurveEditor("Parts that leave last", style.late);
+        if (ImGui::Button("Same curve for both")) { style.late = style.early; edited = true; }
+        ImGui::TreePop();
+    }
+    if (edited) {
+        seg.preset = -1;
+        style.name = "Custom";
+    }
+    if (topo && trueMorphActive && sel < (int)g_segResults.size() && !g_segResults[sel].shared)
+        HintText("This step re-meshes the surface (Piecewise / SDF):\n"
+                 "it follows the first curve; wave, paint and jiggle need shared topology.");
+
+    // ---- tools ----
+    ImGui::SeparatorText("Tools");
+    int tool = (int)director.tool;
+    bool toolChanged = false;
+    toolChanged |= ImGui::RadioButton("Orbit", &tool, (int)MorphDirector::Tool::Orbit);
+    ImGui::SameLine();
+    toolChanged |= ImGui::RadioButton("Set Origin", &tool, (int)MorphDirector::Tool::Origin);
+    ImGui::SameLine();
+    toolChanged |= ImGui::RadioButton("Paint Early", &tool, (int)MorphDirector::Tool::PaintEarly);
+    toolChanged |= ImGui::RadioButton("Paint Late", &tool, (int)MorphDirector::Tool::PaintLate);
+    if (topo) {
+        ImGui::SameLine();
+        toolChanged |= ImGui::RadioButton("Pin", &tool, (int)MorphDirector::Tool::Pin);
+    }
+    if (toolChanged) {
+        bool wasPin = director.tool == MorphDirector::Tool::Pin;
+        director.tool = (MorphDirector::Tool)tool;
+        director.pinWaitingForB = false;
+        if (director.tool == MorphDirector::Tool::Pin) ShowPinStage(false);
+        else if (wasPin && g_previewIndexOverride >= 0) { g_previewIndexOverride = -1; g_previewGen++; }
+    }
+    switch (director.tool) {
+        case MorphDirector::Tool::Orbit:
+            HintText("Drag to turn the camera.");
+            break;
+        case MorphDirector::Tool::Origin:
+            HintText("Click the shape where the change should\nstart. Alt + drag turns the camera.");
+            break;
+        case MorphDirector::Tool::PaintEarly:
+        case MorphDirector::Tool::PaintLate:
+            HintText("Drag over the shape: orange = leaves early,\nblue = leaves late. Alt + drag turns the camera.");
+            ImGui::SliderFloat("Brush size", &director.brushRadius, 0.03f, 0.6f, "%.2f");
+            ImGui::SliderFloat("Brush strength", &director.brushStrength, 0.02f, 0.5f, "%.2f");
+            break;
+        case MorphDirector::Tool::Pin:
+            HintText(director.pinWaitingForB ? "Now click where that point should land on the end shape."
+                                             : "Click a point on the start shape, then its partner\n"
+                                               "on the end shape. Bake again to use the pins.");
+            break;
+    }
+    if (renderMode == RenderMode::Splats && director.tool != MorphDirector::Tool::Orbit && !splatMorphActive)
+        HintText("Bake first: the tools work on the baked splats.");
+
+    if (ImGui::SmallButton("Clear paint")) director.ClearPaint();
+    ImGui::SameLine();
+    ImGui::BeginDisabled(!director.hasOrigin);
+    if (ImGui::SmallButton("Clear origin")) director.hasOrigin = false;
+    ImGui::EndDisabled();
+    if (topo) {
+        ImGui::SameLine();
+        ImGui::BeginDisabled(seg.pins.empty());
+        char pinLabel[32];
+        snprintf(pinLabel, sizeof(pinLabel), "Clear pins (%d)", (int)seg.pins.size());
+        if (ImGui::SmallButton(pinLabel)) seg.pins.clear();
+        ImGui::EndDisabled();
+        bool pinsChanged = trueMorphActive && sel < (int)g_segKeys.size() && TimelineBakeable() &&
+                           g_segKeys[sel] != MorphBakeKey(SegmentSettings(sel));
+        if (pinsChanged) HintText("Shapes or pins changed: bake again to apply.");
+    }
+
+    // ---- scrub ----
+    if (trueMorphActive || splatMorphActive) {
+        float p = animator->GetProgress();
+        if (ImGui::SliderFloat("Scrub", &p, 0.0f, 1.0f, "%.3f")) animator->Seek(p);
+        ImGui::SetItemTooltip("Hold the morph at any moment (Bake It! plays it again)");
+    }
 }
 
 void Window::DrawMainGUI() {
@@ -2268,20 +2702,36 @@ void Window::DrawMainGUI() {
 
     // ---- 2. Shapes ----
     ImGui::SeparatorText("Shapes");
-    if (DrawShapeCombo("Source (A)", meshIndexA))
-        StopAllMorphs();   // show the newly selected source right away
-    DrawShapeCombo("Target (B)", meshIndexB);
+    if (renderMode == RenderMode::TriangleMorph) {
+        // Shapes as keyframes: start -> key 1 -> key 2 ...
+        if (timeline.DrawGUI(DrawShapeCombo)) {
+            SyncTimelineKeys();
+            StopAllMorphs();   // show the newly selected source right away
+        }
+    } else {
+        if (DrawShapeCombo("Source (A)", meshIndexA))
+            StopAllMorphs();   // show the newly selected source right away
+        DrawShapeCombo("Target (B)", meshIndexB);
+    }
 
     bool hasA = meshIndexA > 0, hasB = meshIndexB > 0;
     bool needsMeshes = renderMode != RenderMode::Particles;
-    bool captureOutsideSplats = renderMode == RenderMode::TriangleMorph &&
-        ((hasA && IsCapture(meshPaths[meshIndexA - 1])) || (hasB && IsCapture(meshPaths[meshIndexB - 1])));
+    bool captureOutsideSplats = false;
+    for (int key : renderMode == RenderMode::TriangleMorph ? timeline.keys : std::vector<int>())
+        if (key > 0 && key <= (int)meshPaths.size() && IsCapture(meshPaths[key - 1])) captureOutsideSplats = true;
+    bool allKeys = true;
+    for (int key : timeline.keys) allKeys &= key > 0;
     bool baking  = splatBaking || morphBaking;
-    bool canBake = !baking && !captureOutsideSplats && (!needsMeshes || (hasA && hasB));
+    bool canBake = !baking && !captureOutsideSplats &&
+                   (!needsMeshes || (renderMode == RenderMode::TriangleMorph ? allKeys : hasA && hasB));
 
     // ---- 3. Transport ----
-    ImGui::SeparatorText("Transport");
-    animator->DrawParamsGUI();
+    if (renderMode == RenderMode::Particles) {
+        ImGui::SeparatorText("Transport");
+        animator->DrawParamsGUI();
+    } else {
+        DrawDirectorGUI();
+    }
 
     // Bake | Revert | Clear on one row
     ImGui::Spacing();
@@ -2310,7 +2760,9 @@ void Window::DrawMainGUI() {
         StopAllMorphs();
     ImGui::SetItemTooltip("Stop and show the source again");
 
-    if (needsMeshes && !(hasA && hasB))
+    if (needsMeshes && renderMode == RenderMode::TriangleMorph && !allKeys)
+        ImGui::TextColored(ImVec4(1.0f, 0.55f, 0.4f, 1.0f), "Pick a mesh for every shape to bake.");
+    else if (needsMeshes && !(hasA && hasB))
         ImGui::TextColored(ImVec4(1.0f, 0.55f, 0.4f, 1.0f), "Pick a mesh for both A and B to bake.");
     if (captureOutsideSplats)
         ImGui::TextColored(ImVec4(1.0f, 0.55f, 0.4f, 1.0f), ".ply captures work in Splats and Particles modes.");
@@ -2319,9 +2771,13 @@ void Window::DrawMainGUI() {
     if (baking) {
         int stage = g_bakeStage.load();
         float frac = (float)g_bakeDone.load() / (float)g_bakeTotal.load();
-        char label[64];
-        snprintf(label, sizeof(label), "%s (%d/%d)", g_stageNames[stage],
-                 std::min(stage + 1, g_stageCount), g_stageCount);
+        char label[96];
+        if (morphBaking && g_segTotal.load() > 1)
+            snprintf(label, sizeof(label), "Step %d/%d: %s (%d/%d)", g_segBaking.load() + 1, g_segTotal.load(),
+                     g_stageNames[stage], std::min(stage + 1, g_stageCount), g_stageCount);
+        else
+            snprintf(label, sizeof(label), "%s (%d/%d)", g_stageNames[stage],
+                     std::min(stage + 1, g_stageCount), g_stageCount);
         ImGui::ProgressBar(glm::clamp(frac, 0.0f, 1.0f), ImVec2(-1, 0), label);
     } else {
         animator->DrawStatusGUI();
@@ -2433,15 +2889,9 @@ void Window::DrawMainGUI() {
                 if (ImGui::SliderInt("Splats", &splatCount, 1000, 500000, "%d", ImGuiSliderFlags_Logarithmic))
                     autoQuality = false;
                 ImGui::SliderFloat("Splat Size", &splatSizeMul, 0.3f, 3.0f);
-                ImGui::SliderFloat("Cohesion", &splatCohesion, 0.0f, 1.0f);
-                ImGui::SetItemTooltip("0 = every splat flies straight\n1 = neighbours move together as chunks");
                 ImGui::Checkbox("Area-preserving splats", &splatAreaPreserve);
                 ImGui::SetItemTooltip("Mid-flight, grow or shrink each splat by how much the OT map\n"
                                       "stretches its patch of surface (exact size at both ends)");
-                ImGui::SliderFloat("Heat Wave", &splatWave, 0.0f, 0.6f, "%.2f");
-                ImGui::SetItemTooltip("0 = every splat leaves at once\n"
-                                      "Higher = splats leave as heat spreads up from the bottom,\n"
-                                      "like a cake baking from the pan");
                 if (ImGui::SliderInt("Mixture K", &mixtureK, 1, 128)) autoQuality = false;
                 ImGui::SetItemTooltip("Gaussians fitted per shape for the OT map\n1 = original single-Gaussian map");
                 ImGui::SliderFloat("Sinkhorn eps", &sinkhornEps, 0.005f, 0.5f, "%.3f", ImGuiSliderFlags_Logarithmic);
@@ -2540,11 +2990,92 @@ void Window::keyCallback(GLFWwindow* window, int key, int scancode, int action, 
     }
 }
 
+// Pin tool: show the start (A) or the end (B) shape of the selected step,
+// so the two clicks of a pin land on the right shapes.
+static void ShowPinStage(bool endShape) {
+    const MorphTimeline& tl = Window::timeline;
+    int seg = std::clamp(tl.selected, 0, (int)tl.segs.size() - 1);
+    if (Window::trueMorphActive) {
+        Window::animator->Seek(endShape ? tl.SegmentEnd(seg) - 1e-4f : tl.SegmentStart(seg));
+        return;
+    }
+    int want = endShape ? tl.keys[seg + 1] : (seg > 0 ? tl.keys[seg] : -1);
+    if (want != g_previewIndexOverride) {
+        g_previewIndexOverride = want;
+        g_previewGen++;
+    }
+}
+
+// A click (press) or drag with the current Director tool at window pixel (x, y).
+static void ApplyTool(double x, double y, bool press) {
+    MorphDirector& d = Window::director;
+    if (g_pickPoints.empty()) return;
+    Ray ray = ScreenRay((float)x, (float)y, (float)Window::width, (float)Window::height,
+                        Cam->GetViewMtx(), Cam->GetProjectMtx());
+    int hit = PickPoint(g_pickPoints, ray, 0.04f);
+    if (hit < 0) return;
+    glm::vec3 p = g_pickPoints[hit];
+    MorphTimeline& tl = Window::timeline;
+    int seg = Window::renderMode == RenderMode::Splats ? 0 : tl.selected;
+    MorphStyle& style = tl.segs[seg].style;
+
+    switch (d.tool) {
+        case MorphDirector::Tool::Origin:
+            if (!press) return;
+            d.origin = p;
+            d.hasOrigin = true;
+            // a clicked origin means "spread from here": make sure it does
+            if (style.origin != OriginMode::Clicked) {
+                style.origin = OriginMode::Clicked;
+                if (style.wave <= 0.0f) style.wave = 0.5f;
+                tl.segs[seg].preset = -1;
+                style.name = "Custom";
+            }
+            break;
+        case MorphDirector::Tool::PaintEarly:
+        case MorphDirector::Tool::PaintLate:
+            d.Paint(p, d.tool == MorphDirector::Tool::PaintEarly ? -1.0f : 1.0f);
+            break;
+        case MorphDirector::Tool::Pin:
+            if (!press || Window::renderMode != RenderMode::TriangleMorph) return;
+            if (!d.pinWaitingForB) {
+                d.pendingA = p;
+                d.pinWaitingForB = true;
+                ShowPinStage(true);
+            } else {
+                tl.segs[seg].pins.push_back({ d.pendingA, p });
+                d.pinWaitingForB = false;
+                ShowPinStage(false);
+            }
+            break;
+        default:
+            break;
+    }
+}
+
+void Window::ToolClick(double x, double y) {
+    ApplyTool(x, y, true);
+}
+
 void Window::mouse_callback(GLFWwindow* window, int button, int action, int mods) {
     // Only start a drag outside the GUI, but always end it, even when the
     // button is released over a GUI window.
     bool down = (action == GLFW_PRESS) && !ImGui::GetIO().WantCaptureMouse;
-    if (button == GLFW_MOUSE_BUTTON_LEFT)  LeftDown  = down;
+    // A Director tool takes the left button; Alt + drag still orbits
+    bool tool = director.tool != MorphDirector::Tool::Orbit && !(mods & GLFW_MOD_ALT) &&
+                renderMode != RenderMode::Particles;
+    if (button == GLFW_MOUSE_BUTTON_LEFT) {
+        if (down && tool) {
+            double x, y;
+            glfwGetCursorPos(window, &x, &y);
+            g_toolDragging = true;
+            LeftDown = false;
+            ApplyTool(x, y, true);
+        } else {
+            LeftDown = down;
+        }
+        if (action == GLFW_RELEASE) g_toolDragging = false;
+    }
     if (button == GLFW_MOUSE_BUTTON_RIGHT) RightDown = down;
 }
 
@@ -2561,6 +3092,11 @@ void Window::cursor_callback(GLFWwindow* window, double currX, double currY) {
 
     MouseX = (int)currX;
     MouseY = (int)currY;
+
+    // paint strokes follow the mouse
+    if (g_toolDragging && (director.tool == MorphDirector::Tool::PaintEarly ||
+                           director.tool == MorphDirector::Tool::PaintLate))
+        ApplyTool(currX, currY, false);
 
     if (LeftDown) {
         const float rate = 1.0f;

@@ -103,6 +103,29 @@ This is an experimental project that expands on the concept of a simple particle
 
 _For this project, I really want to show how theoretical concepts can actually be applied in fun settings, and how practical applications can help visualize and understand these concepts._
 
+## Morph Director (animation controls, no rigging)
+
+The Director panel (Topology and Splats modes) lets you direct a morph like a shot instead of rigging it:
+
+- **Shapes as keyframes** (Topology): `Start -> Key 1 -> Key 2 ...`. Each step is its own bake (shared topology, Piecewise or SDF), and every step has its own duration and style.
+- **Styles**: Classic, Bake, Ripple, Melt, Pop and Dissolve. Each one is a set of the knobs below, and you can edit any of them.
+- **Starts from + Wave**: parts leave one after another, as heat spreads over the surface from the bottom, from the top or from a point you click (*Set Origin*).
+- **Paint Early / Paint Late**: brush areas so they leave sooner or later. The shape shows the timing as orange (early) to blue (late) while a tool is active.
+- **Timing curves**: two editable curves, one for the parts that leave first and one for the parts that leave last. Pull a handle below or above the band for anticipation or overshoot.
+- **Jiggle / Sag** (shared topology): parts overshoot and settle when they arrive (a spring on each vertex's own time), and the surface droops mid-flight.
+- **Pin** (shared topology): click a point on the start shape, then where it must land on the end shape, then bake again. The template fit honours the pin and brings the area around it along.
+- **Scrub**: hold the morph at any moment.
+
+Hold Alt and drag to turn the camera while a tool is active. Piecewise and SDF steps rebuild the whole surface each frame, so they follow the first curve only (wave, paint and jiggle need shared topology).
+
+Scripted runs can set all of this too, for example:
+
+```
+menv --shot out/ripple --mode topology --keys bunny.obj,MaleHead.obj,heart_crystal.obj --style ripple --origin 0.3,0.9,0 --times 0.25,0.5,0.75
+```
+
+Other options are `--style`, `--wave`, `--jiggle`, `--sag`, `--pin ax,ay,az:bx,by,bz`, `--tool origin|paint|pin` (shows the overlay) and `--click x,y`.
+
 ## How to Run
 Download the release, unzip it, and run the menv.exe.
 

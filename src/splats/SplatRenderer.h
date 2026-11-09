@@ -1,4 +1,5 @@
 #pragma once
+#include "MorphCurve.h"
 #include "core.h"
 #include "Splat.h"
 #include "GpuTimer.h"
@@ -45,7 +46,9 @@ public:
     // How each splat's clock follows the timeline in the next DrawMorph
     // (SplatClockAt in SplatHeat.h): heat-wave width (0 = off), cohesion
     // exponent and mid-flight growth. The defaults are a plain lerp.
-    void SetClock(float wave, float cohesionExp, float midGrow);
+    // early / late: the style's timing curves (null = e is already eased)
+    void SetClock(float wave, float cohesionExp, float midGrow,
+                  const MorphCurve* early = nullptr, const MorphCurve* late = nullptr);
 
     // e = eased time, sizeMul scales every splat,
     // stretchOn = 1 applies the per-splat stretch, 0 ignores it
@@ -91,6 +94,8 @@ private:
 
     GpuTimer prepTimer, drawTimer;
     float  waveWidth = 0.0f, waveCohesionExp = 1.0f, waveMidGrow = 0.0f;   // SetClock
+    bool   useCurves = false;
+    glm::vec4 curveEarly = glm::vec4(0.0f, 0.0f, 1.0f, 1.0f), curveLate = glm::vec4(0.0f, 0.0f, 1.0f, 1.0f);
 
     void   SetBlendState(bool begin);
 };

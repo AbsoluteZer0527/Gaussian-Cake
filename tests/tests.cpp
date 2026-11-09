@@ -6,6 +6,16 @@
 #include "SDFMorph.h"
 #include "PiecewiseMorph.h"
 #include "SphericalHarmonics.h"
+#include "SplatHeat.h"
+#include "MeshFitter.h"
+#include "MorphCurve.h"
+#include "MorphStyle.h"
+#include "MorphSpring.h"
+#include "MorphTimeline.h"
+#include "Picking.h"
+
+#include <algorithm>
+#include <numeric>
 
 #include <cmath>
 #include <cstdio>
@@ -253,11 +263,166 @@ static void TestPiecewise() {
           "end segments don't use A's and B's triangles");
 }
 
+
+// ---- Morph Director ----
+
+// Curves: exact ends; Pop pulls back below 0 and overshoots above 1.
+static void TestCurves() {
+    for (const MorphStyle& st : BuiltinStyles()) {
+        for (const MorphCurve* c : { &st.early, &st.late }) {
+            CHECK(c->Eval(0.0f) == 0.0f && c->Eval(1.0f) == 1.0f, "%s: curve ends %g %g",
+                  st.name.c_str(), c->Eval(0.0f), c->Eval(1.0f));
+        }
+        // every point is at A at t = 0 and at B at t = 1, whatever its delay
+        for (float d : { 0.0f, 0.3f, 1.0f }) {
+            float a = VertexTime(0.0f, st.wave, d, st.early, st.late);
+            float b = VertexTime(1.0f, st.wave, d, st.early, st.late);
+            CHECK(a == 0.0f && b == 1.0f, "%s: delay %g runs %g..%g", st.name.c_str(), d, a, b);
+        }
+    }
+    const MorphStyle& pop = BuiltinStyles()[FindStyle("pop")];
+    float lo = 1.0f, hi = 0.0f;
+    for (int i = 0; i <= 200; ++i) {
+        float y = pop.early.Eval(i / 200.0f);
+        lo = std::min(lo, y);
+        hi = std::max(hi, y);
+    }
+    std::printf("Curves: Pop runs %.3f .. %.3f\n", lo, hi);
+    CHECK(lo < -0.02f && hi > 1.05f, "Pop should anticipate and overshoot (%g, %g)", lo, hi);
+    // linear curve is the identity
+    float worst = 0.0f;
+    for (int i = 0; i <= 50; ++i) worst = std::max(worst, std::abs(MorphCurve::Linear().Eval(i / 50.0f) - i / 50.0f));
+    CHECK(worst < 1e-4f, "linear curve off by %g", worst);
+}
+
+// Spearman rank correlation of two equally long lists.
+static double RankCorrelation(const std::vector<float>& a, const std::vector<float>& b) {
+    auto ranks = [](const std::vector<float>& v) {
+        std::vector<int> idx(v.size());
+        std::iota(idx.begin(), idx.end(), 0);
+        std::sort(idx.begin(), idx.end(), [&](int i, int j) { return v[i] < v[j]; });
+        std::vector<double> r(v.size());
+        for (size_t k = 0; k < idx.size(); ++k) r[idx[k]] = (double)k;
+        return r;
+    };
+    std::vector<double> ra = ranks(a), rb = ranks(b);
+    double n = (double)a.size(), d2 = 0.0;
+    for (size_t i = 0; i < a.size(); ++i) d2 += (ra[i] - rb[i]) * (ra[i] - rb[i]);
+    return 1.0 - 6.0 * d2 / (n * (n * n - 1.0));
+}
+
+// Heat wave from a clicked point: the delay grows with the distance along
+// the surface (on a sphere, the angle from the seed). The bottom seed of
+// the new overload is exactly the old wave.
+static void TestWaveFromPoint() {
+    std::vector<glm::vec3> pts = MeshSampler::Sample(Sphere(glm::vec3(0.0f), 0.8f), 3000);
+    glm::vec3 seed(0.8f, 0.0f, 0.0f);
+    float cell = 0.12f;
+    std::vector<float> d = HeatWaveDelay(pts, cell, 0.6, 0.02, WaveSeed::Point, seed);
+    std::vector<float> angle(pts.size());
+    for (size_t i = 0; i < pts.size(); ++i)
+        angle[i] = std::acos(std::clamp(glm::dot(glm::normalize(pts[i]), glm::vec3(1, 0, 0)), -1.0f, 1.0f));
+    double rho = RankCorrelation(d, angle);
+    std::printf("Wave from a point: rank correlation with distance %.3f\n", rho);
+    CHECK(rho > 0.8, "delay doesn't follow the distance from the seed (%g)", rho);
+
+    std::vector<float> oldWave = HeatWaveDelay(pts, cell, 0.6, 0.02);
+    std::vector<float> bottom  = HeatWaveDelay(pts, cell, 0.6, 0.02, WaveSeed::Bottom, glm::vec3(0.0f));
+    CHECK(oldWave == bottom, "bottom seed differs from the original wave");
+    std::vector<float> top = HeatWaveDelay(pts, cell, 0.6, 0.02, WaveSeed::Top, glm::vec3(0.0f));
+    std::vector<float> negY(pts.size());
+    for (size_t i = 0; i < pts.size(); ++i) negY[i] = -pts[i].y;
+    CHECK(RankCorrelation(top, negY) > 0.8, "top seed doesn't start at the top");
+}
+
+// Springs: overshoot and settle with jiggle; exact without.
+static void TestSprings() {
+    ScalarSprings s;
+    s.Reset({ 0.0f });
+    float peak = 0.0f;
+    for (int f = 0; f < 240; ++f) peak = std::max(peak, s.Step({ 1.0f }, 1.0f / 60.0f, 0.8f)[0]);
+    std::printf("Springs: jiggle 0.8 peaks at %.3f, ends at %.5f\n", peak, s.Values()[0]);
+    CHECK(peak > 1.05f, "no overshoot with jiggle (%g)", peak);
+    CHECK(std::abs(s.Values()[0] - 1.0f) < 1e-3f && s.Settled(), "did not settle (%g)", s.Values()[0]);
+    s.Reset({ 0.0f });
+    CHECK(s.Step({ 0.7f }, 1.0f / 60.0f, 0.0f)[0] == 0.7f, "jiggle 0 should follow exactly");
+}
+
+// Pins: the pinned vertices land exactly on their targets, and the fit
+// itself gets them much closer than an unpinned fit.
+static void TestPins() {
+    IndexedMesh tmpl;
+    MeshTopology::Build(Sphere(glm::vec3(0.0f), 0.8f), tmpl);
+    // target: the sphere stretched into an ellipsoid
+    std::vector<Triangle> target = Sphere(glm::vec3(0.0f), 0.8f);
+    glm::vec3 scale(1.3f, 0.8f, 1.0f);
+    for (Triangle& t : target) { t.v0 *= scale; t.v1 *= scale; t.v2 *= scale; }
+
+    // three vertices each pinned to the stretched position of a vertex
+    // rotated 40 degrees around y: the fit has to twist to honour them
+    glm::mat3 R = glm::mat3_cast(glm::angleAxis(0.7f, glm::vec3(0, 1, 0)));
+    FitParams params;
+    const int n = (int)tmpl.verts.size();
+    for (int v : { 0, n / 3, 2 * n / 3 })
+        params.pins.push_back({ v, scale * (R * tmpl.verts[v]) });
+
+    FitParams none;
+    FitStats sNone, sPins;
+    std::vector<glm::vec3> free = MeshFitter::Fit(tmpl, tmpl.verts, target, none, &sNone);
+    std::vector<glm::vec3> pinned = MeshFitter::Fit(tmpl, tmpl.verts, target, params, &sPins);
+    double freeErr = 0.0;
+    bool exact = true;
+    for (const auto& p : params.pins) {
+        freeErr += glm::length(free[p.first] - p.second) / params.pins.size();
+        exact &= pinned[p.first] == p.second;
+    }
+    std::printf("Pins: pinned fit off by %.4f before the lock, unpinned by %.4f\n", sPins.pinError, freeErr);
+    CHECK(exact, "pinned vertices are not on their targets");
+    CHECK(sPins.pinError < 0.3 * freeErr, "pins barely steer the fit (%g vs %g)", sPins.pinError, freeErr);
+    CHECK(sPins.meanDist < 0.05f, "pinned fit left the surface (%g)", sPins.meanDist);
+}
+
+// Timeline: segment boundaries and durations.
+static void TestTimeline() {
+    MorphTimeline tl;
+    tl.keys = { 1, 2, 3 };
+    tl.SyncSegments();
+    tl.segs[0].duration = 1.0f;
+    tl.segs[1].duration = 3.0f;
+    CHECK(tl.Total() == 4.0f, "total %g", tl.Total());
+    auto at = [&](float p) { return tl.Locate(p); };
+    CHECK(at(0.0f).seg == 0 && at(0.0f).local == 0.0f, "start");
+    CHECK(at(0.125f).seg == 0 && std::abs(at(0.125f).local - 0.5f) < 1e-5f, "inside the first step");
+    CHECK(at(0.25f).seg == 1 && at(0.25f).local == 0.0f, "the middle key starts the second step");
+    CHECK(at(1.0f).seg == 1 && at(1.0f).local == 1.0f, "end");
+    CHECK(std::abs(tl.SegmentStart(1) - 0.25f) < 1e-6f && tl.SegmentEnd(1) == 1.0f, "segment bounds");
+}
+
+// Picking: the frontmost point near the ray.
+static void TestPicking() {
+    std::vector<glm::vec3> pts = { { 0, 0, -1 }, { 0, 0, 1 }, { 0.5f, 0, 0 } };
+    Ray ray{ glm::vec3(0, 0, 5), glm::vec3(0, 0, -1) };
+    CHECK(PickPoint(pts, ray, 0.1f) == 1, "picked %d", PickPoint(pts, ray, 0.1f));
+    Ray miss{ glm::vec3(3, 0, 5), glm::vec3(0, 0, -1) };
+    CHECK(PickPoint(pts, miss, 0.1f) == -1, "should miss");
+    // the screen centre looks straight at the target
+    glm::mat4 view = glm::lookAt(glm::vec3(0, 0, 5), glm::vec3(0), glm::vec3(0, 1, 0));
+    glm::mat4 proj = glm::perspective(0.8f, 1.5f, 0.1f, 100.0f);
+    Ray c = ScreenRay(300.0f, 200.0f, 600.0f, 400.0f, view, proj);
+    CHECK(glm::length(c.dir - glm::vec3(0, 0, -1)) < 1e-4f, "centre ray off");
+}
+
 int main() {
     TestShRotation();
     TestPlyShLayout();
     TestMixtureWarp();
     TestPiecewise();
+    TestCurves();
+    TestWaveFromPoint();
+    TestSprings();
+    TestPins();
+    TestTimeline();
+    TestPicking();
     if (g_failed) {
         std::printf("%d check(s) failed\n", g_failed);
         return 1;

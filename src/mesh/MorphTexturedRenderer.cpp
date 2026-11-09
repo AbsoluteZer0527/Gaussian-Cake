@@ -116,7 +116,10 @@ MorphTexturedRenderer::~MorphTexturedRenderer() { Release(); }
 void MorphTexturedRenderer::Release() {
     if (vao) glDeleteVertexArrays(1, &vao);
     if (vbo) glDeleteBuffers(1, &vbo);
-    vao = vbo = 0;
+    if (vboTime) glDeleteBuffers(1, &vboTime);
+    vao = vbo = vboTime = 0;
+    cornerVertex.clear();
+    hasVertexTimes = false;
     ranges.clear();
     texturesA.clear();
     texturesB.clear();
@@ -188,6 +191,7 @@ void MorphTexturedRenderer::Initialize(const std::vector<glm::vec3>& startPositi
             glm::vec3 vertexStart = startColors.empty() ? glm::vec3(1.0f) : startColors[v];
             glm::vec3 vertexEnd   = endColors.empty() ? glm::vec3(1.0f) : endColors[v];
 
+            cornerVertex.push_back(v);
             Vertex out;
             out.positionStart = startPositions[v];
             out.normalStart   = normalsStart[v];
@@ -222,6 +226,33 @@ void MorphTexturedRenderer::Initialize(const std::vector<glm::vec3>& startPositi
     glBindVertexArray(0);
 }
 
+void MorphTexturedRenderer::SetVertexTimes(const std::vector<float>& times) {
+    if (!vao || cornerVertex.empty()) return;
+    cornerTimes.resize(cornerVertex.size());
+    for (size_t c = 0; c < cornerVertex.size(); ++c) {
+        unsigned int v = cornerVertex[c];
+        cornerTimes[c] = v < times.size() ? times[v] : 0.0f;
+    }
+    glBindVertexArray(vao);
+    bool fresh = !vboTime;
+    if (fresh) glGenBuffers(1, &vboTime);
+    glBindBuffer(GL_ARRAY_BUFFER, vboTime);
+    if (fresh) glBufferData(GL_ARRAY_BUFFER, cornerTimes.size() * sizeof(float), cornerTimes.data(), GL_DYNAMIC_DRAW);
+    else       glBufferSubData(GL_ARRAY_BUFFER, 0, cornerTimes.size() * sizeof(float), cornerTimes.data());
+    glEnableVertexAttribArray(8);
+    glVertexAttribPointer(8, 1, GL_FLOAT, GL_FALSE, sizeof(float), (void*)0);
+    glBindVertexArray(0);
+    hasVertexTimes = true;
+}
+
+void MorphTexturedRenderer::ClearVertexTimes() {
+    if (!vao || !hasVertexTimes) return;
+    glBindVertexArray(vao);
+    glDisableVertexAttribArray(8);
+    glBindVertexArray(0);
+    hasVertexTimes = false;
+}
+
 void MorphTexturedRenderer::Draw(GLuint shaderProgram, const glm::mat4& viewProj, float morphT) {
     if (!vao) return;
     glUseProgram(shaderProgram);
@@ -232,6 +263,8 @@ void MorphTexturedRenderer::Draw(GLuint shaderProgram, const glm::mat4& viewProj
     glUniform1f(loc("alpha"), 1.0f);
     glUniform1f(loc("morphT"), morphT);
     glUniform1i(loc("useMorphTexture"), 1);
+    glUniform1i(loc("usePerVertexT"), hasVertexTimes ? 1 : 0);
+    glUniform1f(loc("sag"), sag);
     glUniform1i(loc("albedoTex"), 0);
     glUniform1i(loc("albedoTexB"), 1);
 
@@ -255,6 +288,8 @@ void MorphTexturedRenderer::Draw(GLuint shaderProgram, const glm::mat4& viewProj
     glUniform1i(loc("useMorphTexture"), 0);
     glUniform1i(loc("useTexture"), 0);
     glUniform1i(loc("useTextureB"), 0);
+    glUniform1i(loc("usePerVertexT"), 0);
+    glUniform1f(loc("sag"), 0.0f);
     glBindVertexArray(0);
     glUseProgram(0);
 }

@@ -11,8 +11,9 @@ project(menv)
 #   morph      signed-distance-field morph (CPU and GPU)
 #   splats     Gaussian splats: generation and rendering
 #   particles  the particle system
+#   director   Morph Director: timing curves, styles, springs, picking, the shape timeline
 # Third-party code: external/ (headers, imgui, Windows GLFW), third_party/glad, see below.
-set(MODULES app core io mesh transport morph splats particles)
+set(MODULES app core io mesh transport morph splats particles director)
 
 set(
     SOURCES
@@ -47,6 +48,12 @@ set(
     src/mesh/MorphTexturedRenderer.cpp
     src/particles/Particle.cpp
     src/particles/ParticleSystem.cpp
+    src/director/MorphCurve.cpp
+    src/director/MorphStyle.cpp
+    src/director/MorphSpring.cpp
+    src/director/MorphTimeline.cpp
+    src/director/MorphDirector.cpp
+    src/director/Picking.cpp
 )
 
 # ---- Third-party code ----

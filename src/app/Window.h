@@ -11,6 +11,8 @@
 #include "SplatRenderer.h"
 #include "PlyLoader.h"
 #include "GltfLoader.h"
+#include "MorphDirector.h"
+#include "MorphTimeline.h"
 
 #include <string>
 #include <vector>
@@ -139,13 +141,23 @@ public:
 
     // OT pipeline
     static void ComputeOTAndSpawnParticles();
-    static void BakeTrueMorph(const std::string& pathA, const std::string& pathB);
+    static void BakeTimeline();          // Topology: bake every segment of the timeline
     static void PollTrueMorphBake();
-    static void UpdateTrueMorph();
+    static void UpdateTrueMorph(float dt = 0.0f);
     static void BakeSplatMorph(const std::string& pathA, const std::string& pathB);
     static void UpdateSplatPreview();
     static void PollSplatBake();
     static void DrawMainGUI();
+
+    // Morph Director: the shape timeline (Topology: key 0 -> key 1 -> ...;
+    // Splats: segment 0 only) with each segment's style and pins, and the
+    // per-point state (origin, paint, springs) of what is playing.
+    static MorphTimeline timeline;
+    static MorphDirector director;
+    static void DrawDirectorGUI();
+    // A click of the current Director tool at window pixel (x, y), as the
+    // mouse would (scripted runs use it to test picking).
+    static void ToolClick(double x, double y);
 
     // Set to a path: the next frame is saved there as a .ppm (scripted runs).
     static std::string screenshotPath;
