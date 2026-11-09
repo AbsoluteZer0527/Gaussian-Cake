@@ -14,6 +14,10 @@
 #include "MorphTimeline.h"
 #include "Picking.h"
 #include "RigidInterp.h"
+#include "SphereMap.h"
+#include "OBJLoader.h"
+#include "GltfLoader.h"
+#include "MeshData.h"
 
 #include <algorithm>
 #include <numeric>
@@ -488,6 +492,91 @@ static void TestFitFolds() {
     CHECK(st.inverted <= st.invertedBeforeUntangle, "the untangle added folds");
 }
 
+// A mesh as the morph loads it: normalized, welded, small holes closed, outward.
+static bool LoadClean(const std::string& path, IndexedMesh& m) {
+    MeshData data;
+    bool ok = path.size() > 4 && path.substr(path.size() - 4) == ".glb" ? GltfLoader::Load(path, data)
+                                                                         : OBJLoader::Load(path, data);
+    if (!ok) return false;
+    OBJLoader::Normalize(data.tris);
+    MeshTopology::Build(data.tris, m);
+    MeshTopology::FillSmallHoles(m, 40);
+    MeshTopology::OrientConsistently(m);
+    MeshTopology::OrientOutward(m);
+    return true;
+}
+
+// Sphere maps: one-to-one (no inside-out triangles) on synthetic and real
+// genus-0 meshes; Kabsch recovers a rotation; Transfer lands on the target.
+static void TestSphereMap() {
+    std::vector<std::pair<std::string, IndexedMesh>> meshes;
+    {
+        // a dented ellipsoid
+        std::vector<Triangle> t = Sphere(glm::vec3(0.0f), 0.8f, 4);
+        auto dent = [](glm::vec3 p) {
+            p *= glm::vec3(1.5f, 0.6f, 1.0f);
+            float d = std::exp(-8.0f * glm::dot(p - glm::vec3(0, 0.48f, 0), p - glm::vec3(0, 0.48f, 0)));
+            return p - glm::vec3(0, 0.5f * d, 0);
+        };
+        for (Triangle& tr : t) { tr.v0 = dent(tr.v0); tr.v1 = dent(tr.v1); tr.v2 = dent(tr.v2); }
+        IndexedMesh m;
+        MeshTopology::Build(t, m);
+        meshes.push_back({ "dented ellipsoid", m });
+    }
+    for (const char* f : { "meshes/bunny.obj", "meshes/MaleHead.obj", "meshes/Duck.glb", "meshes/heart_crystal.obj" }) {
+        IndexedMesh m;
+        if (LoadClean(f, m)) meshes.push_back({ f, m });
+        else std::printf("  (skipped %s: not found)\n", f);
+    }
+    for (auto& [name, m] : meshes) {
+        std::vector<glm::vec3> s;
+        SphereStats st;
+        bool ok = SphereMap::Compute(m, s, &st);
+        float worst = 0.0f;
+        for (const glm::vec3& p : s) worst = std::max(worst, std::abs(glm::length(p) - 1.0f));
+        std::printf("Sphere map %s: %d verts, %d flow steps, roundness %.3f, flipped %d -> %d, %.0f ms\n",
+                    name.c_str(), (int)m.verts.size(), st.flowSteps, st.roundness, st.flippedAfterFlow,
+                    st.flipped, st.ms);
+        CHECK(ok && st.flipped == 0, "%s: %d inside-out triangles", name.c_str(), st.flipped);
+        CHECK(worst < 1e-4f, "%s: off the sphere by %g", name.c_str(), worst);
+    }
+
+    // Kabsch: a known rotation back from point pairs
+    std::mt19937 rng(5);
+    glm::mat3 R = glm::mat3_cast(glm::angleAxis(1.1f, glm::normalize(glm::vec3(1, 2, 3))));
+    std::vector<std::pair<glm::vec3, glm::vec3>> pairs;
+    for (int i = 0; i < 200; ++i) { glm::vec3 d = RandomDir(rng); pairs.push_back({ d, R * d }); }
+    glm::mat3 got = SphereMap::Kabsch(pairs, std::vector<float>(pairs.size(), 1.0f));
+    float err = 0.0f;
+    for (int c = 0; c < 3; ++c) err = std::max(err, glm::length(got[c] - R[c]));
+    CHECK(err < 1e-4f, "Kabsch off by %g", err);
+
+    // Moebius: up to 3 points land exactly, the sphere stays a sphere
+    for (int k = 1; k <= 3; ++k) {
+        std::vector<glm::vec3> from, to, pts;
+        for (int i = 0; i < k; ++i) { from.push_back(RandomDir(rng)); to.push_back(RandomDir(rng)); }
+        pts = from;
+        SphereMap::MoebiusFit(from, to, pts);
+        float miss = 0.0f;
+        for (int i = 0; i < k; ++i) miss = std::max(miss, glm::length(pts[i] - to[i]));
+        std::printf("Moebius with %d pins: worst miss %.2e\n", k, miss);
+        CHECK(miss < 1e-3f, "Moebius with %d pins misses by %g", k, miss);
+    }
+
+    // Transfer: an ellipsoid whose sphere map is known (its own sphere)
+    IndexedMesh sph;
+    MeshTopology::Build(Sphere(glm::vec3(0.0f), 1.0f, 4), sph);
+    IndexedMesh ell = sph;
+    for (glm::vec3& p : ell.verts) p *= glm::vec3(1.5f, 0.5f, 1.0f);
+    std::vector<glm::vec3> pts;
+    for (int i = 0; i < 500; ++i) pts.push_back(RandomDir(rng));
+    std::vector<glm::vec3> on = SphereMap::Transfer(pts, ell, sph.verts);
+    float off = 0.0f;
+    for (size_t i = 0; i < on.size(); ++i) off = std::max(off, glm::length(on[i] - pts[i] * glm::vec3(1.5f, 0.5f, 1.0f)));
+    std::printf("Sphere transfer: worst %.4f from the true ellipsoid point\n", off);
+    CHECK(off < 0.02f, "transfer off by %g", off);
+}
+
 int main() {
     TestShRotation();
     TestPlyShLayout();
@@ -501,6 +590,7 @@ int main() {
     TestPicking();
     TestRigidInterp();
     TestFitFolds();
+    TestSphereMap();
     if (g_failed) {
         std::printf("%d check(s) failed\n", g_failed);
         return 1;

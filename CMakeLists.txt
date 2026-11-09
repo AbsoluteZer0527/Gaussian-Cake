@@ -34,6 +34,8 @@ set(
     src/mesh/SurfaceColor.cpp
     src/mesh/TexturedMeshRenderer.cpp
     src/mesh/MeshFitter.cpp
+    src/mesh/Laplacian.cpp
+    src/mesh/SphereMap.cpp
     src/mesh/MeshRenderer.cpp
     src/transport/Gaussian.cpp
     src/transport/GaussianMixture.cpp

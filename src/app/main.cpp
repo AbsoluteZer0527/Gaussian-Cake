@@ -70,6 +70,7 @@ void print_versions() {
 //        [--origin x,y,z] [--pin ax,ay,az:bx,by,bz] (repeatable) [--jiggle 0..1] [--wave 0..0.8]
 //        [--sag x] [--tool start|brush|pin] (show the tool overlay) [--select k] (inspect step k)
 //        [--rigid 0|1] (shared topology: rigid in-betweens, default on)
+//        [--sphere 0|1] (shared topology: fold-free matching through the sphere, default on)
 //        [--bench a.obj:b.obj,c.obj:d.obj] (bake each pair in Topology mode, print quality numbers)
 //        [--click x,y] (repeatable: a click of the tool at that pixel, after the bake, at time 0)
 // Bakes A -> B, then saves <prefix>_t<time>.ppm for every time and exits.
@@ -116,6 +117,7 @@ static bool ParseArgs(int argc, char** argv, ScriptArgs& args) {
         else if (key == "--sag" || key == "--droop")    args.sag = std::stof(val);
         else if (key == "--bounce")    args.jiggle = std::stof(val);
         else if (key == "--rigid")     Window::rigidInBetweens = (val != "0");
+        else if (key == "--sphere")    Window::sphereMatch = (val != "0");
         else if (key == "--select")    args.select = std::stoi(val);
         else if (key == "--bench") {
             size_t pos = 0;

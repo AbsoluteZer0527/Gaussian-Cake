@@ -58,6 +58,7 @@ public:
     static int         sdfResolution;    // SDF grid points per axis
     static float       fitStiffness;     // multiplier on the template-fit stiffness schedule
     static bool        fitCotan;         // cotan vs uniform Laplacian in the template fit
+    static bool        sphereMatch;      // shared topology: fold-free matching through the sphere
     static bool        rigidInBetweens;  // shared topology: as-rigid-as-possible in-betweens (CPU)
     static int         morphMixtureK;    // parts the OT alignment matches (1 = one affine map)
     static bool        trueMorphActive;

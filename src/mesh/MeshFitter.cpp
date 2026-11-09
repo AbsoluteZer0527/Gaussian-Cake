@@ -1,6 +1,7 @@
 #include "MeshFitter.h"
 #include "MeshSampler.h"
 #include "Parallel.h"
+#include "Laplacian.h"
 
 #include <Eigen/Sparse>
 #include <Eigen/Dense>
@@ -11,56 +12,6 @@
 #include <unordered_map>
 
 using SpMat = Eigen::SparseMatrix<double>;
-
-static Eigen::Vector3d ToE(const glm::vec3& v) { return Eigen::Vector3d(v.x, v.y, v.z); }
-
-static uint64_t PairKey(int i, int j) {
-    if (i > j) std::swap(i, j);
-    return ((uint64_t)i << 32) | (uint64_t)j;
-}
-
-// Cotan weight of every edge of forms.edges on the given positions:
-// w_ij = (cot alpha + cot beta) / 2, alpha and beta the angles opposite the edge.
-// This is the diagonal Hodge star on 1-forms (DEC's *1). Obtuse angles can make
-// a weight negative; that's fine and kept as is: d0^T W d0 is the Dirichlet
-// energy of piecewise-linear functions, so it stays positive semidefinite, and
-// clamping would cost the exact "linear functions have zero Laplacian" property.
-// Slivers are the real danger: a near-zero-area triangle has a cot near +-1e8,
-// so those faces are skipped (their edges keep the weight from the other side).
-static std::vector<double> CotanWeights(const IndexedMesh& m, const DiscreteForms& forms,
-                                        const std::vector<glm::vec3>& pos) {
-    const int E = (int)forms.edges.size();
-    std::unordered_map<uint64_t, int> edgeId;
-    edgeId.reserve(E);
-    for (int e = 0; e < E; ++e)
-        edgeId[PairKey(forms.edges[e][0], forms.edges[e][1])] = e;
-
-    std::vector<double> w(E, 0.0);
-    for (int f = 0; f < m.FaceCount(); ++f) {
-        // shape quality: 1 for equilateral, 0 for a sliver (2 area / sum of squared edges, scaled)
-        glm::vec3 p0 = pos[m.indices[3 * f + 0]];
-        glm::vec3 p1 = pos[m.indices[3 * f + 1]];
-        glm::vec3 p2 = pos[m.indices[3 * f + 2]];
-        double twiceArea = ToE(p1 - p0).cross(ToE(p2 - p0)).norm();
-        double edgeSq = ToE(p1 - p0).squaredNorm() + ToE(p2 - p1).squaredNorm() + ToE(p0 - p2).squaredNorm();
-        if (edgeSq <= 0.0 || 2.0 * std::sqrt(3.0) * twiceArea / edgeSq < 1e-4) continue;
-
-        for (int k = 0; k < 3; ++k) {
-            // corner c, and the edge (a, b) across from it
-            int c = (int)m.indices[3 * f + k];
-            int a = (int)m.indices[3 * f + (k + 1) % 3];
-            int b = (int)m.indices[3 * f + (k + 2) % 3];
-
-            Eigen::Vector3d u = ToE(pos[a] - pos[c]);
-            Eigen::Vector3d v = ToE(pos[b] - pos[c]);
-            double sinArea = u.cross(v).norm();   // |u||v| sin(angle), > 0 after the check above
-            double cot = u.dot(v) / sinArea;      // |u||v| cos / |u||v| sin
-
-            w[edgeId[PairKey(a, b)]] += 0.5 * cot;
-        }
-    }
-    return w;
-}
 
 // Row-normalized Laplacian L = D^-1 C, with C = d0^T W d0 and D = diag(C).
 // W = I gives the uniform Laplacian (L_ii = 1, L_ij = -1/deg); W = cotan weights
@@ -133,8 +84,8 @@ int MeshFitter::CountFlips(const IndexedMesh& tmpl, const std::vector<glm::vec3>
 
 // Faces that face against the target surface they lie on (dot of the face
 // normal with the target's normal at the face centre < 0): visible folds.
-static int CountInverted(const IndexedMesh& tmpl, const std::vector<glm::vec3>& X, const SurfaceBVH& bvh,
-                         std::vector<int>* faces = nullptr) {
+int MeshFitter::CountInverted(const IndexedMesh& tmpl, const std::vector<glm::vec3>& X, const SurfaceBVH& bvh,
+                              std::vector<int>* faces) {
     const int F = tmpl.FaceCount();
     std::vector<char> bad(F, 0);
     ParallelFor(F, [&](int f) {

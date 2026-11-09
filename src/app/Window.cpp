@@ -2,6 +2,7 @@
 #include "Parallel.h"
 #include "PiecewiseMorph.h"
 #include "RigidInterp.h"
+#include "SphereMap.h"
 
 #include "imgui.h"
 #include "imgui_impl_glfw.h"
@@ -1869,6 +1870,7 @@ struct TrueMorphSettings {
     float sinkhornEps, posteriorTemp;
     glm::vec3 fallbackColor;   // display colour of a mesh without colours, beside one with them
     std::vector<MorphPin> pins;   // Morph Director: points on A that must land on points on B
+    bool sphereMatch = true;      // shared topology: fold-free matching through the sphere
 };
 
 struct TrueMorphResult {
@@ -1899,6 +1901,7 @@ struct TrueMorphResult {
 static PiecewiseMorph g_piecewise;
 static RigidInterp    g_rigid;        // rigid in-betweens of the active shared step (built on first use)
 bool Window::rigidInBetweens = true;
+bool Window::sphereMatch = true;
 static bool g_morphPiecewise = false;
 static int  g_pieceShown = -1;   // segment the mesh renderer holds
 
@@ -1993,14 +1996,85 @@ static TrueMorphResult RunTrueMorphBake(TrueMorphSettings st) {
         if (!st.pins.empty()) {
             PointGrid grid;
             grid.Build(tmpl.verts, 0.05f);
+            SurfaceBVH onTarget;   // a pin's other end, snapped onto the target's surface
+            onTarget.Build(templateIsA ? trisB : trisA);
             for (const MorphPin& pin : st.pins) {
                 int v = grid.Nearest(templateIsA ? pin.onA : pin.onB);
-                if (v >= 0) params.pins.push_back({ v, templateIsA ? pin.onB : pin.onA });
+                if (v >= 0) params.pins.push_back({ v, onTarget.Closest(templateIsA ? pin.onB : pin.onA).point });
             }
         }
         FitStats stats;
-        std::vector<glm::vec3> fitted = MeshFitter::Fit(tmpl, aligned,
-                                                        templateIsA ? trisB : trisA, params, &stats);
+        std::vector<glm::vec3> fitted;
+        // Fold-free matching: when both are closed genus-0 surfaces, match
+        // them through the sphere (SphereMap) instead of pulling the template
+        // onto the target, which folds where the shapes differ a lot.
+        std::string matchNote;
+        if (st.sphereMatch) {
+            const std::vector<Triangle>& targetTris = templateIsA ? trisB : trisA;
+            auto t1 = std::chrono::steady_clock::now();
+            std::vector<glm::vec3> sT, sO;
+            SphereStats ssT, ssO;
+            bool ok = SphereMap::Compute(tmpl, sT, &ssT) && SphereMap::Compute(other, sO, &ssO);
+            if (ok) {
+                // turn the template's sphere to agree with the rough OT alignment:
+                // where each (aligned) template vertex lands on the target, on its sphere
+                SurfaceBVH bvhO;
+                bvhO.Build(targetTris);
+                std::vector<std::pair<glm::vec3, glm::vec3>> pairs;
+                std::vector<float> weights;
+                int stride = std::max(1, (int)tmpl.verts.size() / 2000);
+                for (size_t i = 0; i < tmpl.verts.size(); i += stride) {
+                    SurfaceBVH::Hit h = bvhO.Closest(aligned[i]);
+                    if (h.tri < 0) continue;
+                    unsigned a = other.indices[3 * h.tri], b = other.indices[3 * h.tri + 1], c = other.indices[3 * h.tri + 2];
+                    glm::vec3 w = Barycentric(h.point, other.verts[a], other.verts[b], other.verts[c]);
+                    pairs.push_back({ sT[i], glm::normalize(w.x * sO[a] + w.y * sO[b] + w.z * sO[c]) });
+                    weights.push_back(1.0f);
+                }
+                float pinW = 0.1f * (float)pairs.size();   // a pin counts like a tenth of everything else
+                for (const auto& pin : params.pins) {
+                    pairs.push_back({ sT[pin.first], SphereMap::SpherePointOf(other, sO, pin.second) });
+                    weights.push_back(pinW);
+                }
+                glm::mat3 R = SphereMap::Kabsch(pairs, weights);
+                std::vector<glm::vec3> turned(sT.size());
+                for (size_t i = 0; i < sT.size(); ++i) turned[i] = R * sT[i];
+                // Pins: a Moebius map of the sphere takes up to 3 of them
+                // exactly where they belong, and stays one-to-one (no folds)
+                std::vector<glm::vec3> pinFrom, pinTo;
+                for (size_t k = 0; k < params.pins.size() && k < 3; ++k) {
+                    pinFrom.push_back(turned[params.pins[k].first]);
+                    pinTo.push_back(SphereMap::SpherePointOf(other, sO, params.pins[k].second));
+                }
+                SphereMap::MoebiusFit(pinFrom, pinTo, turned);
+                fitted = SphereMap::Transfer(turned, other, sO);
+                // a 4th pin and beyond: a light, stiff fit from here that holds them all
+                FitStats pinStats;
+                if (params.pins.size() > 3) {
+                    FitParams light = params;
+                    light.stages = 3;
+                    light.stiffnessEnd = 5.0f;
+                    fitted = MeshFitter::Fit(tmpl, fitted, targetTris, light, &pinStats);
+                } else {
+                    float err = 0.0f;
+                    for (const auto& pin : params.pins) err += glm::length(fitted[pin.first] - pin.second);
+                    pinStats.pinError = params.pins.empty() ? 0.0f : err / params.pins.size();
+                }
+                stats.flipped  = MeshFitter::CountFlips(tmpl, aligned, fitted);
+                stats.inverted = MeshFitter::CountInverted(tmpl, fitted, bvhO);
+                stats.meanDist = params.pins.empty() ? 0.0f : pinStats.meanDist;
+                stats.pinError = pinStats.pinError;
+                stats.ms = MsSince(t1);
+                char note[128];
+                snprintf(note, sizeof(note), " Matched through the sphere (%d + %d flow steps).",
+                         ssT.flowSteps, ssO.flowSteps);
+                matchNote = note;
+            } else {
+                matchNote = " Sphere matching unavailable (not two closed genus-0 surfaces, or the sphere map folded): fitted instead.";
+            }
+        }
+        if (fitted.empty())
+            fitted = MeshFitter::Fit(tmpl, aligned, templateIsA ? trisB : trisA, params, &stats);
         res.folds    = stats.flipped;
         res.inverted = stats.inverted;
         res.fitError = stats.meanDist;
@@ -2028,11 +2102,12 @@ static TrueMorphResult RunTrueMorphBake(TrueMorphSettings st) {
                      (int)params.pins.size(), stats.pinError);
         snprintf(buf, sizeof(buf),
                  "Shared topology: %s (%d tris%s) fitted onto %s in %.0f ms. "
-                 "Mean error %.4f, %d folded tris.%s%s%s",
+                 "Mean error %.4f, %d folded tris.%s%s%s",   // folded = facing against the target
                  (templateIsA ? nameA : nameB).c_str(), tmpl.FaceCount(),
                  subdivided ? ", subdivided" : "", (templateIsA ? nameB : nameA).c_str(),
-                 stats.ms, stats.meanDist, stats.flipped, pinText,
+                 stats.ms, stats.meanDist, stats.inverted, pinText,
                  mismatch.empty() ? "" : " Warning: ", mismatch.c_str());
+        strncat(buf, matchNote.c_str(), sizeof(buf) - strlen(buf) - 1);
     } else {
         res.piecewise = st.method == MorphMethod::Piecewise ||
                         (st.method == MorphMethod::Auto && !mismatch.empty());
@@ -2133,7 +2208,7 @@ static std::string MorphBakeKey(const TrueMorphSettings& st) {
            std::to_string(st.mixtureK) + "|" + std::to_string(st.sinkhornEps) + "|" +
            std::to_string(st.posteriorTemp) + "|" +
            std::to_string(st.fallbackColor.x) + "," + std::to_string(st.fallbackColor.y) + "," +
-           std::to_string(st.fallbackColor.z) + PinKey(st.pins);
+           std::to_string(st.fallbackColor.z) + PinKey(st.pins) + (st.sphereMatch ? "|sphere" : "");
 }
 
 // Puts segment k's baked data into the g_morph* globals the playback uses,
@@ -2221,6 +2296,7 @@ static TrueMorphSettings SegmentSettings(int k) {
     st.posteriorTemp = Window::posteriorTemp;
     st.fallbackColor = glm::sqrt(Window::meshRenderer->diffuseColor);   // shader.frag's grey, as a display value
     st.pins          = tl.segs[k].pins;
+    st.sphereMatch   = Window::sphereMatch;
     return st;
 }
 
@@ -3209,6 +3285,10 @@ void Window::DrawMainGUI() {
                                       "K = a Gaussian mixture on each shape, matched part to part\n"
                                       "by Sinkhorn (in-between shapes stay closer to A and B).\n"
                                       "Used only as strongly as it can be without folding.");
+                ImGui::Checkbox("Fold-free matching", &sphereMatch);
+                ImGui::SetItemTooltip("Shared topology, closed shapes without holes: match the two\n"
+                                      "surfaces through a sphere, so the template can't fold over\n"
+                                      "itself (off: pull the template onto the target)");
                 if (ImGui::Checkbox("Rigid in-betweens", &rigidInBetweens)) g_morphShown = MorphShown::None;
                 ImGui::SetItemTooltip("Shared topology: turning parts keep their size mid-morph\n"
                                       "(each triangle rotates and stretches, solved on the CPU).\n"

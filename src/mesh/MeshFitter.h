@@ -50,6 +50,10 @@ class MeshFitter {
 public:
     // Faces whose normal turned more than 90 degrees from `rest` (folded over);
     // their indices go to flippedFaces if given.
+    // Faces that face against the target surface they lie on: visible folds.
+    static int CountInverted(const IndexedMesh& tmpl, const std::vector<glm::vec3>& X, const SurfaceBVH& bvh,
+                             std::vector<int>* faces = nullptr);
+
     static int CountFlips(const IndexedMesh& tmpl, const std::vector<glm::vec3>& rest,
                           const std::vector<glm::vec3>& X, std::vector<int>* flippedFaces = nullptr);
 

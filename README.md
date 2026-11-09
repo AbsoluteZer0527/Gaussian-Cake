@@ -125,6 +125,8 @@ In Topology and Splats modes, the **Animation** window on the right lets you dir
 
   While a tool is on, the shape shows the timing from orange (first) to blue (last).
 
+Two closed shapes without holes are matched **through a sphere** (Settings → Advanced → Fold-free matching): both surfaces are flowed onto a sphere (conformalized mean-curvature flow), lined up, and every template vertex is carried onto the target from there, so the template can't fold over itself (visible folds on bunny → head: 345 → 14). Up to 3 pins are honoured exactly by a Möbius map of the sphere, still without folds.
+
 Shared-topology steps use **rigid in-betweens** by default (Settings → Advanced): each triangle turns and stretches on its way rather than moving in a straight line, so parts that rotate keep their size instead of collapsing mid-morph (about 0.5 ms per frame on the CPU for the bunny).
 
 Wave, brush, bounce and pins need a step whose two shapes share one mesh. Steps that change topology (Piecewise/SDF) follow the Lead curve only.
