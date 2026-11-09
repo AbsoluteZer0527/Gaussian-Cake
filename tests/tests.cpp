@@ -396,6 +396,26 @@ static void TestTimeline() {
     CHECK(at(0.25f).seg == 1 && at(0.25f).local == 0.0f, "the middle key starts the second step");
     CHECK(at(1.0f).seg == 1 && at(1.0f).local == 1.0f, "end");
     CHECK(std::abs(tl.SegmentStart(1) - 0.25f) < 1e-6f && tl.SegmentEnd(1) == 1.0f, "segment bounds");
+
+    // retiming a key moves time between its two steps, never below the minimum
+    tl.Retime(1, 2.5f);
+    CHECK(std::abs(tl.segs[0].duration - 2.5f) < 1e-5f && std::abs(tl.segs[1].duration - 1.5f) < 1e-5f &&
+          std::abs(tl.Total() - 4.0f) < 1e-5f, "retime to 2.5 s: %g + %g", tl.segs[0].duration, tl.segs[1].duration);
+    tl.Retime(1, 100.0f);
+    CHECK(std::abs(tl.segs[1].duration - MorphTimeline::kMinStep) < 1e-5f, "retime keeps the minimum step");
+    tl.Retime(0, 1.0f);   // the ends don't move
+    CHECK(std::abs(tl.Total() - 4.0f) < 1e-5f && tl.KeyTime(0) == 0.0f, "the start key moved");
+
+    // adding and removing keys keeps one step per pair; removing an inner key merges its steps
+    tl.segs[0].pins.push_back({});
+    tl.AddKey(4);
+    CHECK(tl.keys.size() == 4 && tl.segs.size() == 3 && tl.segs[2].pins.empty(), "add key");
+    float before = tl.Total();
+    tl.RemoveKey(1);
+    CHECK(tl.keys.size() == 3 && tl.segs.size() == 2 && tl.keys[1] == 3, "remove key");
+    CHECK(std::abs(tl.Total() - before) < 1e-5f, "removing an inner key changed the length (%g vs %g)", tl.Total(), before);
+    tl.SetKey(0, 7);
+    CHECK(tl.keys[0] == 7 && tl.segs[0].pins.empty(), "set key clears the step's pins");
 }
 
 // Picking: the frontmost point near the ray.

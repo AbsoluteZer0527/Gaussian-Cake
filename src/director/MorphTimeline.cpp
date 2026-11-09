@@ -1,5 +1,4 @@
 #include "MorphTimeline.h"
-#include "imgui.h"
 #include <algorithm>
 
 MorphTimeline::MorphTimeline() {
@@ -59,61 +58,48 @@ void MorphTimeline::ApplyPreset(int seg, int preset) {
     if (preset < 0 || preset >= (int)styles.size()) return;
     segs[seg].style = styles[preset];
     segs[seg].preset = preset;
+    segs[seg].easingLinked = styles[preset].early == styles[preset].late;
+    segs[seg].easingEdit = 0;
 }
 
-bool MorphTimeline::DrawGUI(const std::function<bool(const char*, int&)>& shapeCombo) {
-    bool changed = false, reordered = false;
-    int removeKey = -1, moveUp = -1;
-    for (int k = 0; k < (int)keys.size(); ++k) {
-        ImGui::PushID(k);
-        char label[32];
-        snprintf(label, sizeof(label), k == 0 ? "Start" : "Key %d", k);
-        if (shapeCombo(label, keys[k])) {
-            changed = true;   // pins were placed on the old shape
-            if (k > 0) segs[k - 1].pins.clear();
-            if (k < (int)segs.size()) segs[k].pins.clear();
-        }
-        ImGui::SameLine();
-        ImGui::BeginDisabled(k == 0);
-        if (ImGui::SmallButton("^")) moveUp = k;
-        ImGui::EndDisabled();
-        ImGui::SetItemTooltip("Move this shape earlier");
-        ImGui::SameLine();
-        ImGui::BeginDisabled(keys.size() <= 2);
-        if (ImGui::SmallButton("x")) removeKey = k;
-        ImGui::EndDisabled();
-        ImGui::SetItemTooltip("Remove this shape");
+float MorphTimeline::KeyTime(int k) const {
+    float t = 0.0f;
+    for (int i = 0; i < k && i < (int)segs.size(); ++i) t += std::max(segs[i].duration, 0.01f);
+    return t;
+}
 
-        // the segment from this key to the next one: a selectable row
-        if (k + 1 < (int)keys.size()) {
-            const MorphSegmentSpec& s = segs[k];
-            char row[96];
-            snprintf(row, sizeof(row), "   |  %s, %.1f s%s", s.style.name.c_str(), s.duration,
-                     s.pins.empty() ? "" : (", " + std::to_string(s.pins.size()) + " pins").c_str());
-            if (ImGui::Selectable(row, selected == k)) selected = k;
-            ImGui::SetItemTooltip("Click to edit how this step moves");
-        }
-        ImGui::PopID();
-    }
-    if (ImGui::Button("+ Add shape")) {
-        keys.push_back(keys.back());
-        SyncSegments();
-        selected = (int)segs.size() - 1;
-        segs.back().pins.clear();
-        changed = true;
-    }
-    if (moveUp > 0) {
-        std::swap(keys[moveUp], keys[moveUp - 1]);
-        changed = reordered = true;
-    }
-    if (removeKey >= 0) {
-        keys.erase(keys.begin() + removeKey);
-        int seg = std::min(removeKey, (int)segs.size() - 1);
-        segs.erase(segs.begin() + seg);
-        SyncSegments();
-        changed = reordered = true;
-    }
-    if (reordered)   // pins were placed on the old pairs of shapes
-        for (auto& s : segs) s.pins.clear();
-    return changed;
+void MorphTimeline::AddKey(int mesh) {
+    keys.push_back(mesh);
+    SyncSegments();
+    segs.back().pins.clear();
+    selected = (int)segs.size() - 1;
+}
+
+void MorphTimeline::RemoveKey(int k) {
+    if (keys.size() <= 2 || k < 0 || k >= (int)keys.size()) return;
+    // the step before the key absorbs the one after it (the first key: the next step goes)
+    int keep = std::max(k - 1, 0), drop = std::min(k, (int)segs.size() - 1);
+    if (k > 0 && k < (int)keys.size() - 1) segs[keep].duration += segs[drop].duration;
+    keys.erase(keys.begin() + k);
+    segs.erase(segs.begin() + drop);
+    if (keep < (int)segs.size()) segs[keep].pins.clear();
+    SyncSegments();
+    selectedKey = -1;
+}
+
+void MorphTimeline::SetKey(int k, int mesh) {
+    if (k < 0 || k >= (int)keys.size() || keys[k] == mesh) return;
+    keys[k] = mesh;
+    // pins were placed on the old shape
+    if (k > 0) segs[k - 1].pins.clear();
+    if (k < (int)segs.size()) segs[k].pins.clear();
+}
+
+void MorphTimeline::Retime(int k, float t) {
+    if (k <= 0 || k >= (int)keys.size() - 1) return;
+    float a = KeyTime(k - 1), b = KeyTime(k + 1);
+    if (b - a < 2.0f * kMinStep) return;
+    t = std::clamp(t, a + kMinStep, b - kMinStep);
+    segs[k - 1].duration = t - a;
+    segs[k].duration = b - t;
 }

@@ -14,8 +14,16 @@
 // (start + u (end - start)).
 class MorphDirector {
 public:
-    enum class Tool { Orbit, Origin, PaintEarly, PaintLate, Pin };
-    Tool tool = Tool::Orbit;
+    // Navigate: turn the camera. StartPoint: click where the change starts.
+    // TimingBrush: paint parts to change sooner or later. Pin: pair a point
+    // on the start shape with where it must land on the end shape.
+    enum class Tool { Navigate, StartPoint, TimingBrush, Pin };
+    Tool tool = Tool::Navigate;
+    bool brushLater = false;              // the brush makes parts change later (else sooner)
+
+    // Under the mouse (the brush cursor): a point on the shown shape
+    bool hasHover = false;
+    glm::vec3 hoverPoint = glm::vec3(0.0f);
 
     glm::vec3 origin = glm::vec3(0.0f);   // the clicked origin (normalized mesh space)
     bool  hasOrigin = false;
@@ -45,7 +53,7 @@ public:
     // Forget the delays, so the next UpdateDelay solves again.
     void InvalidateDelay() { solvedMode = -1; }
 
-    // Brush: sign < 0 makes the area leave earlier, > 0 later.
+    // Timing brush: sign < 0 makes the area change sooner, > 0 later.
     void Paint(const glm::vec3& center, float sign);
     void ClearPaint();
     bool HasPaint() const { return hasPaint; }

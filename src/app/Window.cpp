@@ -24,6 +24,7 @@
 #include "MorphDirector.h"
 #include "MorphTimeline.h"
 #include "Picking.h"
+#include "DirectorWidgets.h"
 
 #include <glm/gtc/quaternion.hpp>
 #include <chrono>
@@ -121,7 +122,7 @@ static void SetPickSurface(const std::vector<glm::vec3>& pts, const std::vector<
 static void ShowPinStage(bool endShape);
 
 static bool OverlayActive() {
-    return Window::director.tool != MorphDirector::Tool::Orbit &&
+    return Window::director.tool != MorphDirector::Tool::Navigate &&
            Window::renderMode == RenderMode::TriangleMorph && !g_pickIndices.empty();
 }
 
@@ -756,6 +757,11 @@ void Window::idleCallback() {
     } else if (particleMorphActive) {
         animator->Update(deltaTime, particleSystem->transportPositions);
     }
+
+    // Loop: start again once the end has shown (and, in Topology, settled)
+    if (loopPlayback && (trueMorphActive || splatMorphActive) && animator->state == AnimationState::GAUSSIAN_B &&
+        !animator->IsHeld() && (!trueMorphActive || g_morphShown == MorphShown::B))
+        animator->Play();
 
     // after the animator, so particles show this frame's transport positions
     particleSystem->Update(deltaTime);
@@ -2370,7 +2376,7 @@ void Window::UpdateTrueMorph(float dt) {
 
     if (g_morphShared) {
         float t = u ? 0.0f : style.early.Eval(local);   // no director: one time for all
-        bool tools = director.tool != MorphDirector::Tool::Orbit;
+        bool tools = director.tool != MorphDirector::Tool::Navigate;
         // the CPU positions: for the CPU path, and for the tools to pick from
         if (!gpu || tools) {
             for (size_t i = 0; i < g_sharedCurrent.size(); ++i) {
@@ -2538,13 +2544,91 @@ static void HintText(const char* text) {
     ImGui::TextDisabled("%s", text);
 }
 
-// The Animation window (Topology and Splats), on the right of the screen:
-// the shape timeline, how the selected step moves, the tools that place its
-// origin, paint and pins, and a scrub bar.
+// ---- Animation window ----
+
+bool Window::loopPlayback = false;
+
+// True if Bake It! could start now.
+static bool CanBakeNow() {
+    if (Window::splatBaking || Window::morphBaking) return false;
+    if (Window::renderMode == RenderMode::TriangleMorph) return TimelineBakeable();
+    if (Window::renderMode == RenderMode::Splats) return Window::meshIndexA > 0 && Window::meshIndexB > 0;
+    return true;
+}
+
+// Topology: the shapes, pins or bake settings changed since the last bake.
+static bool TimelineStale() {
+    if (Window::renderMode != RenderMode::TriangleMorph || !Window::trueMorphActive || !TimelineBakeable())
+        return false;
+    const MorphTimeline& tl = Window::timeline;
+    if (g_segKeys.size() != tl.segs.size()) return true;
+    for (int k = 0; k < (int)tl.segs.size(); ++k)
+        if (g_segKeys[k] != MorphBakeKey(SegmentSettings(k))) return true;
+    return false;
+}
+
+void Window::TogglePlay() {
+    bool baked = trueMorphActive || splatMorphActive;
+    if (!baked || TimelineStale()) {   // bake (only what changed), then it plays
+        if (CanBakeNow()) ComputeOTAndSpawnParticles();
+        return;
+    }
+    if (animator->IsPlaying()) animator->Pause();
+    else                       animator->Play();
+}
+
+void Window::SelectTool(MorphDirector::Tool t) {
+    bool wasPin = director.tool == MorphDirector::Tool::Pin;
+    director.tool = t;
+    director.pinWaitingForB = false;
+    director.hasHover = false;
+    if (t == MorphDirector::Tool::Pin) ShowPinStage(false);
+    else if (wasPin && g_previewIndexOverride >= 0) { g_previewIndexOverride = -1; g_previewGen++; }
+}
+
+// Pin tool: two numbered dots, start shape -> end shape; the next click's one lit.
+static void PinSteps(bool waitingForB) {
+    float h = ImGui::GetFrameHeight();
+    ImVec2 p = ImGui::GetCursorScreenPos();
+    ImDrawList* dl = ImGui::GetWindowDrawList();
+    const char* labels[2] = { "1", "2" };
+    float r = 0.38f * h, gap = 2.6f * r;
+    for (int i = 0; i < 2; ++i) {
+        ImVec2 c(p.x + r + i * (gap + r), p.y + 0.5f * h);
+        bool on = (i == 1) == waitingForB;
+        dl->AddCircleFilled(c, r, on ? AccentColor() : ImGui::GetColorU32(ImGuiCol_FrameBg));
+        ImVec2 ts = ImGui::CalcTextSize(labels[i]);
+        dl->AddText(ImVec2(c.x - 0.5f * ts.x, c.y - 0.5f * ts.y),
+                    on ? IM_COL32(20, 20, 24, 255) : ImGui::GetColorU32(ImGuiCol_TextDisabled), labels[i]);
+        if (i == 0) {   // arrow to the second dot
+            float x0 = c.x + r + 3.0f, x1 = c.x + gap + r - r - 3.0f;
+            dl->AddLine(ImVec2(x0, c.y), ImVec2(x1, c.y), ImGui::GetColorU32(ImGuiCol_TextDisabled), 1.5f);
+            dl->AddTriangleFilled(ImVec2(x1 + 3.0f, c.y), ImVec2(x1 - 3.0f, c.y - 3.5f), ImVec2(x1 - 3.0f, c.y + 3.5f),
+                                  ImGui::GetColorU32(ImGuiCol_TextDisabled));
+        }
+    }
+    ImGui::Dummy(ImVec2(2.0f * r + gap + r + r, h));
+    ImGui::SetItemTooltip(waitingForB ? "2: now click where that point should land on the END shape"
+                                      : "1: click a point on the START shape\n2: then where it should land on the end shape");
+}
+
+// A property row: a dim label in a fixed column, then the control.
+static void PropLabel(const char* label, const char* tooltip) {
+    ImGui::AlignTextToFramePadding();
+    ImGui::TextDisabled("%s", label);
+    if (tooltip) ImGui::SetItemTooltip("%s", tooltip);
+    ImGui::SameLine(ImGui::CalcTextSize("Spread from").x + 2.0f * ImGui::GetStyle().ItemSpacing.x);
+    ImGui::SetNextItemWidth(-1.0f);
+}
+
+// The Animation window (Topology and Splats), on the right of the screen.
+// Visual first: a transport bar and a dope-sheet track, style tiles, an
+// easing curve, an icon toolbar. Explanations live in the tooltips.
 void Window::DrawDirectorGUI() {
     if (renderMode == RenderMode::Particles) return;
     MorphTimeline& tl = timeline;
     tl.SyncSegments();
+    const bool topo = renderMode == RenderMode::TriangleMorph;
 
     // Pinned to the right edge: placed there on first use and whenever the
     // app window changes size; it can still be moved or resized by hand.
@@ -2562,155 +2646,264 @@ void Window::DrawDirectorGUI() {
         ImGui::End();
         return;
     }
-    ImGui::PushItemWidth(ImGui::GetFontSize() * -8.0f);   // room for labels on the right
 
-    const bool topo = renderMode == RenderMode::TriangleMorph;
+    const bool baked = trueMorphActive || splatMorphActive;
+    const bool stale = TimelineStale();
+    const float icon = ImGui::GetFrameHeight() * 1.15f;
+    // Splats play one step: show the track with just the first two shapes
+    MorphTimeline splatView;
+    if (!topo) {
+        splatView = tl;
+        splatView.keys.resize(2);
+        splatView.SyncSegments();
+        splatView.selected = 0;
+        splatView.selectedKey = -1;
+    }
+    const MorphTimeline& shown = topo ? tl : splatView;
     const int sel = topo ? tl.selected : 0;
     MorphSegmentSpec& seg = tl.segs[sel];
     MorphStyle& style = seg.style;
-    bool edited = false;
 
-    // ---- the shape timeline (Topology): start -> key 1 -> key 2 ... ----
+    // ---- transport ----
+    float rowY = ImGui::GetCursorPosY();
+    if (IconButton("##tostart", Icon::ToStart, false, "Go to start  (Home)", icon) && baked) animator->Seek(0.0f);
+    ImGui::SameLine(0.0f, 2.0f);
+    bool playing = baked && !stale && animator->IsPlaying();
+    ImGui::BeginDisabled(!(baked && !stale) && !CanBakeNow());
+    if (IconButton("##play", playing ? Icon::Pause : Icon::Play, playing,
+                   playing ? "Pause  (Space)" : (baked && !stale) ? "Play  (Space)" : "Bake and play  (Space)", icon))
+        TogglePlay();
+    ImGui::EndDisabled();
+    ImGui::SameLine(0.0f, 2.0f);
+    if (IconButton("##toend", Icon::ToEnd, false, "Go to end  (End)", icon) && baked) animator->Seek(1.0f);
+    ImGui::SameLine(0.0f, 2.0f);
+    if (IconButton("##loop", Icon::Loop, loopPlayback, loopPlayback ? "Loop: on" : "Loop: off", icon))
+        loopPlayback = !loopPlayback;
+    ImGui::SameLine();
+    float total = topo ? tl.Total() : tl.segs[0].duration;
+    ImGui::SetCursorPosY(rowY + 0.5f * (icon - ImGui::GetTextLineHeight()));
+    ImGui::Text("%.1f", (baked ? animator->GetProgress() : 0.0f) * total);
+    ImGui::SameLine(0.0f, 2.0f);
+    ImGui::SetCursorPosY(rowY + 0.5f * (icon - ImGui::GetTextLineHeight()));
+    ImGui::TextDisabled("/ %.1f s", total);
+    if (morphBaking || splatBaking) {
+        ImGui::SameLine();
+        ImGui::SetCursorPosY(rowY + 0.5f * (icon - ImGui::GetFrameHeight()));
+        Badge("baking...", IM_COL32(170, 170, 185, 255), "Working out how every part moves");
+    } else if (stale) {
+        ImGui::SameLine();
+        ImGui::SetCursorPosY(rowY + 0.5f * (icon - ImGui::GetFrameHeight()));
+        Badge("changed", IM_COL32(255, 196, 80, 255),
+              "Shapes, pins or settings changed since the last bake.\nPlay bakes the changed steps again.");
+    }
+    ImGui::SetCursorPosY(rowY + icon + ImGui::GetStyle().ItemSpacing.y);
+
+    // ---- the track ----
+    TrackResult r;
+    TimelineTrack("##track", shown, baked ? animator->GetProgress() : 0.0f, topo, meshNames, r);
+    bool keysChanged = false;
+    if (r.seek && baked) animator->Seek(r.progress);
+    if (r.selectSeg >= 0 && topo) { tl.selected = r.selectSeg; tl.selectedKey = -1; }
+    if (r.selectKey >= 0 && topo) {
+        tl.selectedKey = r.selectKey;
+        tl.selected = std::min(r.selectKey, (int)tl.segs.size() - 1);
+    }
+    if (r.retimeKey >= 0) tl.Retime(r.retimeKey, r.retimeTime);
+    if (r.addKey)         { tl.AddKey(tl.keys.back()); keysChanged = true; }
+    if (r.deleteKey >= 0) { tl.RemoveKey(r.deleteKey); keysChanged = true; }
+    if (r.shapeKey >= 0)  { tl.SetKey(r.shapeKey, r.shapeMesh); keysChanged = true; }
+    if (r.styleSeg >= 0) {
+        int s = topo ? r.styleSeg : 0;
+        tl.ApplyPreset(s, r.styleIndex);
+        tl.selected = s;
+    }
+
+    // ---- the selected step ----
+    ImGui::Spacing();
     if (topo) {
-        ImGui::SeparatorText("Timeline");
-        if (tl.DrawGUI(DrawShapeCombo)) {
-            SyncTimelineKeys();
-            StopAllMorphs();   // show the newly selected source right away
-        }
-    }
-
-    ImGui::SeparatorText(topo ? "Selected step" : "Style");
-    if (topo && tl.segs.size() > 1) {
-        auto name = [](int key) {
-            return key > 0 && key <= (int)meshNames.size() ? meshNames[key - 1].c_str() : "blob";
-        };
-        ImGui::Text("Step %d: %s -> %s", sel + 1, name(tl.keys[sel]), name(tl.keys[sel + 1]));
-    }
-    ImGui::SliderFloat("Duration (s)", &seg.duration, 0.3f, 10.0f, "%.1f");
-
-    // ---- style presets ----
-    const auto& styles = BuiltinStyles();
-    float avail = ImGui::GetContentRegionAvail().x, used = 0.0f;
-    for (int i = 0; i < (int)styles.size(); ++i) {
-        float w = ImGui::CalcTextSize(styles[i].name.c_str()).x + 2.0f * ImGui::GetStyle().FramePadding.x;
-        if (i > 0) {
-            if (used + ImGui::GetStyle().ItemSpacing.x + w <= avail) ImGui::SameLine();
-            else used = 0.0f;
-        }
-        used += (used > 0.0f ? ImGui::GetStyle().ItemSpacing.x : 0.0f) + w;
-        bool on = seg.preset == i;
-        if (on) ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(1.0f, 0.4f, 0.7f, 1.0f));
-        if (ImGui::Button(styles[i].name.c_str())) tl.ApplyPreset(sel, i);
-        if (on) ImGui::PopStyleColor();
-        ImGui::SetItemTooltip("%s", styles[i].hint.c_str());
-    }
-    if (seg.preset < 0) HintText("Custom style (edited)");
-    if (style.splatsBest && topo) HintText("This style looks best in Splats mode.");
-
-    // ---- feel ----
-    const char* origins[] = { "Everywhere at once", "The bottom", "The top", "Clicked point" };
-    int o = (int)style.origin;
-    if (ImGui::Combo("Starts from", &o, origins, 4)) { style.origin = (OriginMode)o; edited = true; }
-    if (style.origin == OriginMode::Clicked && !director.hasOrigin)
-        HintText("No point clicked yet: starts from the bottom.\nUse Set Origin below.");
-    edited |= ImGui::SliderFloat("Wave", &style.wave, 0.0f, 0.8f, "%.2f");
-    ImGui::SetItemTooltip("0 = every part leaves at once\nHigher = parts leave one after another,\n"
-                          "as heat spreads over the surface from the start point");
-    if (topo) {
-        edited |= ImGui::SliderFloat("Jiggle", &style.jiggle, 0.0f, 1.0f, "%.2f");
-        ImGui::SetItemTooltip("0 = parts arrive exactly\n1 = they overshoot and wobble, then settle");
-        edited |= ImGui::SliderFloat("Sag", &style.sag, 0.0f, 0.6f, "%.2f");
-        ImGui::SetItemTooltip("Mid-flight droop (melting), none at either end");
+        char head[32];
+        snprintf(head, sizeof(head), "Step %d", sel + 1);
+        ImGui::SeparatorText(head);
+        // its two shapes and its length on one row
+        float arrowW = ImGui::CalcTextSize("->").x + 2.0f * ImGui::GetStyle().ItemSpacing.x;
+        float durW = ImGui::GetFontSize() * 4.5f;
+        float comboW = 0.5f * (ImGui::GetContentRegionAvail().x - arrowW - durW - ImGui::GetStyle().ItemSpacing.x);
+        ImGui::SetNextItemWidth(comboW);
+        int from = tl.keys[sel], to = tl.keys[sel + 1];
+        if (DrawShapeCombo("##from", from)) { tl.SetKey(sel, from); keysChanged = true; }
+        ImGui::SetItemTooltip("The shape this step starts from");
+        ImGui::SameLine();
+        ImGui::TextDisabled("->");
+        ImGui::SameLine();
+        ImGui::SetNextItemWidth(comboW);
+        if (DrawShapeCombo("##to", to)) { tl.SetKey(sel + 1, to); keysChanged = true; }
+        ImGui::SetItemTooltip("The shape this step ends on");
+        ImGui::SameLine();
+        ImGui::SetNextItemWidth(durW);
     } else {
-        edited |= ImGui::SliderFloat("Cohesion", &style.cohesion, 0.0f, 1.0f);
-        ImGui::SetItemTooltip("0 = every splat flies straight\n1 = neighbours move together as chunks");
-        edited |= ImGui::SliderFloat("Mid-flight grow", &style.midGrow, 0.0f, 1.0f);
-        ImGui::SetItemTooltip("How much splats swell while travelling (exact size at both ends)");
+        ImGui::SeparatorText("Motion");
+        PropLabel("Length", nullptr);
     }
-    if (ImGui::TreeNode("Timing curves")) {
-        HintText("x = time, y = how far. Below the band: pull back first;\nabove it: overshoot.");
-        edited |= DrawCurveEditor("Parts that leave first", style.early);
-        edited |= DrawCurveEditor("Parts that leave last", style.late);
-        if (ImGui::Button("Same curve for both")) { style.late = style.early; edited = true; }
-        ImGui::TreePop();
+    ImGui::DragFloat("##dur", &seg.duration, 0.05f, MorphTimeline::kMinStep, 20.0f, "%.1f s");
+    ImGui::SetItemTooltip("How long this step takes (drag, or double-click to type)");
+    if (topo && trueMorphActive && sel < (int)g_segResults.size() && !g_segResults[sel].shared) {
+        Badge("whole surface", IM_COL32(170, 170, 185, 255),
+              "This step changes the shape's topology, so it is rebuilt as one surface\n"
+              "each frame: it follows the Lead curve, and spread, brush, bounce and\n"
+              "pins don't apply (they need both shapes to share one mesh).");
     }
+
+    // style tiles
+    {
+        const auto& styles = BuiltinStyles();
+        float avail = ImGui::GetContentRegionAvail().x, sp = ImGui::GetStyle().ItemSpacing.x;
+        int perRow = (int)styles.size();
+        float tile = std::min(60.0f, (avail - sp * (perRow - 1)) / perRow);
+        if (tile < 44.0f) { perRow = 3; tile = std::min(60.0f, (avail - sp * 2) / 3); }
+        for (int i = 0; i < (int)styles.size(); ++i) {
+            if (i % perRow) ImGui::SameLine();
+            ImGui::PushID(i);
+            if (StyleTile("##style", styles[i], seg.preset == i, tile)) tl.ApplyPreset(sel, i);
+            ImGui::PopID();
+        }
+        if (seg.preset < 0) ImGui::TextDisabled("Custom style");
+    }
+
+    // motion
+    bool edited = false;
+    int from = (int)style.origin;
+    PropLabel("Spread from", "Where the change begins");
+    if (IconSegmented("##origin", from, { { Icon::SpreadAll,   "Everywhere at once" },
+                                          { Icon::SpreadUp,    "From the bottom up" },
+                                          { Icon::SpreadDown,  "From the top down" },
+                                          { Icon::SpreadPoint, "From a point you click\n(Start point tool, O)" } },
+                      ImGui::GetFrameHeight())) {
+        style.origin = (OriginMode)from;
+        edited = true;
+        if (style.origin == OriginMode::Clicked && !director.hasOrigin) SelectTool(MorphDirector::Tool::StartPoint);
+        if (style.origin != OriginMode::None && style.wave <= 0.0f) style.wave = 0.5f;
+    }
+    PropLabel("Spread", "0: every part changes together\nhigher: parts change one after another,\n"
+                        "rolling over the surface from where it begins");
+    edited |= ImGui::SliderFloat("##spread", &style.wave, 0.0f, 0.8f, "%.2f");
+    if (topo) {
+        PropLabel("Bounce", "Parts overshoot and wobble when they arrive, then settle");
+        edited |= ImGui::SliderFloat("##bounce", &style.jiggle, 0.0f, 1.0f, "%.2f");
+        PropLabel("Droop", "The surface sags mid-change, like melting (none at either end)");
+        edited |= ImGui::SliderFloat("##droop", &style.sag, 0.0f, 0.6f, "%.2f");
+    } else {
+        PropLabel("Clump", "0: every splat flies alone\n1: neighbours travel together as chunks");
+        edited |= ImGui::SliderFloat("##clump", &style.cohesion, 0.0f, 1.0f, "%.2f");
+        PropLabel("Puff", "How much splats swell while travelling (exact size at both ends)");
+        edited |= ImGui::SliderFloat("##puff", &style.midGrow, 0.0f, 1.0f, "%.2f");
+    }
+    PropLabel("Easing", "Time (left to right) against how far each part has got.\n"
+                        "Drag the handles; below the dashed 0 line it pulls back first,\n"
+                        "above the 1 line it overshoots.");
+    edited |= EasingEditor("##easing", style.early, style.late, seg.easingLinked, seg.easingEdit);
     if (edited) {
         seg.preset = -1;
         style.name = "Custom";
     }
-    if (topo && trueMorphActive && sel < (int)g_segResults.size() && !g_segResults[sel].shared)
-        HintText("This step re-meshes the surface (Piecewise / SDF):\n"
-                 "it follows the first curve; wave, paint and jiggle need shared topology.");
 
     // ---- tools ----
     ImGui::SeparatorText("Tools");
-    int tool = (int)director.tool;
-    bool toolChanged = false;
-    toolChanged |= ImGui::RadioButton("Orbit", &tool, (int)MorphDirector::Tool::Orbit);
-    ImGui::SameLine();
-    toolChanged |= ImGui::RadioButton("Set Origin", &tool, (int)MorphDirector::Tool::Origin);
-    ImGui::SameLine();
-    toolChanged |= ImGui::RadioButton("Paint Early", &tool, (int)MorphDirector::Tool::PaintEarly);
-    toolChanged |= ImGui::RadioButton("Paint Late", &tool, (int)MorphDirector::Tool::PaintLate);
-    if (topo) {
-        ImGui::SameLine();
-        toolChanged |= ImGui::RadioButton("Pin", &tool, (int)MorphDirector::Tool::Pin);
-    }
-    if (toolChanged) {
-        bool wasPin = director.tool == MorphDirector::Tool::Pin;
-        director.tool = (MorphDirector::Tool)tool;
-        director.pinWaitingForB = false;
-        if (director.tool == MorphDirector::Tool::Pin) ShowPinStage(false);
-        else if (wasPin && g_previewIndexOverride >= 0) { g_previewIndexOverride = -1; g_previewGen++; }
-    }
+    using Tool = MorphDirector::Tool;
+    float tb = ImGui::GetFrameHeight() * 1.25f;
+    auto toolButton = [&](const char* id, Icon ic, Tool t, const char* tip) {
+        if (IconButton(id, ic, director.tool == t, tip, tb)) SelectTool(t);
+        ImGui::SameLine(0.0f, 2.0f);
+    };
+    toolButton("##nav", Icon::Navigate, Tool::Navigate, "Navigate  (V)\nDrag to turn the camera, right-drag to zoom");
+    toolButton("##start", Icon::StartPoint, Tool::StartPoint, "Start point  (O)\nClick the shape where the change begins");
+    toolButton("##brush", Icon::Brush, Tool::TimingBrush,
+               "Timing brush  (B)\nPaint parts of the shape to change sooner or later");
+    if (topo)
+        toolButton("##pin", Icon::Pin, Tool::Pin,
+                   "Pin  (P)\nMake a point of the start shape land on a point you choose\n"
+                   "on the end shape (e.g. nose -> spout). Bake again to apply.");
+    ImGui::NewLine();
+
+    // the active tool's options, one row
+    float small = ImGui::GetFrameHeight();
     switch (director.tool) {
-        case MorphDirector::Tool::Orbit:
-            HintText("Drag to turn the camera.");
+        case Tool::Navigate:
             break;
-        case MorphDirector::Tool::Origin:
-            HintText("Click the shape where the change should\nstart. Alt + drag turns the camera.");
+        case Tool::StartPoint:
+            Badge(director.hasOrigin ? "point set" : "click the shape",
+                  director.hasOrigin ? IM_COL32(120, 220, 150, 255) : IM_COL32(170, 170, 185, 255),
+                  "Alt + drag turns the camera while a tool is on");
+            if (director.hasOrigin) {
+                ImGui::SameLine();
+                if (IconButton("##clrorigin", Icon::Clear, false, "Clear the start point", small)) director.hasOrigin = false;
+            }
             break;
-        case MorphDirector::Tool::PaintEarly:
-        case MorphDirector::Tool::PaintLate:
-            HintText("Drag over the shape: orange = leaves early,\nblue = leaves late. Alt + drag turns the camera.");
-            ImGui::SliderFloat("Brush size", &director.brushRadius, 0.03f, 0.6f, "%.2f");
-            ImGui::SliderFloat("Brush strength", &director.brushStrength, 0.02f, 0.5f, "%.2f");
+        case Tool::TimingBrush: {
+            int dir = director.brushLater ? 1 : 0;
+            if (IconSegmented("##dir", dir, { { Icon::Sooner, "Sooner: painted parts change earlier" },
+                                              { Icon::Later,  "Later: painted parts change later\n(hold Ctrl to paint the other way)" } },
+                              small))
+                director.brushLater = dir == 1;
+            ImGui::SameLine();
+            ImGui::TextDisabled(director.brushLater ? "Later" : "Sooner");
+            ImGui::SameLine();
+            float w = 0.5f * (ImGui::GetContentRegionAvail().x - small - 2.0f * ImGui::GetStyle().ItemSpacing.x);
+            ImGui::SetNextItemWidth(w);
+            ImGui::SliderFloat("##size", &director.brushRadius, 0.03f, 0.6f, "size %.2f");
+            ImGui::SetItemTooltip("Brush size");
+            ImGui::SameLine();
+            ImGui::SetNextItemWidth(w);
+            ImGui::SliderFloat("##strength", &director.brushStrength, 0.02f, 0.5f, "strength %.2f");
+            ImGui::SetItemTooltip("How much each stroke shifts the timing");
+            ImGui::SameLine();
+            ImGui::BeginDisabled(!director.HasPaint());
+            if (IconButton("##clrpaint", Icon::Clear, false, "Clear the brush strokes", small)) director.ClearPaint();
+            ImGui::EndDisabled();
             break;
-        case MorphDirector::Tool::Pin:
-            HintText(director.pinWaitingForB ? "Now click where that point should land on the end shape."
-                                             : "Click a point on the start shape, then its partner\n"
-                                               "on the end shape. Bake again to use the pins.");
+        }
+        case Tool::Pin: {
+            PinSteps(director.pinWaitingForB);
+            ImGui::SameLine();
+            char count[24];
+            snprintf(count, sizeof(count), "%d pin%s", (int)seg.pins.size(), seg.pins.size() == 1 ? "" : "s");
+            Badge(count, seg.pins.empty() ? IM_COL32(170, 170, 185, 255) : IM_COL32(120, 220, 150, 255),
+                  "Pins on this step (green dots on the shape)");
+            ImGui::SameLine();
+            ImGui::BeginDisabled(seg.pins.empty());
+            if (IconButton("##clrpins", Icon::Clear, false, "Remove this step's pins", small)) seg.pins.clear();
+            ImGui::EndDisabled();
             break;
+        }
     }
-    if (renderMode == RenderMode::Splats && director.tool != MorphDirector::Tool::Orbit && !splatMorphActive)
-        HintText("Bake first: the tools work on the baked splats.");
-
-    if (ImGui::SmallButton("Clear paint")) director.ClearPaint();
-    ImGui::SameLine();
-    ImGui::BeginDisabled(!director.hasOrigin);
-    if (ImGui::SmallButton("Clear origin")) director.hasOrigin = false;
-    ImGui::EndDisabled();
-    if (topo) {
-        ImGui::SameLine();
-        ImGui::BeginDisabled(seg.pins.empty());
-        char pinLabel[32];
-        snprintf(pinLabel, sizeof(pinLabel), "Clear pins (%d)", (int)seg.pins.size());
-        if (ImGui::SmallButton(pinLabel)) seg.pins.clear();
-        ImGui::EndDisabled();
-        bool pinsChanged = trueMorphActive && sel < (int)g_segKeys.size() && TimelineBakeable() &&
-                           g_segKeys[sel] != MorphBakeKey(SegmentSettings(sel));
-        if (pinsChanged) HintText("Shapes or pins changed: bake again to apply.");
+    if (director.tool != Tool::Navigate) {
+        if (!topo && !splatMorphActive)
+            Badge("bake first", IM_COL32(255, 196, 80, 255), "In Splats mode the tools work on the baked splats");
+        else if (topo)
+            GradientLegend("first", "last");
     }
 
-    // ---- scrub ----
-    if (trueMorphActive || splatMorphActive) {
-        float p = animator->GetProgress();
-        ImGui::SeparatorText("Playback");
-        if (ImGui::SliderFloat("Scrub", &p, 0.0f, 1.0f, "%.3f")) animator->Seek(p);
-        ImGui::SetItemTooltip("Hold the morph at any moment (Bake It! plays it again)");
+    // the brush cursor: a circle the brush's size, where it would paint
+    if (director.tool == Tool::TimingBrush && director.hasHover && !io.WantCaptureMouse) {
+        glm::mat4 vp = Cam->GetViewProjectMtx();
+        glm::vec3 right = glm::vec3(glm::inverse(Cam->GetViewMtx())[0]);
+        auto toScreen = [&](glm::vec3 w) {
+            glm::vec4 c = vp * glm::vec4(w, 1.0f);
+            return ImVec2((c.x / c.w * 0.5f + 0.5f) * io.DisplaySize.x, (0.5f - 0.5f * c.y / c.w) * io.DisplaySize.y);
+        };
+        ImVec2 c = toScreen(director.hoverPoint);
+        ImVec2 e = toScreen(director.hoverPoint + right * director.brushRadius);
+        float rad = std::max(4.0f, std::fabs(e.x - c.x));
+        bool later = director.brushLater != io.KeyCtrl;
+        ImU32 col = later ? IM_COL32(80, 140, 255, 230) : IM_COL32(255, 130, 50, 230);
+        ImDrawList* fg = ImGui::GetForegroundDrawList();
+        fg->AddCircle(io.MousePos, rad, col, 48, 2.0f);
+        fg->AddCircle(io.MousePos, rad * 0.5f, (col & 0x00FFFFFF) | 0x60000000, 32, 1.0f);
     }
 
-    ImGui::PopItemWidth();
+    if (keysChanged) {
+        SyncTimelineKeys();
+        StopAllMorphs();   // show the newly chosen shapes right away
+    }
     ImGui::End();
 }
 
@@ -2723,19 +2916,19 @@ void Window::DrawMainGUI() {
     int modeInt = (int)renderMode;
     bool modeChanged = false;
     modeChanged |= ImGui::RadioButton("Particles##mode", &modeInt, (int)RenderMode::Particles);
+    ImGui::SetItemTooltip("A point cloud carried from A to B by optimal transport");
     ImGui::SameLine();
     modeChanged |= ImGui::RadioButton("Topology##mode", &modeInt, (int)RenderMode::TriangleMorph);
+    ImGui::SetItemTooltip("One solid surface reshaped from A into B (timeline, styles and tools on the right)");
     ImGui::SameLine();
     modeChanged |= ImGui::RadioButton("Splats##mode", &modeInt, (int)RenderMode::Splats);
+    ImGui::SetItemTooltip("Gaussian splats, each matched from A to a spot on B (styles and tools on the right)");
     if (modeChanged && modeInt != (int)renderMode) {
         renderMode = (RenderMode)modeInt;
         // Switching modes stops any active morph and shows the new mode's
         // preview of the source; user re-clicks Bake.
         StopAllMorphs();
     }
-    HintText(renderMode == RenderMode::Particles     ? "Point cloud carried from A to B by optimal transport" :
-             renderMode == RenderMode::TriangleMorph ? "One solid surface reshaped from A into B" :
-                                                       "Gaussian splats, each matched from A to a spot on B");
 
     // ---- 2. Shapes ----
     ImGui::SeparatorText("Shapes");
@@ -2743,9 +2936,10 @@ void Window::DrawMainGUI() {
         // the first two keys of the timeline (all of them: the Animation window)
         bool changed = DrawShapeCombo("Source (A)", timeline.keys[0]);
         changed |= DrawShapeCombo(timeline.keys.size() > 2 ? "Key 1" : "Target (B)", timeline.keys[1]);
-        if (timeline.keys.size() > 2)
-            HintText(("+ " + std::to_string(timeline.keys.size() - 2) +
-                      " more shape(s) in the Animation window").c_str());
+        if (timeline.keys.size() > 2) {
+            std::string more = "+" + std::to_string(timeline.keys.size() - 2);
+            Badge(more.c_str(), IM_COL32(170, 170, 185, 255), "More shapes on the timeline (Animation window)");
+        }
         if (changed) {
             for (auto& seg : timeline.segs) seg.pins.clear();   // pins were placed on the old shapes
             SyncTimelineKeys();
@@ -2773,8 +2967,7 @@ void Window::DrawMainGUI() {
         ImGui::SeparatorText("Transport");
         animator->DrawParamsGUI();
     } else {
-        ImGui::SeparatorText("Transport");
-        HintText("Timing, style and tools: the Animation window ->");
+        ImGui::Spacing();
     }
 
     // Bake | Revert | Clear on one row
@@ -2828,10 +3021,16 @@ void Window::DrawMainGUI() {
     }
     if (renderMode == RenderMode::Splats && lastBakeMs >= 0.0f && !splatBaking)
         HintText(("Last bake: " + std::to_string((int)lastBakeMs) + " ms").c_str());
-    if (renderMode == RenderMode::TriangleMorph && !morphStatus.empty()) {
-        ImGui::PushStyleColor(ImGuiCol_Text, ImGui::GetStyleColorVec4(ImGuiCol_TextDisabled));
-        ImGui::TextWrapped("%s", morphStatus.c_str());
-        ImGui::PopStyleColor();
+    if (renderMode == RenderMode::TriangleMorph && !morphStatus.empty() && !morphBaking) {
+        // one line: how each step was built; the details on hover
+        std::string kinds;
+        for (size_t k = 0; k < g_segResults.size(); ++k) {
+            if (k) kinds += ", ";
+            kinds += g_segResults[k].shared ? "shared" : g_segResults[k].piecewise ? "piecewise" : "SDF";
+        }
+        if (kinds.empty()) kinds = morphStatus.substr(0, morphStatus.find(':'));
+        ImGui::TextDisabled("Built: %s  (?)", kinds.c_str());
+        ImGui::SetItemTooltip("%s", morphStatus.c_str());
     }
 
     // ---- 4. Settings for the selected type ----
@@ -3032,6 +3231,18 @@ void Window::keyCallback(GLFWwindow* window, int key, int scancode, int action, 
                 break;
         }
     }
+    // Animation shortcuts (not while typing in a field)
+    if (action != GLFW_PRESS || ImGui::GetIO().WantTextInput || renderMode == RenderMode::Particles) return;
+    switch (key) {
+        case GLFW_KEY_SPACE: TogglePlay(); break;
+        case GLFW_KEY_HOME:  animator->Seek(0.0f); break;
+        case GLFW_KEY_END:   animator->Seek(1.0f); break;
+        case GLFW_KEY_V:     SelectTool(MorphDirector::Tool::Navigate); break;
+        case GLFW_KEY_O:     SelectTool(MorphDirector::Tool::StartPoint); break;
+        case GLFW_KEY_B:     SelectTool(MorphDirector::Tool::TimingBrush); break;
+        case GLFW_KEY_P:     if (renderMode == RenderMode::TriangleMorph) SelectTool(MorphDirector::Tool::Pin); break;
+        default: break;
+    }
 }
 
 // Pin tool: show the start (A) or the end (B) shape of the selected step,
@@ -3064,7 +3275,7 @@ static void ApplyTool(double x, double y, bool press) {
     MorphStyle& style = tl.segs[seg].style;
 
     switch (d.tool) {
-        case MorphDirector::Tool::Origin:
+        case MorphDirector::Tool::StartPoint:
             if (!press) return;
             d.origin = p;
             d.hasOrigin = true;
@@ -3076,10 +3287,12 @@ static void ApplyTool(double x, double y, bool press) {
                 style.name = "Custom";
             }
             break;
-        case MorphDirector::Tool::PaintEarly:
-        case MorphDirector::Tool::PaintLate:
-            d.Paint(p, d.tool == MorphDirector::Tool::PaintEarly ? -1.0f : 1.0f);
+        case MorphDirector::Tool::TimingBrush: {
+            // Sooner / Later; holding Ctrl paints the other way (as in Blender)
+            bool later = d.brushLater != ImGui::GetIO().KeyCtrl;
+            d.Paint(p, later ? 1.0f : -1.0f);
             break;
+        }
         case MorphDirector::Tool::Pin:
             if (!press || Window::renderMode != RenderMode::TriangleMorph) return;
             if (!d.pinWaitingForB) {
@@ -3106,7 +3319,7 @@ void Window::mouse_callback(GLFWwindow* window, int button, int action, int mods
     // button is released over a GUI window.
     bool down = (action == GLFW_PRESS) && !ImGui::GetIO().WantCaptureMouse;
     // A Director tool takes the left button; Alt + drag still orbits
-    bool tool = director.tool != MorphDirector::Tool::Orbit && !(mods & GLFW_MOD_ALT) &&
+    bool tool = director.tool != MorphDirector::Tool::Navigate && !(mods & GLFW_MOD_ALT) &&
                 renderMode != RenderMode::Particles;
     if (button == GLFW_MOUSE_BUTTON_LEFT) {
         if (down && tool) {
@@ -3124,6 +3337,19 @@ void Window::mouse_callback(GLFWwindow* window, int button, int action, int mods
 }
 
 void Window::cursor_callback(GLFWwindow* window, double currX, double currY) {
+    // the brush cursor follows the shape under the mouse
+    director.hasHover = false;
+    if (director.tool == MorphDirector::Tool::TimingBrush && !ImGui::GetIO().WantCaptureMouse &&
+        !g_pickPoints.empty()) {
+        Ray ray = ScreenRay((float)currX, (float)currY, (float)width, (float)height,
+                            Cam->GetViewMtx(), Cam->GetProjectMtx());
+        int hit = PickPoint(g_pickPoints, ray, 0.04f);
+        if (hit >= 0) {
+            director.hasHover = true;
+            director.hoverPoint = g_pickPoints[hit];
+        }
+    }
+
     if(ImGui::GetIO().WantCaptureMouse){
         MouseX = (int)currX;
         MouseY = (int)currY;
@@ -3138,8 +3364,7 @@ void Window::cursor_callback(GLFWwindow* window, double currX, double currY) {
     MouseY = (int)currY;
 
     // paint strokes follow the mouse
-    if (g_toolDragging && (director.tool == MorphDirector::Tool::PaintEarly ||
-                           director.tool == MorphDirector::Tool::PaintLate))
+    if (g_toolDragging && director.tool == MorphDirector::Tool::TimingBrush)
         ApplyTool(currX, currY, false);
 
     if (LeftDown) {

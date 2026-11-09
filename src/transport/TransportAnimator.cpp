@@ -77,6 +77,13 @@ void TransportAnimator::ReverseTransport() {
     state = AnimationState::BAKING;
 }
 
+void TransportAnimator::Play() {
+    if (transportProgress >= 1.0f) transportProgress = 0.0f;
+    direction = 1.0f;
+    held = false;
+    state = AnimationState::BAKING;
+}
+
 void TransportAnimator::Seek(float t) {
     transportProgress = std::clamp(t, 0.0f, 1.0f);
     direction = 0.0f;              // Update keeps re-evaluating, but doesn't move

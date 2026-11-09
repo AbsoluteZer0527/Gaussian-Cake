@@ -27,7 +27,3 @@ struct MorphCurve {
 
 // Bisection steps in Eval (and in splat_prep.comp's CurveEval).
 constexpr int kCurveSteps = 20;
-
-// A small ImGui editor: the curve on a square canvas with its two handles to
-// drag. Returns true while the curve changed this frame.
-bool DrawCurveEditor(const char* label, MorphCurve& curve, float size = 150.0f);

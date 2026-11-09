@@ -103,20 +103,29 @@ This is an experimental project that expands on the concept of a simple particle
 
 _For this project, I really want to show how theoretical concepts can actually be applied in fun settings, and how practical applications can help visualize and understand these concepts._
 
-## Morph Director (animation controls, no rigging)
+## Animation window (no rigging needed)
 
-The Director panel (Topology and Splats modes) lets you direct a morph like a shot instead of rigging it:
+In Topology and Splats modes, the **Animation** window on the right lets you direct a morph like a shot. Hover over anything to see what it does.
 
-- **Shapes as keyframes** (Topology): `Start -> Key 1 -> Key 2 ...`. Each step is its own bake (shared topology, Piecewise or SDF), and every step has its own duration and style.
-- **Styles**: Classic, Bake, Ripple, Melt, Pop and Dissolve. Each one is a set of the knobs below, and you can edit any of them.
-- **Starts from + Wave**: parts leave one after another, as heat spreads over the surface from the bottom, from the top or from a point you click (*Set Origin*).
-- **Paint Early / Paint Late**: brush areas so they leave sooner or later. The shape shows the timing as orange (early) to blue (late) while a tool is active.
-- **Timing curves**: two editable curves, one for the parts that leave first and one for the parts that leave last. Pull a handle below or above the band for anticipation or overshoot.
-- **Jiggle / Sag** (shared topology): parts overshoot and settle when they arrive (a spring on each vertex's own time), and the surface droops mid-flight.
-- **Pin** (shared topology): click a point on the start shape, then where it must land on the end shape, then bake again. The template fit honours the pin and brings the area around it along.
-- **Scrub**: hold the morph at any moment.
+- **Transport + timeline:** play/pause (Space), jump to the start or end (Home/End), and loop. The track works like a dope sheet:
+  - Each shape is a ◆ key, and each step between two shapes is a clip coloured by its style.
+  - Click or drag the ruler to scrub, and click a clip to edit that step.
+  - Drag an inner ◆ to retime, and use **+** to add a shape (Topology).
+  - Right-click a ◆ to change its shape or delete it, or right-click a clip to pick a style.
+- **Step:** the step's two shapes and its length, then style tiles (Classic, Bake, Ripple, Melt, Pop, Dissolve) that show each timing as a curve.
+- **Motion:**
+  - *Spread from:* all at once, bottom up, top down, or a point you click. *Spread* sets how much the change rolls across the surface.
+  - *Bounce* (overshoot and settle) and *Droop* (mid-change sag) in Topology, or *Clump* and *Puff* in Splats.
+  - *Easing:* one curve canvas with a **Lead** curve (the parts reached first) and a **Trail** curve (the parts reached last). Link them to use one curve for everything.
+- **Tools** (Alt + drag turns the camera while one is on):
+  - **Navigate** (V)
+  - **Start point** (O): click where the change begins.
+  - **Timing brush** (B): paint parts to change *Sooner* or *Later*; Ctrl flips the direction.
+  - **Pin** (P, Topology): click ① a point on the start shape, then ② where it must land on the end shape.
 
-Hold Alt and drag to turn the camera while a tool is active. Piecewise and SDF steps rebuild the whole surface each frame, so they follow the first curve only (wave, paint and jiggle need shared topology).
+  While a tool is on, the shape shows the timing from orange (first) to blue (last).
+
+Wave, brush, bounce and pins need a step whose two shapes share one mesh. Steps that change topology (Piecewise/SDF) follow the Lead curve only.
 
 Scripted runs can set all of this too, for example:
 
@@ -124,7 +133,7 @@ Scripted runs can set all of this too, for example:
 menv --shot out/ripple --mode topology --keys bunny.obj,MaleHead.obj,heart_crystal.obj --style ripple --origin 0.3,0.9,0 --times 0.25,0.5,0.75
 ```
 
-Other options are `--style`, `--wave`, `--jiggle`, `--sag`, `--pin ax,ay,az:bx,by,bz`, `--tool origin|paint|pin` (shows the overlay) and `--click x,y`.
+Other options are `--style`, `--wave`, `--bounce`, `--droop`, `--pin ax,ay,az:bx,by,bz`, `--tool start|brush|pin`, `--select k` and `--click x,y`.
 
 ## How to Run
 Download the release, unzip it, and run the menv.exe.

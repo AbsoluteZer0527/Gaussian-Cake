@@ -1,6 +1,5 @@
 #pragma once
 #include "MorphStyle.h"
-#include <functional>
 #include <string>
 #include <vector>
 
@@ -17,6 +16,8 @@ struct MorphSegmentSpec {
     int   preset = 0;           // BuiltinStyles() index the style came from (-1 = custom)
     MorphStyle style;           // how it moves (copied from the preset, then editable)
     std::vector<MorphPin> pins; // which parts must land where (shared topology only)
+    bool easingLinked = true;   // one easing curve for all parts (Lead = Trail)
+    int  easingEdit = 0;        // the curve the easing editor's handles move (0 Lead, 1 Trail)
 };
 
 // Shapes as keyframes: key 0 -> key 1 -> ... -> key n. Every neighbouring
@@ -27,7 +28,8 @@ class MorphTimeline {
 public:
     std::vector<int> keys;               // mesh indices (Window::meshPaths + 1; 0 = blob)
     std::vector<MorphSegmentSpec> segs;  // keys.size() - 1 of them
-    int selected = 0;                    // the segment the Director panel edits
+    int selected = 0;                    // the step the Animation window edits
+    int selectedKey = -1;                // a key diamond clicked on the track (-1 = none)
 
     MorphTimeline();
 
@@ -48,8 +50,15 @@ public:
 
     void ApplyPreset(int seg, int preset);
 
-    // The key strip and the selected segment's duration. shapeCombo draws one
-    // shape picker (Window's list of meshes) and returns true on a change.
-    // Returns true if the keys changed (a rebake is needed).
-    bool DrawGUI(const std::function<bool(const char*, int&)>& shapeCombo);
+    // Time of key k, in seconds from the start.
+    float KeyTime(int k) const;
+
+    // Editing the keys (each clears the pins that no longer fit).
+    void AddKey(int mesh);                 // at the end, a copy of the last step's style
+    void RemoveKey(int k);                 // the steps on both sides merge into one
+    void SetKey(int k, int mesh);          // a different shape for key k
+    // Move inner key k to time t (s): the steps on both sides change length,
+    // their total stays, and each keeps at least kMinStep seconds.
+    void Retime(int k, float t);
+    static constexpr float kMinStep = 0.3f;
 };

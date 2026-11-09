@@ -11,13 +11,15 @@ const std::vector<MorphStyle>& BuiltinStyles() {
         // Classic: the morph as it was before the Director (ease in-out, together)
         s = MorphStyle();
         s.name = "Classic";
+        s.color = glm::vec3(0.55f, 0.6f, 0.72f);
         s.origin = OriginMode::None;
         s.early = s.late = MorphCurve(0.45f, 0.0f, 0.55f, 1.0f);
-        s.hint = "Every part moves together, easing in and out";
+        s.hint = "Every part changes at once, easing in and out";
         list.push_back(s);
 
         s = MorphStyle();
         s.name = "Bake";
+        s.color = glm::vec3(0.95f, 0.62f, 0.3f);
         s.origin = OriginMode::Bottom;
         s.wave = 0.45f;
         s.early = s.late = MorphCurve(0.42f, 0.0f, 0.58f, 1.0f);
@@ -26,6 +28,7 @@ const std::vector<MorphStyle>& BuiltinStyles() {
 
         s = MorphStyle();
         s.name = "Ripple";
+        s.color = glm::vec3(0.3f, 0.75f, 0.92f);
         s.origin = OriginMode::Clicked;
         s.wave = 0.55f;
         s.early = MorphCurve(0.2f, 0.0f, 0.3f, 1.0f);
@@ -38,6 +41,7 @@ const std::vector<MorphStyle>& BuiltinStyles() {
 
         s = MorphStyle();
         s.name = "Melt";
+        s.color = glm::vec3(0.72f, 0.48f, 0.88f);
         s.origin = OriginMode::Top;
         s.wave = 0.35f;
         s.early = MorphCurve(0.6f, 0.0f, 0.9f, 1.0f);
@@ -50,6 +54,7 @@ const std::vector<MorphStyle>& BuiltinStyles() {
 
         s = MorphStyle();
         s.name = "Pop";
+        s.color = glm::vec3(1.0f, 0.45f, 0.7f);
         s.origin = OriginMode::None;
         s.early = s.late = MorphCurve(0.3f, -0.5f, 0.55f, 1.8f);   // dips to -0.07, peaks at 1.17
         s.jiggle = 0.7f;
@@ -59,6 +64,7 @@ const std::vector<MorphStyle>& BuiltinStyles() {
 
         s = MorphStyle();
         s.name = "Dissolve";
+        s.color = glm::vec3(0.42f, 0.8f, 0.55f);
         s.origin = OriginMode::Bottom;
         s.wave = 0.5f;
         s.early = s.late = MorphCurve(0.5f, 0.0f, 0.5f, 1.0f);

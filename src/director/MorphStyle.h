@@ -24,6 +24,7 @@ struct MorphStyle {
     float cohesion = 0.6f;        // Splats: 0 = every splat flies alone, 1 = chunks
     float midGrow = 0.3f;         // Splats: mid-flight size boost
     bool  splatsBest = false;     // looks best in Splats mode (hint only)
+    glm::vec3 color = glm::vec3(0.55f, 0.6f, 0.7f);   // its clip colour on the timeline
     std::string hint;             // one line for the tooltip
 };
 

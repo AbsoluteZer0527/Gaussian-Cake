@@ -54,6 +54,7 @@ set(
     src/director/MorphTimeline.cpp
     src/director/MorphDirector.cpp
     src/director/Picking.cpp
+    src/director/DirectorWidgets.cpp
 )
 
 # ---- Third-party code ----

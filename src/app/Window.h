@@ -158,6 +158,9 @@ public:
     // A click of the current Director tool at window pixel (x, y), as the
     // mouse would (scripted runs use it to test picking).
     static void ToolClick(double x, double y);
+    static void SelectTool(MorphDirector::Tool tool);
+    static void TogglePlay();   // play / pause (bakes first if nothing is baked)
+    static bool loopPlayback;
 
     // Set to a path: the next frame is saved there as a .ppm (scripted runs).
     static std::string screenshotPath;

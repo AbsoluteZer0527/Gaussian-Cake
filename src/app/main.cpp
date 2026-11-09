@@ -68,7 +68,7 @@ void print_versions() {
 //        [--sh 0..3] [--azimuth deg] [--distance d] [--up asis|flipy] [--gpu 0] [--temp x]
 //        Morph Director: [--keys a.obj,b.obj,c.obj] [--style classic|bake|ripple|melt|pop|dissolve]
 //        [--origin x,y,z] [--pin ax,ay,az:bx,by,bz] (repeatable) [--jiggle 0..1] [--wave 0..0.8]
-//        [--sag x] [--tool origin|paint|pin] (show the tool overlay)
+//        [--sag x] [--tool start|brush|pin] (show the tool overlay) [--select k] (inspect step k)
 //        [--click x,y] (repeatable: a click of the tool at that pixel, after the bake, at time 0)
 // Bakes A -> B, then saves <prefix>_t<time>.ppm for every time and exits.
 struct ScriptArgs {
@@ -78,6 +78,7 @@ struct ScriptArgs {
     std::vector<glm::vec3> origin;          // 0 or 1 entries
     std::vector<MorphPin> pins;
     float jiggle = -1.0f, wave = -1.0f, sag = -1.0f;
+    int select = -1;                        // the step the Animation window shows
     std::vector<glm::vec2> clicks;          // tool clicks (window pixels) before the shots
     std::vector<float> times = { 0.0f, 0.5f, 1.0f };
     int width = 800, height = 600, k = -1;
@@ -109,7 +110,9 @@ static bool ParseArgs(int argc, char** argv, ScriptArgs& args) {
         else if (key == "--tool")      args.tool = val;
         else if (key == "--jiggle")    args.jiggle = std::stof(val);
         else if (key == "--wave")      args.wave = std::stof(val);
-        else if (key == "--sag")       args.sag = std::stof(val);
+        else if (key == "--sag" || key == "--droop")    args.sag = std::stof(val);
+        else if (key == "--bounce")    args.jiggle = std::stof(val);
+        else if (key == "--select")    args.select = std::stoi(val);
         else if (key == "--click") {
             glm::vec2 c;
             if (sscanf(val.c_str(), "%f,%f", &c.x, &c.y) != 2) { std::cerr << "--click x,y\n"; return false; }
@@ -206,13 +209,14 @@ static int RunScript(GLFWwindow* window, const ScriptArgs& args) {
         if (args.sag >= 0.0f)    style.sag = args.sag;
     }
     tl.segs[0].pins = args.pins;
+    if (args.select >= 0) tl.selected = std::min(args.select, (int)tl.segs.size() - 1);
     if (!args.origin.empty()) {
         Window::director.origin = args.origin[0];
         Window::director.hasOrigin = true;
         for (auto& seg : tl.segs) seg.style.origin = OriginMode::Clicked;
     }
-    if (args.tool == "origin") Window::director.tool = MorphDirector::Tool::Origin;
-    if (args.tool == "paint")  Window::director.tool = MorphDirector::Tool::PaintEarly;
+    if (args.tool == "origin" || args.tool == "start") Window::director.tool = MorphDirector::Tool::StartPoint;
+    if (args.tool == "paint"  || args.tool == "brush") Window::director.tool = MorphDirector::Tool::TimingBrush;
     if (args.tool == "pin")    Window::director.tool = MorphDirector::Tool::Pin;
 
     if (args.azimuth > -999.0f) Cam->SetAzimuth(args.azimuth);
