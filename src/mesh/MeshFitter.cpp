@@ -115,6 +115,44 @@ static Eigen::Matrix3d RingRotation(int i, const std::vector<int>& ring,
     return R;
 }
 
+// Faces whose normal turned more than 90 degrees from the rest shape's: folded over.
+int MeshFitter::CountFlips(const IndexedMesh& tmpl, const std::vector<glm::vec3>& rest,
+                           const std::vector<glm::vec3>& X, std::vector<int>* flippedFaces) {
+    int flipped = 0;
+    for (size_t t = 0; t + 2 < tmpl.indices.size(); t += 3) {
+        unsigned int a = tmpl.indices[t], b = tmpl.indices[t + 1], c = tmpl.indices[t + 2];
+        glm::vec3 n0 = glm::cross(rest[b] - rest[a], rest[c] - rest[a]);
+        glm::vec3 n1 = glm::cross(X[b] - X[a], X[c] - X[a]);
+        if (glm::dot(n0, n1) < 0.0f) {
+            ++flipped;
+            if (flippedFaces) flippedFaces->push_back((int)(t / 3));
+        }
+    }
+    return flipped;
+}
+
+// Faces that face against the target surface they lie on (dot of the face
+// normal with the target's normal at the face centre < 0): visible folds.
+static int CountInverted(const IndexedMesh& tmpl, const std::vector<glm::vec3>& X, const SurfaceBVH& bvh,
+                         std::vector<int>* faces = nullptr) {
+    const int F = tmpl.FaceCount();
+    std::vector<char> bad(F, 0);
+    ParallelFor(F, [&](int f) {
+        glm::vec3 a = X[tmpl.indices[3 * f]], b = X[tmpl.indices[3 * f + 1]], c = X[tmpl.indices[3 * f + 2]];
+        glm::vec3 n = glm::cross(b - a, c - a);
+        if (glm::dot(n, n) < 1e-20f) return;
+        SurfaceBVH::Hit h = bvh.Closest((a + b + c) / 3.0f);
+        if (h.tri >= 0 && glm::dot(n, bvh.FaceNormal(h.tri)) < 0.0f) bad[f] = 1;
+    });
+    int count = 0;
+    for (int f = 0; f < F; ++f) {
+        if (!bad[f]) continue;
+        ++count;
+        if (faces) faces->push_back(f);
+    }
+    return count;
+}
+
 std::vector<glm::vec3> MeshFitter::Fit(const IndexedMesh& tmpl,
                                        const std::vector<glm::vec3>& start,
                                        const std::vector<Triangle>& target,
@@ -193,6 +231,16 @@ std::vector<glm::vec3> MeshFitter::Fit(const IndexedMesh& tmpl,
                 fwdW[i] = (c >= cosMin) ? 1.0f : 0.0f;
             });
 
+            // far matches (beyond farFactor x the median match distance) pull across gaps: drop them
+            if (params.farFactor > 0.0f) {
+                std::vector<float> d2(n);
+                for (int i = 0; i < n; ++i) d2[i] = Dist2(X[i], fwdPoint[i]);
+                std::vector<float> sorted = d2;
+                std::nth_element(sorted.begin(), sorted.begin() + n / 2, sorted.end());
+                float lim = params.farFactor * params.farFactor * std::max(sorted[n / 2], 1e-10f);
+                for (int i = 0; i < n; ++i) if (d2[i] > lim) fwdW[i] = 0.0f;
+            }
+
             // backward: every target sample pulls its nearest template vertex
             PointGrid grid;
             float spacing = 2.0f * std::sqrt(MeshSampler::TotalArea(target) / (float)samples.size());
@@ -217,35 +265,51 @@ std::vector<glm::vec3> MeshFitter::Fit(const IndexedMesh& tmpl,
                 rotDelta.row(i) = (R[i] * delta.row(i).transpose()).transpose();
 
             // global step: (alpha LtL + W) X = alpha Lt (R delta) + W C
+            // constantWeights: every vertex keeps the same weights all stage
+            // long (a match that's dropped pulls it to where it already is),
+            // so the matrix only changes with alpha: one factorization per
+            // stage instead of one per iteration.
             Eigen::VectorXd W(n);
             Eigen::MatrixXd rhs = alpha * (Lt * rotDelta);
             for (int i = 0; i < n; ++i) {
-                double wb = bwdCount[i] > 0 ? params.backwardWeight : 0.0;
-                double w = fwdW[i] + wb + kReg;
-                Eigen::Vector3d c = fwdW[i] * ToE(fwdPoint[i]) + kReg * ToE(X[i]);
-                if (bwdCount[i] > 0) c += wb * ToE(bwdSum[i] / (float)bwdCount[i]);
+                double w;
+                Eigen::Vector3d c;
                 if (pinOf[i] >= 0) {
                     w = params.pinWeight + kReg;
                     c = params.pinWeight * ToE(params.pins[pinOf[i]].second) + kReg * ToE(X[i]);
+                } else if (params.constantWeights) {
+                    double wb = params.backwardWeight;
+                    w = 1.0 + wb + kReg;
+                    c = ToE(fwdW[i] > 0.0f ? fwdPoint[i] : X[i]) + kReg * ToE(X[i]);
+                    c += wb * ToE(bwdCount[i] > 0 ? bwdSum[i] / (float)bwdCount[i] : X[i]);
+                } else {
+                    double wb = bwdCount[i] > 0 ? params.backwardWeight : 0.0;
+                    w = fwdW[i] + wb + kReg;
+                    c = fwdW[i] * ToE(fwdPoint[i]) + kReg * ToE(X[i]);
+                    if (bwdCount[i] > 0) c += wb * ToE(bwdSum[i] / (float)bwdCount[i]);
                 }
                 W(i) = w;
                 rhs.row(i) += c.transpose();
             }
 
             // LtL always stores its diagonal, so the pattern never changes
-            SpMat A = alpha * LtL;
-            for (int i = 0; i < n; ++i) A.coeffRef(i, i) += W(i);
-            if (!analyzed) { solver.analyzePattern(A); analyzed = true; }
-            solver.factorize(A);
-            if (solver.info() != Eigen::Success) {
-                std::cerr << "[MeshFitter] factorization failed at stage " << s << "\n";
-                break;
+            if (!params.constantWeights || it == 0) {
+                SpMat A = alpha * LtL;
+                for (int i = 0; i < n; ++i) A.coeffRef(i, i) += W(i);
+                if (!analyzed) { solver.analyzePattern(A); analyzed = true; }
+                solver.factorize(A);
+                if (solver.info() != Eigen::Success) {
+                    std::cerr << "[MeshFitter] factorization failed at stage " << s << "\n";
+                    break;
+                }
             }
             Eigen::MatrixXd sol = solver.solve(rhs);
             for (int i = 0; i < n; ++i)
                 X[i] = glm::vec3((float)sol(i, 0), (float)sol(i, 1), (float)sol(i, 2));
         }
     }
+
+    if (stats) stats->flippedBeforeLock = CountFlips(tmpl, start, X);
 
     // residual before locking onto the surface
     std::vector<float> dist(n);
@@ -264,6 +328,7 @@ std::vector<glm::vec3> MeshFitter::Fit(const IndexedMesh& tmpl,
     ParallelFor(n, [&](int i) {
         X[i] = pinOf[i] >= 0 ? params.pins[pinOf[i]].second : bvh.Closest(X[i]).point;
     });
+    if (stats) stats->flippedAfterLock = CountFlips(tmpl, start, X);
     for (int r = 0; r < params.relaxRounds; ++r) {
         std::vector<glm::vec3> nrm = MeshTopology::VertexNormals(tmpl, X);
         std::vector<glm::vec3> next = X;
@@ -279,7 +344,54 @@ std::vector<glm::vec3> MeshFitter::Fit(const IndexedMesh& tmpl,
         X.swap(next);
     }
 
+    // Untangle: smooth the folded regions over the surface (each vertex
+    // toward its one-ring centre, within the target's tangent plane, then
+    // back onto the target). A round is kept only if it leaves fewer folds;
+    // otherwise the next one tries a wider region with a smaller step.
+    if (stats) stats->invertedBeforeUntangle = CountInverted(tmpl, X, bvh);
+    {
+        std::vector<int> faces;
+        int bad = CountInverted(tmpl, X, bvh, &faces);
+        int grow = 0;
+        float step = 1.0f;
+        for (int r = 0; r < params.untangleRounds && bad > 0; ++r) {
+            std::vector<char> move(n, 0);
+            for (int f : faces)
+                for (int k = 0; k < 3; ++k) move[tmpl.indices[3 * f + k]] = 1;
+            for (int g = 0; g < grow; ++g) {   // the ring around them too
+                std::vector<char> wider = move;
+                for (int i = 0; i < n; ++i)
+                    if (move[i]) for (int j : rings[i]) wider[j] = 1;
+                move.swap(wider);
+            }
+            std::vector<glm::vec3> next = X;
+            ParallelFor(n, [&](int i) {
+                if (!move[i] || rings[i].empty() || pinOf[i] >= 0) return;
+                glm::vec3 c(0.0f);
+                for (int j : rings[i]) c += X[j];
+                c /= (float)rings[i].size();
+                SurfaceBVH::Hit h = bvh.Closest(X[i]);
+                glm::vec3 nt = bvh.FaceNormal(h.tri);
+                glm::vec3 d = c - X[i];
+                d -= nt * glm::dot(nt, d);   // stay on the surface's tangent plane
+                next[i] = bvh.Closest(X[i] + step * d).point;
+            });
+            std::vector<int> nextFaces;
+            int nextBad = CountInverted(tmpl, next, bvh, &nextFaces);
+            if (nextBad < bad) {
+                X.swap(next);
+                faces.swap(nextFaces);
+                bad = nextBad;
+            } else {   // no better: look wider, move less
+                grow = std::min(grow + 1, 3);
+                step *= 0.6f;
+                if (step < 0.1f) break;
+            }
+        }
+    }
+
     if (stats) {
+        stats->inverted = CountInverted(tmpl, X, bvh);
         double sum = 0.0;
         float mx = 0.0f;
         for (float d : dist) { sum += d; mx = std::max(mx, d); }

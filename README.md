@@ -125,6 +125,8 @@ In Topology and Splats modes, the **Animation** window on the right lets you dir
 
   While a tool is on, the shape shows the timing from orange (first) to blue (last).
 
+Shared-topology steps use **rigid in-betweens** by default (Settings → Advanced): each triangle turns and stretches on its way rather than moving in a straight line, so parts that rotate keep their size instead of collapsing mid-morph (about 0.5 ms per frame on the CPU for the bunny).
+
 Wave, brush, bounce and pins need a step whose two shapes share one mesh. Steps that change topology (Piecewise/SDF) follow the Lead curve only.
 
 Scripted runs can set all of this too, for example:

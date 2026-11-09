@@ -58,6 +58,12 @@ public:
     void ClearVertexTimes();
     float sag = 0.0f;   // mid-flight droop (morph.vert)
 
+    // Show these positions (one per template vertex, e.g. rigid in-betweens)
+    // instead of blending start and end; the textures still blend by time.
+    // indices: the template's triangles (for the normals).
+    void SetPositions(const std::vector<glm::vec3>& positions, const std::vector<unsigned int>& indices);
+    void ClearPositions();   // back to the start / end blend
+
     // Draw with a program built from morph.vert + shader.frag.
     void Draw(GLuint shaderProgram, const glm::mat4& viewProj, float morphT);
     bool IsInitialized() const { return vao != 0; }
@@ -85,6 +91,9 @@ private:
     GLuint vboTime = 0;            // per-corner times (location 8)
     std::vector<unsigned int> cornerVertex;   // template vertex of every uploaded corner
     std::vector<float> cornerTimes;
+    std::vector<Vertex> uploaded;      // the corners as first uploaded (start / end)
+    std::vector<Vertex> overridden;    // scratch for SetPositions
+    bool positionsSet = false;
     bool hasVertexTimes = false;
     std::vector<Range> ranges;
     std::vector<GLuint> texturesA, texturesB;   // per material of A / B (0 = untextured; owned by the TextureCache)

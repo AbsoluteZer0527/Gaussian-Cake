@@ -13,6 +13,7 @@
 #include "MorphSpring.h"
 #include "MorphTimeline.h"
 #include "Picking.h"
+#include "RigidInterp.h"
 
 #include <algorithm>
 #include <numeric>
@@ -432,6 +433,61 @@ static void TestPicking() {
     CHECK(glm::length(c.dir - glm::vec3(0, 0, -1)) < 1e-4f, "centre ray off");
 }
 
+// Rigid in-betweens: exact at both ends, and a bar turning half a turn keeps
+// its length halfway (straight lines would shrink it to a point).
+static void TestRigidInterp() {
+    // a bar along x: a strip of 20 quads, 2 units long, 0.2 wide
+    std::vector<glm::vec3> start;
+    std::vector<unsigned int> idx;
+    const int segs = 20;
+    for (int i = 0; i <= segs; ++i) {
+        float x = -1.0f + 2.0f * i / segs;
+        start.push_back({ x, -0.1f, 0.0f });
+        start.push_back({ x,  0.1f, 0.0f });
+    }
+    for (int i = 0; i < segs; ++i) {
+        unsigned a = 2 * i, b = 2 * i + 1, c = 2 * i + 2, d = 2 * i + 3;
+        idx.insert(idx.end(), { a, c, b, b, c, d });
+    }
+    // the end: turned 179 degrees about z (180 would make the turn direction ambiguous)
+    glm::mat3 R = glm::mat3_cast(glm::angleAxis(glm::radians(179.0f), glm::vec3(0, 0, 1)));
+    std::vector<glm::vec3> end;
+    for (const glm::vec3& p : start) end.push_back(R * p);
+
+    RigidInterp ri;
+    CHECK(ri.Build(start, end, idx), "build failed");
+    std::vector<glm::vec3> out;
+    float err0 = 0.0f, err1 = 0.0f;
+    ri.Evaluate(0.0f, out);
+    for (size_t i = 0; i < out.size(); ++i) err0 = std::max(err0, glm::length(out[i] - start[i]));
+    ri.Evaluate(1.0f, out);
+    for (size_t i = 0; i < out.size(); ++i) err1 = std::max(err1, glm::length(out[i] - end[i]));
+    ri.Evaluate(0.5f, out);
+    float rigidLen = glm::length(out[out.size() - 1] - out[0]);
+    float lerpLen = glm::length(glm::mix(start.back(), end.back(), 0.5f) - glm::mix(start[0], end[0], 0.5f));
+    std::printf("Rigid in-betweens: ends off by %.1e / %.1e, bar length halfway %.3f (straight lines: %.3f)\n",
+                err0, err1, rigidLen, lerpLen);
+    CHECK(err0 < 1e-3f && err1 < 1e-3f, "ends not exact (%g, %g)", err0, err1);
+    CHECK(std::abs(rigidLen - glm::length(start.back() - start[0])) < 0.05f, "bar length halfway %g", rigidLen);
+    CHECK(lerpLen < 0.1f, "the straight-line comparison should collapse (%g)", lerpLen);
+}
+
+// The fit leaves no faces facing against the target on an easy pair
+// (sphere onto a stretched sphere), and the untangle never adds folds.
+static void TestFitFolds() {
+    IndexedMesh tmpl;
+    MeshTopology::Build(Sphere(glm::vec3(0.0f), 0.8f), tmpl);
+    std::vector<Triangle> target = Sphere(glm::vec3(0.0f), 0.8f);
+    for (Triangle& t : target) { t.v0 *= glm::vec3(1.4f, 0.7f, 1.0f); t.v1 *= glm::vec3(1.4f, 0.7f, 1.0f); t.v2 *= glm::vec3(1.4f, 0.7f, 1.0f); }
+    FitParams params;
+    FitStats st;
+    MeshFitter::Fit(tmpl, tmpl.verts, target, params, &st);
+    std::printf("Fit folds: inverted %d (before untangle %d), flipped %d, error %.4f\n",
+                st.inverted, st.invertedBeforeUntangle, st.flipped, st.meanDist);
+    CHECK(st.inverted == 0, "%d faces face against the target", st.inverted);
+    CHECK(st.inverted <= st.invertedBeforeUntangle, "the untangle added folds");
+}
+
 int main() {
     TestShRotation();
     TestPlyShLayout();
@@ -443,6 +499,8 @@ int main() {
     TestPins();
     TestTimeline();
     TestPicking();
+    TestRigidInterp();
+    TestFitFolds();
     if (g_failed) {
         std::printf("%d check(s) failed\n", g_failed);
         return 1;

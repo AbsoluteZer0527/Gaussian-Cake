@@ -58,6 +58,7 @@ public:
     static int         sdfResolution;    // SDF grid points per axis
     static float       fitStiffness;     // multiplier on the template-fit stiffness schedule
     static bool        fitCotan;         // cotan vs uniform Laplacian in the template fit
+    static bool        rigidInBetweens;  // shared topology: as-rigid-as-possible in-betweens (CPU)
     static int         morphMixtureK;    // parts the OT alignment matches (1 = one affine map)
     static bool        trueMorphActive;
     static bool        morphBaking;      // a background Topology bake is running
@@ -158,6 +159,8 @@ public:
     // A click of the current Director tool at window pixel (x, y), as the
     // mouse would (scripted runs use it to test picking).
     static void ToolClick(double x, double y);
+    static void BenchReport(const std::string& label);
+    static double RigidSolveMs();   // the last rigid in-between solve (-1: none)   // quality numbers of the baked steps
     static void SelectTool(MorphDirector::Tool tool);
     static void TogglePlay();   // play / pause (bakes first if nothing is baked)
     static bool loopPlayback;

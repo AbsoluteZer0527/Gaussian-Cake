@@ -25,18 +25,34 @@ struct FitParams {
     // region around each pin along, so a few pins steer the whole fit.
     std::vector<std::pair<int, glm::vec3>> pins;
     float pinWeight       = 50.0f;
+    float farFactor       = 0.0f;   // drop forward matches farther than this x the median (0 = keep all)
+    int   untangleRounds  = 24;
+    // One factorization per stage instead of per iteration: dropped matches
+    // hold the vertex in place instead of letting it go. ~2.5x faster, but it
+    // converges slower from far away, so only for fits that start close (the
+    // Piecewise keyframes, each starting from the last).
+    bool  constantWeights = false;     // smoothing passes over folded regions after the fit (0 = off)
 };
 
 struct FitStats {
     float meanDist = 0.0f;   // template-to-target distance before the final lock
     float maxDist  = 0.0f;
     int   flipped  = 0;      // faces whose normal turned > 90 deg vs. the pre-aligned template
-    float pinError = 0.0f;   // mean distance of the pinned vertices to their targets, before the lock
+    float pinError = 0.0f;
+    int   flippedBeforeLock = 0;   // folds after the iterative fit
+    int   flippedAfterLock  = 0;   // ...after snapping onto the surface (before the relax)
+    int   invertedBeforeUntangle = 0;   // faces facing against the target surface, before untangling
+    int   inverted = 0;            // ...at the end: the visible folds   // mean distance of the pinned vertices to their targets, before the lock
     double ms      = 0.0;
 };
 
 class MeshFitter {
 public:
+    // Faces whose normal turned more than 90 degrees from `rest` (folded over);
+    // their indices go to flippedFaces if given.
+    static int CountFlips(const IndexedMesh& tmpl, const std::vector<glm::vec3>& rest,
+                          const std::vector<glm::vec3>& X, std::vector<int>* flippedFaces = nullptr);
+
     // tmpl:     template connectivity (positions unused)
     // start:    template positions already roughly aligned to the target
     // target:   target triangle soup

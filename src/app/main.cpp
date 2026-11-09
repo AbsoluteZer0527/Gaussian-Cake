@@ -69,6 +69,8 @@ void print_versions() {
 //        Morph Director: [--keys a.obj,b.obj,c.obj] [--style classic|bake|ripple|melt|pop|dissolve]
 //        [--origin x,y,z] [--pin ax,ay,az:bx,by,bz] (repeatable) [--jiggle 0..1] [--wave 0..0.8]
 //        [--sag x] [--tool start|brush|pin] (show the tool overlay) [--select k] (inspect step k)
+//        [--rigid 0|1] (shared topology: rigid in-betweens, default on)
+//        [--bench a.obj:b.obj,c.obj:d.obj] (bake each pair in Topology mode, print quality numbers)
 //        [--click x,y] (repeatable: a click of the tool at that pixel, after the bake, at time 0)
 // Bakes A -> B, then saves <prefix>_t<time>.ppm for every time and exits.
 struct ScriptArgs {
@@ -79,7 +81,8 @@ struct ScriptArgs {
     std::vector<MorphPin> pins;
     float jiggle = -1.0f, wave = -1.0f, sag = -1.0f;
     int select = -1;                        // the step the Animation window shows
-    std::vector<glm::vec2> clicks;          // tool clicks (window pixels) before the shots
+    std::vector<glm::vec2> clicks;
+    std::vector<std::pair<std::string, std::string>> bench;   // --bench a:b,c:d          // tool clicks (window pixels) before the shots
     std::vector<float> times = { 0.0f, 0.5f, 1.0f };
     int width = 800, height = 600, k = -1;
     int gpu = -1;               // 0 = force the CPU paths
@@ -112,8 +115,20 @@ static bool ParseArgs(int argc, char** argv, ScriptArgs& args) {
         else if (key == "--wave")      args.wave = std::stof(val);
         else if (key == "--sag" || key == "--droop")    args.sag = std::stof(val);
         else if (key == "--bounce")    args.jiggle = std::stof(val);
+        else if (key == "--rigid")     Window::rigidInBetweens = (val != "0");
         else if (key == "--select")    args.select = std::stoi(val);
-        else if (key == "--click") {
+        else if (key == "--bench") {
+            size_t pos = 0;
+            while (pos < val.size()) {
+                size_t comma = val.find(',', pos);
+                if (comma == std::string::npos) comma = val.size();
+                std::string pair = val.substr(pos, comma - pos);
+                size_t colon = pair.find(':');
+                if (colon == std::string::npos) { std::cerr << "--bench a.obj:b.obj,...\n"; return false; }
+                args.bench.push_back({ pair.substr(0, colon), pair.substr(colon + 1) });
+                pos = comma + 1;
+            }
+        } else if (key == "--click") {
             glm::vec2 c;
             if (sscanf(val.c_str(), "%f,%f", &c.x, &c.y) != 2) { std::cerr << "--click x,y\n"; return false; }
             args.clicks.push_back(c);
@@ -165,7 +180,30 @@ static void Frame(GLFWwindow* window) {
     Window::displayCallback(window);
 }
 
+// --bench: bake each pair in Topology mode and print its quality numbers.
+static int RunBench(GLFWwindow* window, const ScriptArgs& args) {
+    Window::renderMode = RenderMode::TriangleMorph;
+    for (int i = 0; i < 3; ++i) Frame(window);
+    for (const auto& pair : args.bench) {
+        int a = MeshIndexByName(pair.first), b = MeshIndexByName(pair.second);
+        if (a < 0 || b < 0) return EXIT_FAILURE;
+        Window::timeline.keys = { a, b };
+        Window::timeline.SyncSegments();
+        Frame(window);
+        Window::ComputeOTAndSpawnParticles();
+        double start = glfwGetTime();
+        while (Window::morphBaking) {
+            Frame(window);
+            if (glfwGetTime() - start > 900.0) { std::cerr << "[Bench] timed out\n"; return EXIT_FAILURE; }
+        }
+        Frame(window);
+        Window::BenchReport(pair.first + "->" + pair.second);
+    }
+    return EXIT_SUCCESS;
+}
+
 static int RunScript(GLFWwindow* window, const ScriptArgs& args) {
+    if (!args.bench.empty()) return RunBench(window, args);
     if (args.mode == "topology")       Window::renderMode = RenderMode::TriangleMorph;
     else if (args.mode == "particles") Window::renderMode = RenderMode::Particles;
     else if (args.mode == "splats")    Window::renderMode = RenderMode::Splats;
@@ -262,6 +300,7 @@ static int RunScript(GLFWwindow* window, const ScriptArgs& args) {
         Window::screenshotPath = args.shot + name;
         Frame(window);
     }
+    if (Window::RigidSolveMs() >= 0.0) std::cout << "[Script] rigid solve " << Window::RigidSolveMs() << " ms\n";
     return EXIT_SUCCESS;
 }
 
@@ -313,7 +352,7 @@ int main(int argc, char** argv) {
     // Initialize objects/pointers for rendering; exit if initialization fails.
     if (!Window::initializeObjects()) exit(EXIT_FAILURE);
 
-    if (!script.shot.empty()) {
+    if (!script.shot.empty() || !script.bench.empty()) {
         int code = RunScript(window, script);
         Window::cleanUp();
         glfwDestroyWindow(window);

@@ -42,6 +42,7 @@ set(
     src/morph/SDFMorph.cpp
     src/morph/GpuSDFMorph.cpp
     src/morph/PiecewiseMorph.cpp
+    src/morph/RigidInterp.cpp
     src/splats/SplatGenerator.cpp
     src/splats/SplatRenderer.cpp
     src/splats/SplatHeat.cpp

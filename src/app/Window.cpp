@@ -1,6 +1,7 @@
 #include "Window.h"
 #include "Parallel.h"
 #include "PiecewiseMorph.h"
+#include "RigidInterp.h"
 
 #include "imgui.h"
 #include "imgui_impl_glfw.h"
@@ -1887,10 +1888,17 @@ struct TrueMorphResult {
     Gaussian gA, gB;
     OTMap map;
     std::string status;
+    // Bench numbers (Window::BenchReport)
+    int    folds = -1;          // shared: template triangles turned > 90 degrees by the fit
+    int    inverted = -1;       // shared: ...and those facing against the target (visible folds)
+    float  fitError = -1.0f;    // shared: mean template-to-target distance before the lock
+    double fitMs = 0.0, bakeMs = 0.0;
 };
 
 // The baked Piecewise morph (main thread)
 static PiecewiseMorph g_piecewise;
+static RigidInterp    g_rigid;        // rigid in-betweens of the active shared step (built on first use)
+bool Window::rigidInBetweens = true;
 static bool g_morphPiecewise = false;
 static int  g_pieceShown = -1;   // segment the mesh renderer holds
 
@@ -1993,6 +2001,10 @@ static TrueMorphResult RunTrueMorphBake(TrueMorphSettings st) {
         FitStats stats;
         std::vector<glm::vec3> fitted = MeshFitter::Fit(tmpl, aligned,
                                                         templateIsA ? trisB : trisA, params, &stats);
+        res.folds    = stats.flipped;
+        res.inverted = stats.inverted;
+        res.fitError = stats.meanDist;
+        res.fitMs    = stats.ms;
 
         res.sharedIndices = tmpl.indices;
         res.sharedStart   = templateIsA ? tmpl.verts : fitted;
@@ -2065,6 +2077,7 @@ static TrueMorphResult RunTrueMorphBake(TrueMorphSettings st) {
             pp.fit.stages = 4;
             pp.fit.stiffnessEnd = 1.5f;
             pp.fit.relaxRounds = 3;
+            pp.fit.constantWeights = true;   // each fit starts from the last keyframe: close
             res.piecewise = res.pieces.Build(res.sdf, res.a, res.b, res.colorsA, res.colorsB,
                                              colored ? &colorA : nullptr, colored ? &colorB : nullptr, pp);
             if (res.piecewise) {
@@ -2086,7 +2099,8 @@ static TrueMorphResult RunTrueMorphBake(TrueMorphSettings st) {
     if (!res.shared && !st.pins.empty())
         res.status += " Pins ignored: they only steer a shared-topology fit.";
     SetBakeStage(3, 1);
-    std::cout << "[Morph] " << res.status << " (bake " << (int)MsSince(t0) << " ms)\n";
+    res.bakeMs = MsSince(t0);
+    std::cout << "[Morph] " << res.status << " (bake " << (int)res.bakeMs << " ms)\n";
     res.ok = true;
     return res;
 }
@@ -2154,6 +2168,7 @@ static void ActivateSegment(int k) {
                                     g_morphTextures);
         g_morphTexturedOn = g_morphTextured->IsInitialized();
     }
+    g_rigid.Clear();
     g_morphPiecewise = res.piecewise;
     g_piecewise      = res.pieces;
     g_pieceShown     = -1;
@@ -2377,6 +2392,44 @@ void Window::UpdateTrueMorph(float dt) {
     if (g_morphShared) {
         float t = u ? 0.0f : style.early.Eval(local);   // no director: one time for all
         bool tools = director.tool != MorphDirector::Tool::Navigate;
+
+        // Rigid in-betweens: every triangle turns and stretches on its own
+        // way from start to end, and the vertices are solved to fit them
+        // (RigidInterp), so turning parts keep their size instead of
+        // collapsing on the straight lines. CPU positions, real normals.
+        if (rigidInBetweens && !g_rigid.Ready())
+            g_rigid.Build(g_sharedStart, g_sharedEnd, g_sharedIndices);
+        if (rigidInBetweens && g_rigid.Ready()) {
+            static std::vector<float> uniform;
+            if (!u) uniform.assign(g_sharedStart.size(), t);
+            const std::vector<float>& times = u ? *u : uniform;
+            g_rigid.Evaluate(times, g_sharedCurrent);
+            for (size_t i = 0; i < g_sharedCurrent.size(); ++i) {
+                float tc = glm::clamp(times[i], 0.0f, 1.0f);
+                g_sharedCurrent[i].y -= style.sag * 4.0f * tc * (1.0f - tc);
+            }
+            if (tools) SetPickSurface(g_sharedCurrent, g_sharedIndices);
+            if (g_morphTexturedOn) {   // positions from the solve, textures still blend by time
+                g_morphTextured->SetPositions(g_sharedCurrent, g_sharedIndices);
+                g_morphTextured->SetVertexTimes(times);
+                g_morphTextured->sag = 0.0f;   // already in the positions
+                g_morphTexT  = t;
+                g_morphShown = MorphShown::Blend;
+                return;
+            }
+            for (size_t i = 0; i < g_sharedColorCurrent.size(); ++i)
+                g_sharedColorCurrent[i] = glm::mix(g_sharedColorStart[i], g_sharedColorEnd[i],
+                                                   glm::clamp(times[i], 0.0f, 1.0f));
+            if (g_morphShown != MorphShown::Blend || meshRenderer->IsMorphTarget()) {
+                meshRenderer->Initialize(g_sharedCurrent, g_sharedIndices, g_sharedColorCurrent);
+                g_morphShown = MorphShown::Blend;
+            } else {
+                meshRenderer->UpdatePositions(g_sharedCurrent, g_sharedColorCurrent);
+            }
+            return;
+        }
+        if (g_morphTexturedOn) g_morphTextured->ClearPositions();
+
         // the CPU positions: for the CPU path, and for the tools to pick from
         if (!gpu || tools) {
             for (size_t i = 0; i < g_sharedCurrent.size(); ++i) {
@@ -2542,6 +2595,39 @@ static bool DrawShapeCombo(const char* label, int& meshIndex) {
 
 static void HintText(const char* text) {
     ImGui::TextDisabled("%s", text);
+}
+
+double Window::RigidSolveMs() { return g_rigid.Ready() ? g_rigid.lastMs : -1.0; }
+
+// One line per baked step: how it was built and how good it is (--bench).
+void Window::BenchReport(const std::string& label) {
+    for (size_t k = 0; k < g_segResults.size(); ++k) {
+        const TrueMorphResult& r = g_segResults[k];
+        const char* kind = r.shared ? "shared" : r.piecewise ? "piecewise" : "sdf";
+        // How far the SDF surface at t = 0 / 1 lies from the real meshes ("softness")
+        float sdfMean[2] = { -1.0f, -1.0f }, sdfMax[2] = { -1.0f, -1.0f };
+        if (!r.shared) {
+            for (int end = 0; end < 2; ++end) {
+                std::vector<glm::vec3> v;
+                std::vector<unsigned int> idx;
+                r.sdf.Extract((float)end, v, idx);
+                SurfaceBVH bvh;
+                bvh.Build(MeshTopology::ToTriangles(end == 0 ? r.a : r.b));
+                double sum = 0.0;
+                float mx = 0.0f;
+                for (const glm::vec3& p : v) {
+                    float d = std::sqrt(bvh.Closest(p).dist2);
+                    sum += d;
+                    mx = std::max(mx, d);
+                }
+                if (!v.empty()) { sdfMean[end] = (float)(sum / v.size()); sdfMax[end] = mx; }
+            }
+        }
+        printf("[Bench] %s step %zu: %s folds=%d inverted=%d fitErr=%.5f sdfErr(t0)=%.5f/%.5f sdfErr(t1)=%.5f/%.5f fitMs=%.0f bakeMs=%.0f\n",
+               label.c_str(), k + 1, kind, r.folds, r.inverted, r.fitError, sdfMean[0], sdfMax[0], sdfMean[1], sdfMax[1],
+               r.fitMs, r.bakeMs);
+    }
+    fflush(stdout);
 }
 
 // ---- Animation window ----
@@ -3123,6 +3209,10 @@ void Window::DrawMainGUI() {
                                       "K = a Gaussian mixture on each shape, matched part to part\n"
                                       "by Sinkhorn (in-between shapes stay closer to A and B).\n"
                                       "Used only as strongly as it can be without folding.");
+                if (ImGui::Checkbox("Rigid in-betweens", &rigidInBetweens)) g_morphShown = MorphShown::None;
+                ImGui::SetItemTooltip("Shared topology: turning parts keep their size mid-morph\n"
+                                      "(each triangle rotates and stretches, solved on the CPU).\n"
+                                      "Off: straight lines per vertex, blended on the GPU.");
                 ImGui::Checkbox("Cotan Laplacian", &fitCotan);
                 ImGui::SetItemTooltip("Shared topology: weight the shape-keeping term by triangle angles\n"
                                       "(cotan Laplacian) instead of treating every neighbour the same");
@@ -3185,6 +3275,9 @@ void Window::DrawMainGUI() {
                 ImGui::Text("GPU re-mesh  %s", g_sdfOnGpu ? ms(g_morphTimer->Ms()) : "- (CPU)");
             ImGui::Text("GPU draw     %s", ms(g_drawTimer->Ms()));
         }
+        if (renderMode == RenderMode::TriangleMorph && trueMorphActive && g_morphShared &&
+            rigidInBetweens && g_rigid.Ready())
+            ImGui::Text("Rigid solve  %.3f ms (CPU)", g_rigid.lastMs);
         if (renderMode == RenderMode::TriangleMorph && trueMorphActive) {
             bool gpuMesh = g_sdfOnGpu && g_morphShown == MorphShown::Blend;
             ImGui::Text("Surface      %d verts, %d tris",

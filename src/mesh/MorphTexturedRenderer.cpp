@@ -119,6 +119,8 @@ void MorphTexturedRenderer::Release() {
     if (vboTime) glDeleteBuffers(1, &vboTime);
     vao = vbo = vboTime = 0;
     cornerVertex.clear();
+    uploaded.clear();
+    positionsSet = false;
     hasVertexTimes = false;
     ranges.clear();
     texturesA.clear();
@@ -210,7 +212,9 @@ void MorphTexturedRenderer::Initialize(const std::vector<glm::vec3>& startPositi
     glGenBuffers(1, &vbo);
     glBindVertexArray(vao);
     glBindBuffer(GL_ARRAY_BUFFER, vbo);
-    glBufferData(GL_ARRAY_BUFFER, verts.size() * sizeof(Vertex), verts.data(), GL_STATIC_DRAW);
+    glBufferData(GL_ARRAY_BUFFER, verts.size() * sizeof(Vertex), verts.data(), GL_DYNAMIC_DRAW);
+    uploaded = verts;
+    positionsSet = false;
     auto attrib = [](GLuint loc, int size, size_t offset) {
         glEnableVertexAttribArray(loc);
         glVertexAttribPointer(loc, size, GL_FLOAT, GL_FALSE, sizeof(Vertex), (void*)offset);
@@ -243,6 +247,32 @@ void MorphTexturedRenderer::SetVertexTimes(const std::vector<float>& times) {
     glVertexAttribPointer(8, 1, GL_FLOAT, GL_FALSE, sizeof(float), (void*)0);
     glBindVertexArray(0);
     hasVertexTimes = true;
+}
+
+void MorphTexturedRenderer::SetPositions(const std::vector<glm::vec3>& positions,
+                                         const std::vector<unsigned int>& indices) {
+    if (!vao || uploaded.size() != cornerVertex.size()) return;
+    std::vector<glm::vec3> normals = VertexNormals(positions, indices);
+    overridden = uploaded;
+    for (size_t c = 0; c < overridden.size(); ++c) {
+        unsigned int v = cornerVertex[c];
+        if (v >= positions.size()) continue;
+        // both ends at the solved position: the blend then leaves it there
+        overridden[c].positionStart = overridden[c].positionEnd = positions[v];
+        overridden[c].normalStart   = overridden[c].normalEnd   = normals[v];
+    }
+    glBindBuffer(GL_ARRAY_BUFFER, vbo);
+    glBufferSubData(GL_ARRAY_BUFFER, 0, overridden.size() * sizeof(Vertex), overridden.data());
+    glBindBuffer(GL_ARRAY_BUFFER, 0);
+    positionsSet = true;
+}
+
+void MorphTexturedRenderer::ClearPositions() {
+    if (!vao || !positionsSet) return;
+    glBindBuffer(GL_ARRAY_BUFFER, vbo);
+    glBufferSubData(GL_ARRAY_BUFFER, 0, uploaded.size() * sizeof(Vertex), uploaded.data());
+    glBindBuffer(GL_ARRAY_BUFFER, 0);
+    positionsSet = false;
 }
 
 void MorphTexturedRenderer::ClearVertexTimes() {
