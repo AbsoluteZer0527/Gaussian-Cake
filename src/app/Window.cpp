@@ -863,7 +863,10 @@ void Window::displayCallback(GLFWwindow* window) {
     ImGui_ImplGlfw_NewFrame();
     ImGui::NewFrame();
 
-    if (!hideGui) Window::DrawMainGUI();
+    if (!hideGui) {
+        Window::DrawMainGUI();
+        Window::DrawDirectorGUI();   // the Animation window, on the right
+    }
 
     ImGui::Render();
     int display_w, display_h;
@@ -2535,18 +2538,48 @@ static void HintText(const char* text) {
     ImGui::TextDisabled("%s", text);
 }
 
-// The Director panel (Topology and Splats): how the selected step moves,
-// the tools that place its origin, paint and pins, and a scrub bar.
+// The Animation window (Topology and Splats), on the right of the screen:
+// the shape timeline, how the selected step moves, the tools that place its
+// origin, paint and pins, and a scrub bar.
 void Window::DrawDirectorGUI() {
+    if (renderMode == RenderMode::Particles) return;
     MorphTimeline& tl = timeline;
     tl.SyncSegments();
+
+    // Pinned to the right edge: placed there on first use and whenever the
+    // app window changes size; it can still be moved or resized by hand.
+    ImGuiIO& io = ImGui::GetIO();
+    static float lastW = -1.0f, lastH = -1.0f;
+    ImGuiCond cond = (io.DisplaySize.x != lastW || io.DisplaySize.y != lastH) ? ImGuiCond_Always
+                                                                              : ImGuiCond_FirstUseEver;
+    lastW = io.DisplaySize.x;
+    lastH = io.DisplaySize.y;
+    const float margin = 10.0f;
+    float width = std::min(400.0f, io.DisplaySize.x * 0.4f);
+    ImGui::SetNextWindowPos(ImVec2(io.DisplaySize.x - margin, margin), cond, ImVec2(1.0f, 0.0f));
+    ImGui::SetNextWindowSize(ImVec2(width, io.DisplaySize.y - 2.0f * margin), cond);
+    if (!ImGui::Begin("Animation")) {
+        ImGui::End();
+        return;
+    }
+    ImGui::PushItemWidth(ImGui::GetFontSize() * -8.0f);   // room for labels on the right
+
     const bool topo = renderMode == RenderMode::TriangleMorph;
     const int sel = topo ? tl.selected : 0;
     MorphSegmentSpec& seg = tl.segs[sel];
     MorphStyle& style = seg.style;
     bool edited = false;
 
-    ImGui::SeparatorText("Director");
+    // ---- the shape timeline (Topology): start -> key 1 -> key 2 ... ----
+    if (topo) {
+        ImGui::SeparatorText("Timeline");
+        if (tl.DrawGUI(DrawShapeCombo)) {
+            SyncTimelineKeys();
+            StopAllMorphs();   // show the newly selected source right away
+        }
+    }
+
+    ImGui::SeparatorText(topo ? "Selected step" : "Style");
     if (topo && tl.segs.size() > 1) {
         auto name = [](int key) {
             return key > 0 && key <= (int)meshNames.size() ? meshNames[key - 1].c_str() : "blob";
@@ -2579,7 +2612,7 @@ void Window::DrawDirectorGUI() {
     int o = (int)style.origin;
     if (ImGui::Combo("Starts from", &o, origins, 4)) { style.origin = (OriginMode)o; edited = true; }
     if (style.origin == OriginMode::Clicked && !director.hasOrigin)
-        HintText("No point clicked yet: starts from the bottom. Use Set Origin below.");
+        HintText("No point clicked yet: starts from the bottom.\nUse Set Origin below.");
     edited |= ImGui::SliderFloat("Wave", &style.wave, 0.0f, 0.8f, "%.2f");
     ImGui::SetItemTooltip("0 = every part leaves at once\nHigher = parts leave one after another,\n"
                           "as heat spreads over the surface from the start point");
@@ -2672,9 +2705,13 @@ void Window::DrawDirectorGUI() {
     // ---- scrub ----
     if (trueMorphActive || splatMorphActive) {
         float p = animator->GetProgress();
+        ImGui::SeparatorText("Playback");
         if (ImGui::SliderFloat("Scrub", &p, 0.0f, 1.0f, "%.3f")) animator->Seek(p);
         ImGui::SetItemTooltip("Hold the morph at any moment (Bake It! plays it again)");
     }
+
+    ImGui::PopItemWidth();
+    ImGui::End();
 }
 
 void Window::DrawMainGUI() {
@@ -2703,8 +2740,14 @@ void Window::DrawMainGUI() {
     // ---- 2. Shapes ----
     ImGui::SeparatorText("Shapes");
     if (renderMode == RenderMode::TriangleMorph) {
-        // Shapes as keyframes: start -> key 1 -> key 2 ...
-        if (timeline.DrawGUI(DrawShapeCombo)) {
+        // the first two keys of the timeline (all of them: the Animation window)
+        bool changed = DrawShapeCombo("Source (A)", timeline.keys[0]);
+        changed |= DrawShapeCombo(timeline.keys.size() > 2 ? "Key 1" : "Target (B)", timeline.keys[1]);
+        if (timeline.keys.size() > 2)
+            HintText(("+ " + std::to_string(timeline.keys.size() - 2) +
+                      " more shape(s) in the Animation window").c_str());
+        if (changed) {
+            for (auto& seg : timeline.segs) seg.pins.clear();   // pins were placed on the old shapes
             SyncTimelineKeys();
             StopAllMorphs();   // show the newly selected source right away
         }
@@ -2730,7 +2773,8 @@ void Window::DrawMainGUI() {
         ImGui::SeparatorText("Transport");
         animator->DrawParamsGUI();
     } else {
-        DrawDirectorGUI();
+        ImGui::SeparatorText("Transport");
+        HintText("Timing, style and tools: the Animation window ->");
     }
 
     // Bake | Revert | Clear on one row
