@@ -14,6 +14,7 @@ struct MorphPin {
 struct MorphSegmentSpec {
     float duration = 3.0f;      // seconds
     int   preset = 0;           // BuiltinStyles() index the style came from (-1 = custom)
+    int   basePreset = 0;       // the last preset applied (what "reset" goes back to)
     MorphStyle style;           // how it moves (copied from the preset, then editable)
     std::vector<MorphPin> pins; // which parts must land where (shared topology only)
     bool easingLinked = true;   // one easing curve for all parts (Lead = Trail)

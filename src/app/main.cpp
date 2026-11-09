@@ -1,4 +1,5 @@
 #include "Window.h"
+#include "DirectorWidgets.h"
 #include "core.h"
 #include <cstdio>
 #include <string>
@@ -72,6 +73,7 @@ void print_versions() {
 //        [--rigid 0|1] (shared topology: rigid in-betweens, default on)
 //        [--sphere 0|1] (shared topology: fold-free matching through the sphere, default on)
 //        [--bench a.obj:b.obj,c.obj:d.obj] (bake each pair in Topology mode, print quality numbers)
+//        [--uitest 1] (drive the Animation window with a synthetic mouse, check each control)
 //        [--click x,y] (repeatable: a click of the tool at that pixel, after the bake, at time 0)
 // Bakes A -> B, then saves <prefix>_t<time>.ppm for every time and exits.
 struct ScriptArgs {
@@ -83,7 +85,8 @@ struct ScriptArgs {
     float jiggle = -1.0f, wave = -1.0f, sag = -1.0f;
     int select = -1;                        // the step the Animation window shows
     std::vector<glm::vec2> clicks;
-    std::vector<std::pair<std::string, std::string>> bench;   // --bench a:b,c:d          // tool clicks (window pixels) before the shots
+    std::vector<std::pair<std::string, std::string>> bench;   // --bench a:b,c:d
+    bool uitest = false;          // tool clicks (window pixels) before the shots
     std::vector<float> times = { 0.0f, 0.5f, 1.0f };
     int width = 800, height = 600, k = -1;
     int gpu = -1;               // 0 = force the CPU paths
@@ -119,6 +122,7 @@ static bool ParseArgs(int argc, char** argv, ScriptArgs& args) {
         else if (key == "--rigid")     Window::rigidInBetweens = (val != "0");
         else if (key == "--sphere")    Window::sphereMatch = (val != "0");
         else if (key == "--select")    args.select = std::stoi(val);
+        else if (key == "--uitest")    args.uitest = (val != "0");
         else if (key == "--bench") {
             size_t pos = 0;
             while (pos < val.size()) {
@@ -182,6 +186,110 @@ static void Frame(GLFWwindow* window) {
     Window::displayCallback(window);
 }
 
+// --uitest: drive the Animation window with a (synthetic) mouse and check
+// that each control does what it should. Prints PASS / FAIL per case.
+static int RunUiTest(GLFWwindow* window) {
+    ImGuiIO& io = ImGui::GetIO();
+    auto moveTo = [&](ImVec2 p) {
+        glfwSetCursorPos(window, p.x, p.y);
+        io.AddMousePosEvent(p.x, p.y);
+        Frame(window);
+    };
+    auto button = [&](bool down) {
+        io.AddMouseButtonEvent(0, down);
+        Frame(window);
+    };
+    auto click = [&](ImVec2 p) { moveTo(p); button(true); button(false); };
+    auto drag = [&](ImVec2 a, ImVec2 b) {
+        moveTo(a);
+        button(true);
+        for (int k = 1; k <= 6; ++k) moveTo(ImVec2(a.x + (b.x - a.x) * k / 6.0f, a.y + (b.y - a.y) * k / 6.0f));
+        button(false);
+    };
+    auto center = [](ImVec2 a, ImVec2 b) { return ImVec2(0.5f * (a.x + b.x), 0.5f * (a.y + b.y)); };
+    int failed = 0;
+    auto report = [&](const char* name, bool ok, const std::string& detail) {
+        std::cout << "[UiTest] " << (ok ? "PASS " : "FAIL ") << name << "  " << detail << "\n";
+        if (!ok) ++failed;
+    };
+
+    // a 3-shape timeline, baked
+    Window::renderMode = RenderMode::TriangleMorph;
+    MorphTimeline& tl = Window::timeline;
+    int a = MeshIndexByName("bunny.obj"), b = MeshIndexByName("MaleHead.obj"), c = MeshIndexByName("heart_crystal.obj");
+    if (a < 0 || b < 0 || c < 0) return EXIT_FAILURE;
+    tl.keys = { a, b, c };
+    tl.SyncSegments();
+    tl.selected = 0;
+    for (int i = 0; i < 5; ++i) Frame(window);
+    Window::ComputeOTAndSpawnParticles();
+    while (Window::morphBaking) Frame(window);
+    for (int i = 0; i < 5; ++i) Frame(window);
+    ImVec2 lo, hi;
+
+    // 1. easing: drag the Lead curve's second handle down
+    {
+        MorphCurve before = tl.segs[tl.selected].style.early;
+        bool found = UiDebug::Get("easing:h2", lo, hi);
+        if (found) drag(center(lo, hi), ImVec2(center(lo, hi).x, center(lo, hi).y + 40.0f));
+        MorphCurve after = tl.segs[tl.selected].style.early;
+        char d[128];
+        snprintf(d, sizeof(d), "p2.y %.3f -> %.3f, preset %d", before.p2.y, after.p2.y, tl.segs[tl.selected].preset);
+        report("easing handle drag", found && after.p2.y < before.p2.y - 0.05f && tl.segs[tl.selected].preset == -1, d);
+    }
+    // 2. easing: a click on empty canvas moves the nearest handle there
+    {
+        MorphCurve before = tl.segs[tl.selected].style.early;
+        bool found = UiDebug::Get("easing:canvas", lo, hi);
+        if (found) click(ImVec2(lo.x + 0.2f * (hi.x - lo.x), lo.y + 0.3f * (hi.y - lo.y)));
+        MorphCurve after = tl.segs[tl.selected].style.early;
+        char d[160];
+        snprintf(d, sizeof(d), "p1 (%.2f, %.2f) -> (%.2f, %.2f)", before.p1.x, before.p1.y, after.p1.x, after.p1.y);
+        report("easing click-to-nearest", found && after.p1 != before.p1, d);
+    }
+    // 2b. easing: a double-click puts the curve back to its preset
+    {
+        bool found = UiDebug::Get("easing:canvas", lo, hi);
+        ImVec2 p = ImVec2(lo.x + 0.5f * (hi.x - lo.x), lo.y + 0.5f * (hi.y - lo.y));
+        if (found) { click(p); click(p); }
+        const MorphCurve& want = BuiltinStyles()[tl.segs[tl.selected].basePreset].early;
+        report("easing double-click reset", found && tl.segs[tl.selected].style.early == want, "");
+    }
+    // 3. track: click at 75% of the ruler
+    {
+        bool found = UiDebug::Get("track", lo, hi);
+        if (found) click(ImVec2(lo.x + 0.75f * (hi.x - lo.x), lo.y + 5.0f));
+        float p = Window::animator->GetProgress();
+        report("track scrub", found && std::abs(p - 0.75f) < 0.03f, "progress " + std::to_string(p));
+    }
+    // 4. style tile: Pop
+    {
+        bool found = UiDebug::Get("tile:Pop", lo, hi);
+        if (found) click(center(lo, hi));
+        report("style tile", found && tl.segs[tl.selected].preset == FindStyle("pop"),
+               "preset " + std::to_string(tl.segs[tl.selected].preset));
+    }
+    // 5. key retime: drag the middle key right
+    {
+        float d0 = tl.segs[0].duration, d1 = tl.segs[1].duration, total = tl.Total();
+        bool found = UiDebug::Get("track:key1", lo, hi);
+        if (found) drag(center(lo, hi), ImVec2(center(lo, hi).x + 50.0f, center(lo, hi).y));
+        char d[128];
+        snprintf(d, sizeof(d), "%.2f + %.2f -> %.2f + %.2f (total %.2f -> %.2f)", d0, d1, tl.segs[0].duration,
+                 tl.segs[1].duration, total, tl.Total());
+        report("key retime", found && tl.segs[0].duration > d0 + 0.1f && std::abs(tl.Total() - total) < 1e-3f, d);
+    }
+    // 6. tool button: the brush
+    {
+        bool found = UiDebug::Get("icon:##brush", lo, hi);
+        if (found) click(center(lo, hi));
+        report("tool button", found && Window::director.tool == MorphDirector::Tool::TimingBrush,
+               "tool " + std::to_string((int)Window::director.tool));
+    }
+    std::cout << "[UiTest] " << (failed ? std::to_string(failed) + " failed" : "all passed") << "\n";
+    return failed ? EXIT_FAILURE : EXIT_SUCCESS;
+}
+
 // --bench: bake each pair in Topology mode and print its quality numbers.
 static int RunBench(GLFWwindow* window, const ScriptArgs& args) {
     Window::renderMode = RenderMode::TriangleMorph;
@@ -205,6 +313,7 @@ static int RunBench(GLFWwindow* window, const ScriptArgs& args) {
 }
 
 static int RunScript(GLFWwindow* window, const ScriptArgs& args) {
+    if (args.uitest) return RunUiTest(window);
     if (!args.bench.empty()) return RunBench(window, args);
     if (args.mode == "topology")       Window::renderMode = RenderMode::TriangleMorph;
     else if (args.mode == "particles") Window::renderMode = RenderMode::Particles;
@@ -354,7 +463,7 @@ int main(int argc, char** argv) {
     // Initialize objects/pointers for rendering; exit if initialization fails.
     if (!Window::initializeObjects()) exit(EXIT_FAILURE);
 
-    if (!script.shot.empty() || !script.bench.empty()) {
+    if (!script.shot.empty() || !script.bench.empty() || script.uitest) {
         int code = RunScript(window, script);
         Window::cleanUp();
         glfwDestroyWindow(window);

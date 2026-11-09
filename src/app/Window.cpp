@@ -2754,7 +2754,7 @@ static void PinSteps(bool waitingForB) {
     ImVec2 p = ImGui::GetCursorScreenPos();
     ImDrawList* dl = ImGui::GetWindowDrawList();
     const char* labels[2] = { "1", "2" };
-    float r = 0.38f * h, gap = 2.6f * r;
+    float r = 0.46f * h, gap = 2.2f * r;
     for (int i = 0; i < 2; ++i) {
         ImVec2 c(p.x + r + i * (gap + r), p.y + 0.5f * h);
         bool on = (i == 1) == waitingForB;
@@ -2828,7 +2828,9 @@ void Window::DrawDirectorGUI() {
 
     // ---- transport ----
     float rowY = ImGui::GetCursorPosY();
-    if (IconButton("##tostart", Icon::ToStart, false, "Go to start  (Home)", icon) && baked) animator->Seek(0.0f);
+    ImGui::BeginDisabled(!baked);
+    if (IconButton("##tostart", Icon::ToStart, false, "Go to start  (Home)", icon)) animator->Seek(0.0f);
+    ImGui::EndDisabled();
     ImGui::SameLine(0.0f, 2.0f);
     bool playing = baked && !stale && animator->IsPlaying();
     ImGui::BeginDisabled(!(baked && !stale) && !CanBakeNow());
@@ -2837,7 +2839,9 @@ void Window::DrawDirectorGUI() {
         TogglePlay();
     ImGui::EndDisabled();
     ImGui::SameLine(0.0f, 2.0f);
-    if (IconButton("##toend", Icon::ToEnd, false, "Go to end  (End)", icon) && baked) animator->Seek(1.0f);
+    ImGui::BeginDisabled(!baked);
+    if (IconButton("##toend", Icon::ToEnd, false, "Go to end  (End)", icon)) animator->Seek(1.0f);
+    ImGui::EndDisabled();
     ImGui::SameLine(0.0f, 2.0f);
     if (IconButton("##loop", Icon::Loop, loopPlayback, loopPlayback ? "Loop: on" : "Loop: off", icon))
         loopPlayback = !loopPlayback;
@@ -2862,7 +2866,7 @@ void Window::DrawDirectorGUI() {
 
     // ---- the track ----
     TrackResult r;
-    TimelineTrack("##track", shown, baked ? animator->GetProgress() : 0.0f, topo, meshNames, r);
+    TimelineTrack("##track", shown, baked ? animator->GetProgress() : 0.0f, topo, baked, meshNames, r);
     bool keysChanged = false;
     if (r.seek && baked) animator->Seek(r.progress);
     if (r.selectSeg >= 0 && topo) { tl.selected = r.selectSeg; tl.selectedKey = -1; }
@@ -2947,12 +2951,12 @@ void Window::DrawDirectorGUI() {
     }
     PropLabel("Spread", "0: every part changes together\nhigher: parts change one after another,\n"
                         "rolling over the surface from where it begins");
-    edited |= ImGui::SliderFloat("##spread", &style.wave, 0.0f, 0.8f, "%.2f");
+    edited |= ImGui::SliderFloat("##spread", &style.wave, 0.0f, 0.8f, style.wave <= 0.0f ? "all together" : "%.2f");
     if (topo) {
         PropLabel("Bounce", "Parts overshoot and wobble when they arrive, then settle");
-        edited |= ImGui::SliderFloat("##bounce", &style.jiggle, 0.0f, 1.0f, "%.2f");
+        edited |= ImGui::SliderFloat("##bounce", &style.jiggle, 0.0f, 1.0f, style.jiggle <= 0.0f ? "off" : "%.2f");
         PropLabel("Droop", "The surface sags mid-change, like melting (none at either end)");
-        edited |= ImGui::SliderFloat("##droop", &style.sag, 0.0f, 0.6f, "%.2f");
+        edited |= ImGui::SliderFloat("##droop", &style.sag, 0.0f, 0.6f, style.sag <= 0.0f ? "off" : "%.2f");
     } else {
         PropLabel("Clump", "0: every splat flies alone\n1: neighbours travel together as chunks");
         edited |= ImGui::SliderFloat("##clump", &style.cohesion, 0.0f, 1.0f, "%.2f");
@@ -2962,7 +2966,17 @@ void Window::DrawDirectorGUI() {
     PropLabel("Easing", "Time (left to right) against how far each part has got.\n"
                         "Drag the handles; below the dashed 0 line it pulls back first,\n"
                         "above the 1 line it overshoots.");
-    edited |= EasingEditor("##easing", style.early, style.late, seg.easingLinked, seg.easingEdit);
+    {
+        float now = -1.0f;   // the playback, as a dot riding the curve
+        if (baked && !stale) {
+            MorphTimeline::Place place = topo ? tl.Locate(animator->GetProgress())
+                                              : MorphTimeline::Place{ 0, animator->GetProgress() };
+            if (place.seg == sel) now = place.local;
+        }
+        const auto& base = BuiltinStyles()[std::clamp(seg.basePreset, 0, (int)BuiltinStyles().size() - 1)];
+        edited |= EasingEditor("##easing", style.early, style.late, seg.easingLinked, seg.easingEdit,
+                               now, &base.early, &base.late);
+    }
     if (edited) {
         seg.preset = -1;
         style.name = "Custom";
@@ -3007,8 +3021,6 @@ void Window::DrawDirectorGUI() {
                               small))
                 director.brushLater = dir == 1;
             ImGui::SameLine();
-            ImGui::TextDisabled(director.brushLater ? "Later" : "Sooner");
-            ImGui::SameLine();
             float w = 0.5f * (ImGui::GetContentRegionAvail().x - small - 2.0f * ImGui::GetStyle().ItemSpacing.x);
             ImGui::SetNextItemWidth(w);
             ImGui::SliderFloat("##size", &director.brushRadius, 0.03f, 0.6f, "size %.2f");
@@ -3040,7 +3052,7 @@ void Window::DrawDirectorGUI() {
     if (director.tool != Tool::Navigate) {
         if (!topo && !splatMorphActive)
             Badge("bake first", IM_COL32(255, 196, 80, 255), "In Splats mode the tools work on the baked splats");
-        else if (topo)
+        else if (topo && OverlayActive())
             GradientLegend("first", "last");
     }
 
@@ -3095,18 +3107,20 @@ void Window::DrawMainGUI() {
     // ---- 2. Shapes ----
     ImGui::SeparatorText("Shapes");
     if (renderMode == RenderMode::TriangleMorph) {
-        // the first two keys of the timeline (all of them: the Animation window)
-        bool changed = DrawShapeCombo("Source (A)", timeline.keys[0]);
-        changed |= DrawShapeCombo(timeline.keys.size() > 2 ? "Key 1" : "Target (B)", timeline.keys[1]);
-        if (timeline.keys.size() > 2) {
-            std::string more = "+" + std::to_string(timeline.keys.size() - 2);
-            Badge(more.c_str(), IM_COL32(170, 170, 185, 255), "More shapes on the timeline (Animation window)");
+        // The timeline owns the shapes: a summary here, edited on the right
+        std::string chain;
+        for (size_t k = 0; k < timeline.keys.size(); ++k) {
+            int key = timeline.keys[k];
+            std::string name = key > 0 && key <= (int)meshNames.size() ? meshNames[key - 1] : "(pick a shape)";
+            size_t dot = name.rfind('.');
+            if (dot != std::string::npos && key > 0) name = name.substr(0, dot);
+            chain += (k ? "  >  " : "") + name;
         }
-        if (changed) {
-            for (auto& seg : timeline.segs) seg.pins.clear();   // pins were placed on the old shapes
-            SyncTimelineKeys();
-            StopAllMorphs();   // show the newly selected source right away
-        }
+        ImGui::PushStyleColor(ImGuiCol_Text, ImGui::GetStyleColorVec4(ImGuiCol_TextDisabled));
+        ImGui::TextWrapped("%s", chain.c_str());
+        ImGui::PopStyleColor();
+        ImGui::SetItemTooltip("The shapes of the timeline, in order.\nEdit them on the timeline in the Animation window\n"
+                              "(right-click a key, or the boxes under Step).");
     } else {
         if (DrawShapeCombo("Source (A)", meshIndexA))
             StopAllMorphs();   // show the newly selected source right away
@@ -3135,8 +3149,9 @@ void Window::DrawMainGUI() {
     // Bake | Revert | Clear on one row
     ImGui::Spacing();
     float spacing = ImGui::GetStyle().ItemSpacing.x;
+    const bool particles = renderMode == RenderMode::Particles;
     float smallW  = ImGui::CalcTextSize("Revert").x + ImGui::GetStyle().FramePadding.x * 4.0f;
-    float bakeW   = ImGui::GetContentRegionAvail().x - 2.0f * (smallW + spacing);
+    float bakeW   = ImGui::GetContentRegionAvail().x - (particles ? 2.0f : 1.0f) * (smallW + spacing);
 
     ImGui::PushStyleColor(ImGuiCol_Button,        ImVec4(1.0f, 0.4f, 0.7f, 1.0f));
     ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImVec4(1.0f, 0.6f, 0.8f, 1.0f));
@@ -3147,17 +3162,20 @@ void Window::DrawMainGUI() {
     ImGui::EndDisabled();
     ImGui::PopStyleColor(3);
 
+    ImGui::SetItemTooltip(particles ? "Work out how every point moves, then play it"
+                                    : "Work out how every part moves, then play it\n(Play in the Animation window does the same)");
+    if (particles) {   // the other modes play, scrub and loop in the Animation window
+        ImGui::SameLine();
+        ImGui::BeginDisabled(animator->state != AnimationState::GAUSSIAN_B);
+        if (ImGui::Button("Revert", ImVec2(smallW, 0)))
+            animator->ReverseTransport();
+        ImGui::EndDisabled();
+        ImGui::SetItemTooltip("Play the morph back from B to A");
+    }
     ImGui::SameLine();
-    ImGui::BeginDisabled(animator->state != AnimationState::GAUSSIAN_B);
-    if (ImGui::Button("Revert", ImVec2(smallW, 0)))
-        animator->ReverseTransport();
-    ImGui::EndDisabled();
-    ImGui::SetItemTooltip("Play the morph back from B to A");
-
-    ImGui::SameLine();
-    if (ImGui::Button("Clear", ImVec2(smallW, 0)))
+    if (ImGui::Button("Reset", ImVec2(smallW, 0)))
         StopAllMorphs();
-    ImGui::SetItemTooltip("Stop and show the source again");
+    ImGui::SetItemTooltip("Stop the morph and show the starting shape again");
 
     if (needsMeshes && renderMode == RenderMode::TriangleMorph && !allKeys)
         ImGui::TextColored(ImVec4(1.0f, 0.55f, 0.4f, 1.0f), "Pick a mesh for every shape to bake.");
@@ -3178,21 +3196,29 @@ void Window::DrawMainGUI() {
             snprintf(label, sizeof(label), "%s (%d/%d)", g_stageNames[stage],
                      std::min(stage + 1, g_stageCount), g_stageCount);
         ImGui::ProgressBar(glm::clamp(frac, 0.0f, 1.0f), ImVec2(-1, 0), label);
-    } else {
-        animator->DrawStatusGUI();
+    } else if (particles) {
+        animator->DrawStatusGUI();   // (the other modes: the Animation window's transport)
     }
     if (renderMode == RenderMode::Splats && lastBakeMs >= 0.0f && !splatBaking)
         HintText(("Last bake: " + std::to_string((int)lastBakeMs) + " ms").c_str());
-    if (renderMode == RenderMode::TriangleMorph && !morphStatus.empty() && !morphBaking) {
-        // one line: how each step was built; the details on hover
-        std::string kinds;
+    if (renderMode == RenderMode::TriangleMorph && !morphStatus.empty() && !morphBaking && !g_segResults.empty()) {
+        // how each step was built, one chip each; the full report on hover
         for (size_t k = 0; k < g_segResults.size(); ++k) {
-            if (k) kinds += ", ";
-            kinds += g_segResults[k].shared ? "shared" : g_segResults[k].piecewise ? "piecewise" : "SDF";
+            const TrueMorphResult& r = g_segResults[k];
+            const char* kind = r.shared ? "shared" : r.piecewise ? "piecewise" : "SDF";
+            ImU32 col = r.shared ? IM_COL32(120, 220, 150, 255) : r.piecewise ? IM_COL32(120, 180, 255, 255)
+                                                                              : IM_COL32(170, 170, 185, 255);
+            char label[32];
+            snprintf(label, sizeof(label), "%zu %s", k + 1, kind);
+            std::string tip = std::string(r.shared ? "One mesh reshaped (wave, brush, bounce and pins all apply).\n"
+                                          : r.piecewise ? "The topology changes: real meshes that switch where a hole opens or parts merge.\n"
+                                                        : "The topology changes: a surface rebuilt every frame.\n") +
+                              "\n" + r.status;
+            if (k) ImGui::SameLine(0.0f, 4.0f);
+            ImGui::PushID((int)k);
+            Badge(label, col, tip.c_str());
+            ImGui::PopID();
         }
-        if (kinds.empty()) kinds = morphStatus.substr(0, morphStatus.find(':'));
-        ImGui::TextDisabled("Built: %s  (?)", kinds.c_str());
-        ImGui::SetItemTooltip("%s", morphStatus.c_str());
     }
 
     // ---- 4. Settings for the selected type ----
@@ -3237,6 +3263,17 @@ void Window::DrawMainGUI() {
         }
 
         // Settings the bar doesn't touch
+        if (renderMode == RenderMode::TriangleMorph) {
+            ImGui::Checkbox("Fold-free matching", &sphereMatch);
+            ImGui::SetItemTooltip("Closed shapes without holes: match the two surfaces through a\n"
+                                  "sphere, so the in-between shape can't fold over itself.\n"
+                                  "Off: pull one shape onto the other (can fold where they differ).");
+            ImGui::SameLine();
+            if (ImGui::Checkbox("Rigid in-betweens", &rigidInBetweens)) g_morphShown = MorphShown::None;
+            ImGui::SetItemTooltip("Turning parts keep their size mid-morph instead of collapsing\n"
+                                  "(each triangle rotates and stretches; solved on the CPU).\n"
+                                  "Off: straight lines per vertex, blended on the GPU.");
+        }
         if (renderMode == RenderMode::Splats) {
             ImGui::SeparatorText("Captures (.ply)");
             // Changing the crop reloads the capture, so apply it on release, not while dragging
@@ -3247,7 +3284,7 @@ void Window::DrawMainGUI() {
             const char* upAxes[] = { "As is", "Flip Y (COLMAP)", "Rotate X +90", "Rotate X -90" };
             int up = (int)plyOptions.up;
             if (ImGui::Combo("Up Axis", &up, upAxes, 4)) plyOptions.up = (PlyLoadOptions::Up)up;
-            ImGui::SliderInt("Colour Detail (SH)", &SplatRenderer::shDegree, 0, 3);
+            ImGui::SliderInt("Colour detail", &SplatRenderer::shDegree, 0, 3);
             ImGui::SetItemTooltip("Spherical-harmonic degree of a capture's view-dependent colour:\n"
                                   "0 = one flat colour per splat, 3 = full 3DGS shading\n"
                                   "(highlights and reflections change as you orbit)");
@@ -3260,7 +3297,7 @@ void Window::DrawMainGUI() {
                 const char* transports[] = { "Auto", "Greedy (discrete)", "Gaussian", "Gaussian Mixture" };
                 int tr = (int)particleTransport;
                 if (ImGui::Combo("Transport", &tr, transports, 4)) particleTransport = (ParticleTransport)tr;
-                HintText(particleTransport == ParticleTransport::Auto ? "Greedy between two shapes, Gaussian with the blob" :
+                ImGui::SetItemTooltip("%s", particleTransport == ParticleTransport::Auto ? "Greedy between two shapes, Gaussian with the blob" :
                          particleTransport == ParticleTransport::Greedy ? "Match surface samples one-to-one" :
                          particleTransport == ParticleTransport::Gaussian ? "One closed-form map T(x) = muB + A(x - muA)" :
                                                                             "K parts matched by Sinkhorn, one map per pair");
@@ -3272,7 +3309,7 @@ void Window::DrawMainGUI() {
                 const char* methods[] = { "Auto", "Shared Topology", "SDF", "Piecewise" };
                 int m = (int)morphMethod;
                 if (ImGui::Combo("Method", &m, methods, 4)) morphMethod = (MorphMethod)m;
-                HintText(morphMethod == MorphMethod::Auto ? "Shared topology if both meshes match, else Piecewise" :
+                ImGui::SetItemTooltip("%s", morphMethod == MorphMethod::Auto ? "Shared topology if both meshes match, else Piecewise" :
                          morphMethod == MorphMethod::SharedTopology ? "Fit the denser mesh onto the other" :
                          morphMethod == MorphMethod::SDF ? "Distance-field blend: any genus / parts" :
                                                            "A's mesh, then B's, along the SDF path;\n"
@@ -3285,14 +3322,6 @@ void Window::DrawMainGUI() {
                                       "K = a Gaussian mixture on each shape, matched part to part\n"
                                       "by Sinkhorn (in-between shapes stay closer to A and B).\n"
                                       "Used only as strongly as it can be without folding.");
-                ImGui::Checkbox("Fold-free matching", &sphereMatch);
-                ImGui::SetItemTooltip("Shared topology, closed shapes without holes: match the two\n"
-                                      "surfaces through a sphere, so the template can't fold over\n"
-                                      "itself (off: pull the template onto the target)");
-                if (ImGui::Checkbox("Rigid in-betweens", &rigidInBetweens)) g_morphShown = MorphShown::None;
-                ImGui::SetItemTooltip("Shared topology: turning parts keep their size mid-morph\n"
-                                      "(each triangle rotates and stretches, solved on the CPU).\n"
-                                      "Off: straight lines per vertex, blended on the GPU.");
                 ImGui::Checkbox("Cotan Laplacian", &fitCotan);
                 ImGui::SetItemTooltip("Shared topology: weight the shape-keeping term by triangle angles\n"
                                       "(cotan Laplacian) instead of treating every neighbour the same");

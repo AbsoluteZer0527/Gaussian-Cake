@@ -137,6 +137,8 @@ Scripted runs can set all of this too, for example:
 menv --shot out/ripple --mode topology --keys bunny.obj,MaleHead.obj,heart_crystal.obj --style ripple --origin 0.3,0.9,0 --times 0.25,0.5,0.75
 ```
 
+`menv --uitest 1` drives the Animation window with a synthetic mouse (drags the easing handles, scrubs the track, retimes a key, clicks a style and a tool) and reports PASS/FAIL for each.
+
 Other options are `--style`, `--wave`, `--bounce`, `--droop`, `--pin ax,ay,az:bx,by,bz`, `--tool start|brush|pin`, `--select k` and `--click x,y`.
 
 ## How to Run

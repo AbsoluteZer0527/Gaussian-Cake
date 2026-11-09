@@ -58,6 +58,7 @@ void MorphTimeline::ApplyPreset(int seg, int preset) {
     if (preset < 0 || preset >= (int)styles.size()) return;
     segs[seg].style = styles[preset];
     segs[seg].preset = preset;
+    segs[seg].basePreset = preset;
     segs[seg].easingLinked = styles[preset].early == styles[preset].late;
     segs[seg].easingEdit = 0;
 }

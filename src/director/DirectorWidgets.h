@@ -47,7 +47,8 @@ struct TrackResult {
 // diamonds between them and a playhead. Click the ruler to scrub, a clip to
 // select it, a diamond to select that key; drag an inner diamond to retime;
 // right-click for a menu. meshNames[i] names mesh index i + 1 (0 = blob).
-void TimelineTrack(const char* id, const MorphTimeline& tl, float progress, bool editKeys,
+// canScrub: something is baked (else clicks on the ruler only explain that).
+void TimelineTrack(const char* id, const MorphTimeline& tl, float progress, bool editKeys, bool canScrub,
                    const std::vector<std::string>& meshNames, TrackResult& out);
 
 // A tile showing a style's timing as a little curve, its name below.
@@ -55,11 +56,22 @@ bool StyleTile(const char* id, const MorphStyle& style, bool selected, float siz
 
 // One canvas, two curves: Lead (the parts the change reaches first, pink)
 // and Trail (the last ones, blue). `editing` picks whose handles move;
-// `linked` keeps them the same. Returns true if a curve changed.
-bool EasingEditor(const char* id, MorphCurve& lead, MorphCurve& trail, bool& linked, int& editing);
+// `linked` keeps them the same. now: where the playback is (0..1, -1 =
+// none), shown as a dot riding the curve. leadDefault / trailDefault: what a
+// double-click resets to (null = no reset). Returns true if a curve changed.
+bool EasingEditor(const char* id, MorphCurve& lead, MorphCurve& trail, bool& linked, int& editing,
+                  float now = -1.0f, const MorphCurve* leadDefault = nullptr,
+                  const MorphCurve* trailDefault = nullptr);
 
 // A small orange -> blue bar, the colours of the timing overlay.
 void GradientLegend(const char* left, const char* right);
+
+// Where the interactive parts were drawn last frame (screen rects), so a
+// scripted run (menv --uitest) can click and drag them like a user would.
+namespace UiDebug {
+void Record(const std::string& name, ImVec2 min, ImVec2 max);
+bool Get(const std::string& name, ImVec2& min, ImVec2& max);
+}
 
 // A rounded label with a coloured background (counts, status); tooltip on hover.
 void Badge(const char* text, ImU32 bg, const char* tooltip = nullptr);

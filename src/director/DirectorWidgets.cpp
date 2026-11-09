@@ -2,8 +2,24 @@
 #include <algorithm>
 #include <cmath>
 #include <cstdio>
+#include <map>
 
 static const float kPi = 3.14159265f;
+
+namespace UiDebug {
+static std::map<std::string, std::pair<ImVec2, ImVec2>>& Rects() {
+    static std::map<std::string, std::pair<ImVec2, ImVec2>> r;
+    return r;
+}
+void Record(const std::string& name, ImVec2 min, ImVec2 max) { Rects()[name] = { min, max }; }
+bool Get(const std::string& name, ImVec2& min, ImVec2& max) {
+    auto it = Rects().find(name);
+    if (it == Rects().end()) return false;
+    min = it->second.first;
+    max = it->second.second;
+    return true;
+}
+}
 
 ImU32 AccentColor() { return IM_COL32(255, 102, 179, 255); }
 
@@ -127,6 +143,7 @@ void DrawIcon(ImDrawList* dl, Icon icon, ImVec2 c, float s, ImU32 col) {
 bool IconButton(const char* id, Icon icon, bool active, const char* tooltip, float size) {
     ImVec2 p = ImGui::GetCursorScreenPos();
     bool pressed = ImGui::InvisibleButton(id, ImVec2(size, size));
+    UiDebug::Record(std::string("icon:") + id, p, ImVec2(p.x + size, p.y + size));
     bool hovered = ImGui::IsItemHovered(), held = ImGui::IsItemActive();
     ImDrawList* dl = ImGui::GetWindowDrawList();
     ImU32 bg = active ? AccentColor()
@@ -176,7 +193,7 @@ static std::string MeshName(const std::vector<std::string>& names, int mesh) {
     return names[mesh - 1];
 }
 
-void TimelineTrack(const char* id, const MorphTimeline& tl, float progress, bool editKeys,
+void TimelineTrack(const char* id, const MorphTimeline& tl, float progress, bool editKeys, bool canScrub,
                    const std::vector<std::string>& meshNames, TrackResult& out) {
     ImGui::PushID(id);
     const float plusW = editKeys ? ImGui::GetFrameHeight() : 0.0f;
@@ -187,6 +204,7 @@ void TimelineTrack(const char* id, const MorphTimeline& tl, float progress, bool
     ImVec2 size(width, rulerH + clipH + 6.0f);
 
     ImGui::InvisibleButton("##track", size, ImGuiButtonFlags_MouseButtonLeft | ImGuiButtonFlags_MouseButtonRight);
+    UiDebug::Record("track", ImVec2(p0.x + padX, p0.y), ImVec2(p0.x + width - padX, p0.y + size.y));
     bool hovered = ImGui::IsItemHovered(), active = ImGui::IsItemActive();
     ImDrawList* dl = ImGui::GetWindowDrawList();
 
@@ -251,11 +269,13 @@ void TimelineTrack(const char* id, const MorphTimeline& tl, float progress, bool
     // key diamonds
     for (int k = 0; k < (int)tl.keys.size(); ++k) {
         float x = timeToX(tl.KeyTime(k));
+        UiDebug::Record("track:key" + std::to_string(k), ImVec2(x - 6.0f, midY - 6.0f), ImVec2(x + 6.0f, midY + 6.0f));
         float r = (k == hoverKey) ? 7.5f : 6.0f;
         ImVec2 pts[4] = { { x, midY - r }, { x + r, midY }, { x, midY + r }, { x - r, midY } };
         bool sel = k == tl.selectedKey;
         dl->AddConvexPolyFilled(pts, 4, sel ? AccentColor() : IM_COL32(235, 235, 240, 255));
         dl->AddPolyline(pts, 4, IM_COL32(20, 20, 24, 255), ImDrawFlags_Closed, 1.5f);
+        if (sel) dl->AddCircle(ImVec2(x, midY), r + 4.0f, AccentColor(), 16, 1.5f);
     }
 
     // playhead
@@ -283,10 +303,11 @@ void TimelineTrack(const char* id, const MorphTimeline& tl, float progress, bool
             out.retimeKey = dragKey;
             out.retimeTime = xToTime(m.x);
             ImGui::SetMouseCursor(ImGuiMouseCursor_ResizeEW);
-        } else if (scrubbing) {
+        } else if (scrubbing && canScrub) {
             out.seek = true;
             out.progress = xToTime(m.x) / total;
         }
+        if (dragKey >= 0 && out.retimeKey >= 0) ImGui::SetTooltip("%.1f s", out.retimeTime);
     }
     if (!active) { dragKey = -1; scrubbing = false; }
 
@@ -304,7 +325,7 @@ void TimelineTrack(const char* id, const MorphTimeline& tl, float progress, bool
                               MeshName(meshNames, tl.keys[hoverSeg + 1]).c_str(), s.style.name.c_str(), s.duration,
                               s.pins.empty() ? "" : (", " + std::to_string(s.pins.size()) + " pins").c_str());
         } else {
-            ImGui::SetTooltip("Click or drag to scrub");
+            ImGui::SetTooltip(canScrub ? "Click or drag to scrub" : "Bake (press Play) to scrub through the morph");
         }
     }
 
@@ -368,6 +389,7 @@ bool StyleTile(const char* id, const MorphStyle& style, bool selected, float siz
     float textH = ImGui::GetTextLineHeight();
     ImVec2 p = ImGui::GetCursorScreenPos();
     bool pressed = ImGui::InvisibleButton(id, ImVec2(size, size + textH + 2.0f));
+    UiDebug::Record("tile:" + style.name, p, ImVec2(p.x + size, p.y + size));
     bool hovered = ImGui::IsItemHovered();
     ImDrawList* dl = ImGui::GetWindowDrawList();
     ImVec2 q(p.x + size, p.y + size);
@@ -396,7 +418,8 @@ bool StyleTile(const char* id, const MorphStyle& style, bool selected, float siz
 
 // ---- easing editor ----
 
-bool EasingEditor(const char* id, MorphCurve& lead, MorphCurve& trail, bool& linked, int& editing) {
+bool EasingEditor(const char* id, MorphCurve& lead, MorphCurve& trail, bool& linked, int& editing,
+                  float now, const MorphCurve* leadDefault, const MorphCurve* trailDefault) {
     ImGui::PushID(id);
     bool changed = false;
     const ImU32 colLead = AccentColor(), colTrail = IM_COL32(90, 160, 255, 255);
@@ -442,6 +465,7 @@ bool EasingEditor(const char* id, MorphCurve& lead, MorphCurve& trail, bool& lin
     float w = ImGui::GetContentRegionAvail().x, h = std::min(130.0f, 0.6f * w);
     ImVec2 o = ImGui::GetCursorScreenPos();
     ImGui::InvisibleButton("##canvas", ImVec2(w, h));
+    UiDebug::Record("easing:canvas", o, ImVec2(o.x + w, o.y + h));
     ImDrawList* dl = ImGui::GetWindowDrawList();
     const float pad = 10.0f;
     auto toScreen = [&](glm::vec2 v) {
@@ -471,25 +495,59 @@ bool EasingEditor(const char* id, MorphCurve& lead, MorphCurve& trail, bool& lin
     MorphCurve& cur = active == 0 ? lead : trail;
     plot(cur, active == 0 ? colLead : colTrail, 2.5f);
 
-    // handles
+    // Handles. The canvas is the one interactive item (handle buttons on
+    // top of it never got the mouse: ImGui gives hover to the first item);
+    // a press grabs the nearest handle, a drag moves it (Figma-style), a
+    // double-click resets the curve to its preset.
     glm::vec2* handles[2] = { &cur.p1, &cur.p2 };
     glm::vec2 anchors[2] = { { 0.0f, 0.0f }, { 1.0f, 1.0f } };
-    for (int k = 0; k < 2; ++k) {
-        ImVec2 s = toScreen(*handles[k]);
-        dl->AddLine(toScreen(anchors[k]), s, IM_COL32(170, 170, 190, 200), 1.0f);
-        ImGui::SetCursorScreenPos(ImVec2(s.x - 7.0f, s.y - 7.0f));
-        ImGui::InvisibleButton(k == 0 ? "##h1" : "##h2", ImVec2(14.0f, 14.0f));
-        bool act = ImGui::IsItemActive(), hov = ImGui::IsItemHovered();
-        anyActive |= act;
-        if (act && ImGui::IsMouseDragging(ImGuiMouseButton_Left, 0.0f)) {
-            glm::vec2 v = fromScreen(ImGui::GetIO().MousePos);
-            v.x = std::clamp(v.x, 0.0f, 1.0f);
-            v.y = std::clamp(v.y, std::max(yLo, -1.0f), std::min(yHi, 2.0f));
-            if (v != *handles[k]) { *handles[k] = v; changed = true; }
-        }
-        if (act || hov) ImGui::SetTooltip("(%.2f, %.2f)", handles[k]->x, handles[k]->y);
-        dl->AddCircleFilled(s, act || hov ? 6.5f : 5.0f, act || hov ? IM_COL32(255, 220, 120, 255) : IM_COL32(245, 245, 250, 255));
+    static int grabbed = -1;
+    ImVec2 mouse = ImGui::GetIO().MousePos;
+    auto nearest = [&]() {
+        float d0 = 0.0f, d1 = 0.0f;
+        ImVec2 s0 = toScreen(*handles[0]), s1 = toScreen(*handles[1]);
+        d0 = (mouse.x - s0.x) * (mouse.x - s0.x) + (mouse.y - s0.y) * (mouse.y - s0.y);
+        d1 = (mouse.x - s1.x) * (mouse.x - s1.x) + (mouse.y - s1.y) * (mouse.y - s1.y);
+        return d0 <= d1 ? 0 : 1;
+    };
+    bool canvasHovered = ImGui::IsItemHovered(), canvasActive = ImGui::IsItemActive();
+    if (ImGui::IsItemActivated()) grabbed = nearest();
+    if (!canvasActive) grabbed = -1;
+    anyActive = canvasActive;
+    if (canvasHovered && ImGui::IsMouseDoubleClicked(ImGuiMouseButton_Left)) {
+        const MorphCurve* def = (active == 0) ? leadDefault : trailDefault;
+        if (def && cur != *def) { cur = *def; changed = true; }
+        grabbed = -1;
+    } else if (grabbed >= 0 && ImGui::IsMouseDown(ImGuiMouseButton_Left)) {
+        glm::vec2 v = fromScreen(mouse);
+        v.x = std::clamp(v.x, 0.0f, 1.0f);
+        v.y = std::clamp(v.y, std::max(yLo, -1.0f), std::min(yHi, 2.0f));
+        if (v != *handles[grabbed]) { *handles[grabbed] = v; changed = true; }
     }
+    int hot = grabbed >= 0 ? grabbed : (canvasHovered ? nearest() : -1);
+    for (int k = 0; k < 2; ++k) {
+        ImVec2 sp = toScreen(*handles[k]);
+        UiDebug::Record(k == 0 ? "easing:h1" : "easing:h2", ImVec2(sp.x - 7.0f, sp.y - 7.0f), ImVec2(sp.x + 7.0f, sp.y + 7.0f));
+        dl->AddLine(toScreen(anchors[k]), sp, IM_COL32(170, 170, 190, 200), 1.0f);
+        bool on = k == hot;
+        dl->AddCircleFilled(sp, on ? 6.5f : 5.0f, on ? IM_COL32(255, 220, 120, 255) : IM_COL32(245, 245, 250, 255));
+    }
+    if (grabbed >= 0) ImGui::SetTooltip("(%.2f, %.2f)", handles[grabbed]->x, handles[grabbed]->y);
+    else if (canvasHovered) ImGui::SetTooltip("Drag to shape the curve (the nearest handle follows)\nDouble-click: back to the preset");
+
+    // where the playback is now, riding on the curve
+    if (now >= 0.0f && now <= 1.0f) {
+        ImVec2 top = toScreen({ now, yHi }), bot = toScreen({ now, yLo });
+        dl->AddLine(top, bot, IM_COL32(255, 255, 255, 40), 1.0f);
+        dl->AddCircleFilled(toScreen({ now, cur.Eval(now) }), 4.5f, IM_COL32(255, 255, 255, 230));
+    }
+    // axes: what x and y mean
+    ImU32 axis = IM_COL32(130, 130, 150, 255);
+    const char* xLabel = "time >";
+    ImVec2 xs = ImGui::CalcTextSize(xLabel);
+    dl->AddText(ImVec2(o.x + w - xs.x - 6.0f, o.y + h - xs.y - 3.0f), axis, xLabel);
+    dl->AddText(ImVec2(o.x + 6.0f, o.y + 3.0f), axis, "^ change");
+
     dragging = anyActive;
     if (linked && changed) trail = lead;
     ImGui::SetCursorScreenPos(ImVec2(o.x, o.y + h + ImGui::GetStyle().ItemSpacing.y));
