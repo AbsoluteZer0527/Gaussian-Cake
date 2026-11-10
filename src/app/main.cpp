@@ -73,6 +73,7 @@ void print_versions() {
 //        [--rigid 0|1] (shared topology: rigid in-betweens, default on)
 //        [--sphere 0|1] (shared topology: fold-free matching through the sphere, default on)
 //        [--bench a.obj:b.obj,c.obj:d.obj] (bake each pair in Topology mode, print quality numbers)
+//        [--bakeshot 5,30] (screenshots that many seconds into the bake: the progress bar)
 //        [--uitest 1] (drive the Animation window with a synthetic mouse, check each control)
 //        [--click x,y] (repeatable: a click of the tool at that pixel, after the bake, at time 0)
 // Bakes A -> B, then saves <prefix>_t<time>.ppm for every time and exits.
@@ -86,7 +87,8 @@ struct ScriptArgs {
     int select = -1;                        // the step the Animation window shows
     std::vector<glm::vec2> clicks;
     std::vector<std::pair<std::string, std::string>> bench;   // --bench a:b,c:d
-    bool uitest = false;          // tool clicks (window pixels) before the shots
+    bool uitest = false;
+    std::vector<float> bakeshots;   // --bakeshot 5,30: screenshots this many seconds into the bake          // tool clicks (window pixels) before the shots
     std::vector<float> times = { 0.0f, 0.5f, 1.0f };
     int width = 800, height = 600, k = -1;
     int gpu = -1;               // 0 = force the CPU paths
@@ -123,6 +125,15 @@ static bool ParseArgs(int argc, char** argv, ScriptArgs& args) {
         else if (key == "--sphere")    Window::sphereMatch = (val != "0");
         else if (key == "--select")    args.select = std::stoi(val);
         else if (key == "--uitest")    args.uitest = (val != "0");
+        else if (key == "--bakeshot") {
+            size_t pos = 0;
+            while (pos < val.size()) {
+                size_t comma = val.find(',', pos);
+                if (comma == std::string::npos) comma = val.size();
+                args.bakeshots.push_back(std::stof(val.substr(pos, comma - pos)));
+                pos = comma + 1;
+            }
+        }
         else if (key == "--bench") {
             size_t pos = 0;
             while (pos < val.size()) {
@@ -375,7 +386,14 @@ static int RunScript(GLFWwindow* window, const ScriptArgs& args) {
     Window::ComputeOTAndSpawnParticles();
 
     double start = glfwGetTime();
+    size_t nextBakeShot = 0;
     for (;;) {
+        if (nextBakeShot < args.bakeshots.size() && glfwGetTime() - start >= args.bakeshots[nextBakeShot]) {
+            char name[64];
+            snprintf(name, sizeof(name), "_baking%.0fs.ppm", args.bakeshots[nextBakeShot]);
+            Window::screenshotPath = args.shot + name;
+            ++nextBakeShot;
+        }
         Frame(window);
         bool busy = Window::morphBaking || Window::splatBaking;
         bool ready = Window::trueMorphActive || Window::splatMorphActive || Window::particleMorphActive;

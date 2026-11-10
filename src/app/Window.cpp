@@ -961,7 +961,8 @@ static const char* kBakeStageNames[] = {
     "Mapping splats", "Matching splats", "Smoothing paths", "Done"
 };
 static const char* kMorphStageNames[] = {
-    "Loading meshes", "Fitting Gaussians", "Building the morph", "Done"
+    "Loading meshes", "Aligning shapes", "Matching surfaces", "Building distance field",
+    "Finding topology changes", "Fitting meshes", "Done"
 };
 // Progress labels of the bake that is running (splat or topology)
 static const char* const* g_stageNames = kBakeStageNames;
@@ -971,10 +972,18 @@ static std::atomic<int> g_bakeStage{0};
 static std::atomic<int> g_bakeDone{0};
 static std::atomic<int> g_bakeTotal{1};
 
+// When the bake and its current stage started (ms on the steady clock)
+static std::atomic<long long> g_bakeStartMs{0}, g_stageStartMs{0};
+static long long NowMs() {
+    return std::chrono::duration_cast<std::chrono::milliseconds>(
+               std::chrono::steady_clock::now().time_since_epoch()).count();
+}
+
 static void SetBakeStage(int stage, int total) {
     g_bakeDone  = 0;
     g_bakeTotal = std::max(1, total);
     g_bakeStage = stage;
+    g_stageStartMs = NowMs();
 }
 
 // Everything the bake needs, copied when Bake is clicked so GUI changes
@@ -1527,6 +1536,7 @@ void Window::BakeSplatMorph(const std::string& pathA, const std::string& pathB) 
 
     g_stageNames = kBakeStageNames;
     g_stageCount = 6;
+    g_bakeStartMs = NowMs();
     SetBakeStage(0, 1);
     splatBaking  = true;
     g_bakeLaunchEpoch = g_bakeEpoch;
@@ -1941,7 +1951,7 @@ static TrueMorphResult RunTrueMorphBake(TrueMorphSettings st) {
     res.shared = (st.method == MorphMethod::SharedTopology) ||
                  (st.method == MorphMethod::Auto && mismatch.empty());
 
-    SetBakeStage(1, 1);
+    SetBakeStage(1, 1);   // aligning shapes
     std::vector<glm::vec3> samplesA = MeshSampler::Sample(trisA, st.sampleCount);
     std::vector<glm::vec3> samplesB = MeshSampler::Sample(trisB, st.sampleCount);
     res.gA.FitFromPoints(samplesA);
@@ -1960,8 +1970,8 @@ static TrueMorphResult RunTrueMorphBake(TrueMorphSettings st) {
         mixAB = OptimalTransport::ComputeMixture(mA, mB, st.sinkhornEps, st.posteriorTemp);
     }
 
-    SetBakeStage(2, 1);
     char buf[512];
+    SetBakeStage(res.shared ? 2 : 3, 1);   // matching surfaces / building the distance field
     if (res.shared) {
         // The template is the mesh with more faces, unless it is too big to fit
         // quickly; then the smaller one is subdivided up to a similar size.
@@ -2143,8 +2153,13 @@ static TrueMorphResult RunTrueMorphBake(TrueMorphSettings st) {
 
         if (res.piecewise) {
             // real meshes following the SDF surface, switching at topology events
-            SetBakeStage(2, 1);
             PiecewiseMorph::Params pp;
+            pp.progress = [](int phase, int done, int total) {
+                int stage = phase == 0 ? 4 : 5;   // finding topology changes / fitting meshes
+                if (g_bakeStage.load() != stage) SetBakeStage(stage, total);
+                g_bakeTotal = std::max(1, total);
+                g_bakeDone = done;
+            };
             pp.fit.stiffnessScale = st.fitStiffness;
             pp.fit.cotanLaplacian = st.fitCotan;
             // Each fit starts close (from the last keyframe), so fewer stiffness
@@ -2173,7 +2188,7 @@ static TrueMorphResult RunTrueMorphBake(TrueMorphSettings st) {
     res.status = buf;
     if (!res.shared && !st.pins.empty())
         res.status += " Pins ignored: they only steer a shared-topology fit.";
-    SetBakeStage(3, 1);
+    SetBakeStage(6, 1);   // done
     res.bakeMs = MsSince(t0);
     std::cout << "[Morph] " << res.status << " (bake " << (int)res.bakeMs << " ms)\n";
     res.ok = true;
@@ -2343,7 +2358,8 @@ void Window::BakeTimeline() {
     }
 
     g_stageNames = kMorphStageNames;
-    g_stageCount = 3;
+    g_stageCount = 6;
+    g_bakeStartMs = NowMs();
     SetBakeStage(0, 1);
     g_segBaking = 0;
     g_segTotal  = (int)todo.size();
@@ -2706,6 +2722,72 @@ void Window::BenchReport(const std::string& label) {
     fflush(stdout);
 }
 
+// ---- Bake progress ----
+
+// How far the running bake is, 0..1, over all the steps it bakes. Within a
+// topology step the stages are weighted by how long they usually take
+// (the Piecewise mesh fits dominate).
+static float BakeFraction() {
+    int stage = g_bakeStage.load();
+    float f = glm::clamp((float)g_bakeDone.load() / (float)std::max(1, g_bakeTotal.load()), 0.0f, 1.0f);
+    if (g_stageNames != kMorphStageNames)   // splats: equal stages
+        return glm::clamp((stage + f) / (float)g_stageCount, 0.0f, 1.0f);
+    static const float base[7]   = { 0.00f, 0.05f, 0.10f, 0.10f, 0.25f, 0.35f, 1.0f };
+    static const float weight[7] = { 0.05f, 0.05f, 0.90f, 0.15f, 0.10f, 0.65f, 0.0f };
+    float step = base[std::clamp(stage, 0, 6)] + weight[std::clamp(stage, 0, 6)] * f;
+    int steps = std::max(1, g_segTotal.load());
+    return glm::clamp((g_segBaking.load() + step) / (float)steps, 0.0f, 1.0f);
+}
+
+static std::string Clock(double seconds) {
+    int s = (int)std::max(0.0, seconds);
+    char buf[16];
+    snprintf(buf, sizeof(buf), "%d:%02d", s / 60, s % 60);
+    return buf;
+}
+
+// The bake's progress bar. Full: "Step 2/3 · Fitting meshes 7/19 · 0:42,
+// ~1:10 left" with a tooltip; compact (the Animation window): the step and
+// count only. width < 0: the rest of the row.
+static void DrawBakeProgress(bool compact, float width = -1.0f) {
+    int stage = std::clamp(g_bakeStage.load(), 0, g_stageCount);
+    int done = g_bakeDone.load(), total = std::max(1, g_bakeTotal.load());
+    double elapsed = (NowMs() - g_bakeStartMs.load()) / 1000.0;
+    double inStage = (NowMs() - g_stageStartMs.load()) / 1000.0;
+    bool morph = g_stageNames == kMorphStageNames;
+    bool counted = total > 1;   // a stage with a count worth showing (fits, probes, splats)
+    // the step's own number on the timeline (only changed steps are baked)
+    std::string step;
+    int steps = (int)Window::timeline.segs.size();
+    if (morph && steps > 1) {
+        int i = g_segBaking.load();
+        int k = (i >= 0 && i < (int)g_launchBakeIdx.size()) ? g_launchBakeIdx[i] : i;
+        step = "Step " + std::to_string(k + 1) + "/" + std::to_string(steps);
+    }
+    std::string what = g_stageNames[stage];
+    if (counted) what += " " + std::to_string(done) + "/" + std::to_string(total);
+    // time left in this stage, from its own pace (once it has some)
+    std::string left;
+    if (counted && done > 0 && done < total && inStage > 2.0)
+        left = "~" + Clock(inStage * (total - done) / done) + " left";
+
+    std::string label = compact
+        ? (step.empty() ? "" : step + "  ") + (counted ? std::to_string(done) + "/" + std::to_string(total) : what)
+        : what;
+    ImGui::ProgressBar(BakeFraction(), ImVec2(width, 0.0f), label.c_str());
+    std::string tip = (step.empty() ? std::string() : step + ": ") + what + "\nElapsed " + Clock(elapsed);
+    if (!left.empty()) tip += "\n" + left + " in this stage";
+    if (morph && stage == 5)
+        tip += "\n\nThe topology changes here, so a mesh is fitted to the in-between\n"
+               "surface at each keyframe. Big meshes (100k+ triangles) take longest.";
+    ImGui::SetItemTooltip("%s", tip.c_str());
+    if (!compact) {   // the second line: which step, how long so far, how long to go
+        std::string line = step.empty() ? Clock(elapsed) : step + "   " + Clock(elapsed);
+        if (!left.empty()) line += "   " + left;
+        ImGui::TextDisabled("%s", line.c_str());
+    }
+}
+
 // ---- Animation window ----
 
 bool Window::loopPlayback = false;
@@ -2855,7 +2937,7 @@ void Window::DrawDirectorGUI() {
     if (morphBaking || splatBaking) {
         ImGui::SameLine();
         ImGui::SetCursorPosY(rowY + 0.5f * (icon - ImGui::GetFrameHeight()));
-        Badge("baking...", IM_COL32(170, 170, 185, 255), "Working out how every part moves");
+        DrawBakeProgress(true);
     } else if (stale) {
         ImGui::SameLine();
         ImGui::SetCursorPosY(rowY + 0.5f * (icon - ImGui::GetFrameHeight()));
@@ -3186,16 +3268,7 @@ void Window::DrawMainGUI() {
 
     // Status: bake progress while baking, then the timeline position
     if (baking) {
-        int stage = g_bakeStage.load();
-        float frac = (float)g_bakeDone.load() / (float)g_bakeTotal.load();
-        char label[96];
-        if (morphBaking && g_segTotal.load() > 1)
-            snprintf(label, sizeof(label), "Step %d/%d: %s (%d/%d)", g_segBaking.load() + 1, g_segTotal.load(),
-                     g_stageNames[stage], std::min(stage + 1, g_stageCount), g_stageCount);
-        else
-            snprintf(label, sizeof(label), "%s (%d/%d)", g_stageNames[stage],
-                     std::min(stage + 1, g_stageCount), g_stageCount);
-        ImGui::ProgressBar(glm::clamp(frac, 0.0f, 1.0f), ImVec2(-1, 0), label);
+        DrawBakeProgress(false);
     } else if (particles) {
         animator->DrawStatusGUI();   // (the other modes: the Animation window's transport)
     }

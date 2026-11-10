@@ -4,6 +4,7 @@
 #include "MeshTopology.h"
 #include "SDFMorph.h"
 #include "SurfaceColor.h"
+#include <functional>
 #include <string>
 #include <vector>
 
@@ -38,6 +39,9 @@ public:
     struct Params {
         int       keyframes = 12;   // fits per unit of time
         FitParams fit;
+        // Progress (called on the building thread): phase 0 = finding the
+        // topology changes, 1 = fitting the meshes; done of total.
+        std::function<void(int phase, int done, int total)> progress;
     };
 
     // a / b: the cleaned end meshes (A's and B's vertices); colorsA / colorsB:

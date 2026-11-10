@@ -182,7 +182,10 @@ bool PiecewiseMorph::Build(const SDFMorph& sdf, const IndexedMesh& a, const Inde
     // changes are seen (and can be dropped below)
     const int probes = 4 * samples;
     std::vector<Topology> topo(probes + 1);
-    for (int k = 0; k <= probes; ++k) topo[k] = SolidTopology(sdf, (float)k / probes);
+    for (int k = 0; k <= probes; ++k) {
+        topo[k] = SolidTopology(sdf, (float)k / probes);
+        if (params.progress) params.progress(0, k + 1, probes + 1);
+    }
 
     // A change that undoes itself within a short time (a hole that flickers
     // open and shut) is noise, not an event: smooth those runs away.
@@ -241,6 +244,7 @@ bool PiecewiseMorph::Build(const SDFMorph& sdf, const IndexedMesh& a, const Inde
 
     // Fits the template along `times` (in that order), starting from `start`
     // at the first time; returns one position set per time.
+    int plannedFits = 1, fitsDone = 0;   // for the progress (counted below)
     auto follow = [&](const IndexedMesh& tmpl, const std::vector<glm::vec3>& start,
                       const std::vector<float>& times, bool firstIsExact) {
         std::vector<std::vector<glm::vec3>> out;
@@ -251,6 +255,7 @@ bool PiecewiseMorph::Build(const SDFMorph& sdf, const IndexedMesh& a, const Inde
                 if (target.FaceCount() > 0) {
                     p = MeshFitter::Fit(tmpl, p, MeshTopology::ToTriangles(target), params.fit);
                     ++fits;
+                    if (params.progress) params.progress(1, std::min(++fitsDone, plannedFits), plannedFits);
                 }
             }
             out.push_back(p);
@@ -274,6 +279,22 @@ bool PiecewiseMorph::Build(const SDFMorph& sdf, const IndexedMesh& a, const Inde
             seg.colors.push_back(std::move(c));
         }
     };
+
+    // How many fits are coming (for the progress): each keyframe but the
+    // exact first one of every chain
+    plannedFits = 0;
+    for (int s = 0; s < segCount; ++s) {
+        const float lo = (s == 0) ? 0.0f : right[s - 1];
+        const float hi = (s == segCount - 1) ? 1.0f : left[s];
+        if (s == 0) plannedFits += (int)inner(0.0f, hi).size() + (hi > 0.0f ? 1 : 0);
+        else if (s == segCount - 1) plannedFits += (int)inner(lo, 1.0f).size() + (lo < 1.0f ? 1 : 0);
+        else {
+            const float mid = 0.5f * (lo + hi);
+            plannedFits += (int)inner(mid, hi).size() + 1 + (int)inner(lo, mid).size() + 1;
+        }
+    }
+    plannedFits = std::max(plannedFits, 1);
+    if (params.progress) params.progress(1, 0, plannedFits);
 
     for (int s = 0; s < segCount; ++s) {
         PiecewiseSegment& seg = segments[s];
