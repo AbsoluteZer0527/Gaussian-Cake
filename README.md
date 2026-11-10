@@ -110,7 +110,7 @@ In Topology and Splats modes, the **Animation** window on the right lets you dir
 - **Transport + timeline:** play/pause (Space), jump to the start or end (Home/End), and loop. The track works like a dope sheet:
   - Each shape is a ◆ key, and each step between two shapes is a clip coloured by its style.
   - Click or drag the ruler to scrub, and click a clip to edit that step.
-  - Drag an inner ◆ to retime, and use **+** to add a shape (Topology).
+  - Drag an inner ◆ to retime, and use **+** to add a shape. This works in both modes; in Splats, a timeline can mix meshes and .ply captures, and the steps join seamlessly because a shared shape is the same set of splats on both sides of its key.
   - Right-click a ◆ to change its shape or delete it, or right-click a clip to pick a style.
 - **Step:** the step's two shapes and its length, then style tiles (Classic, Bake, Ripple, Melt, Pop, Dissolve) that show each timing as a curve.
 - **Motion:**

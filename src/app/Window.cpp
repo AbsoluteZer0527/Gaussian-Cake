@@ -152,6 +152,10 @@ static const double kWaveSigma        = 0.6;    // how far the source's heat spr
 static const double kWaveSeedFraction = 0.02;   // the lowest 2% of splats are the source
 static float g_splatWaveCell = 0.0f;            // neighbour-search cell of the baked splats
 static void EnsureSplatDelay();
+// The splat timeline (defined with the splat bake)
+static void ActivateSplatSegment(int k);
+static int  SplatSegCount();
+static int  ActiveSplatSeg();
 
 // Full-resolution captures on the GPU: [0] = A, [1] = B. Shown while the
 // timeline rests at that end (the morph itself moves a subsample), and [0]
@@ -388,6 +392,10 @@ static void UpdateQuality() {
         g_refitQuality = true;
     }
     if (!Window::autoQuality || !g_refitQuality) return;
+    // Not while a morph is loaded: changing the counts would make the bake
+    // that just finished look out of date. The refit waits for the next
+    // Reset / new shapes (StopAllMorphs).
+    if (Window::splatMorphActive || Window::trueMorphActive) return;
     g_refitQuality = false;
 
     // only splats have a learned cost; the other modes take the middle
@@ -638,7 +646,7 @@ void Window::resizeCallback(GLFWwindow* window, int width, int height) {
 static void SyncTimelineKeys() {
     MorphTimeline& tl = Window::timeline;
     tl.SyncSegments();
-    if (Window::renderMode == RenderMode::TriangleMorph) {
+    if (Window::renderMode != RenderMode::Particles) {   // Topology and Splats: the timeline leads
         Window::meshIndexA = tl.keys[0];
         Window::meshIndexB = tl.keys[1];
     } else {
@@ -681,11 +689,13 @@ void Window::idleCallback() {
         static std::vector<glm::vec3> unused;
         animator->Update(deltaTime, unused);
 
-        // Splats play the timeline's first segment, in its style: progress is
-        // linear here, each splat eases itself (wave, then the style's curves)
-        const MorphStyle& style = timeline.segs[0].style;
-        animator->transportDuration = timeline.segs[0].duration;
-        float e = animator->GetProgress();
+        // Splats play the timeline step by step, each in its own style:
+        // progress is linear here, each splat eases itself (wave, then curves)
+        animator->transportDuration = timeline.Total();
+        MorphTimeline::Place place = timeline.Locate(animator->GetProgress());
+        ActivateSplatSegment(std::min(place.seg, SplatSegCount() - 1));
+        const MorphStyle& style = timeline.segs[std::clamp(ActiveSplatSeg(), 0, (int)timeline.segs.size() - 1)].style;
+        float e = place.local;
         splatWave     = style.wave;
         splatCohesion = style.cohesion;
         g_splatMidGrow = style.midGrow;
@@ -971,6 +981,9 @@ static const int kSplatNeighbors = 8;   // k for the cohesion smoothing graph
 static std::atomic<int> g_bakeStage{0};
 static std::atomic<int> g_bakeDone{0};
 static std::atomic<int> g_bakeTotal{1};
+
+// Which of the timeline's steps the running bake is on (topology and splats)
+static std::atomic<int> g_segBaking{0}, g_segTotal{1};
 
 // When the bake and its current stage started (ms on the steady clock)
 static std::atomic<long long> g_bakeStartMs{0}, g_stageStartMs{0};
@@ -1293,6 +1306,13 @@ static float MidwayStretch(const glm::quat& rot, const Eigen::Matrix3d& J) {
     return (float)std::clamp(s, 0.5, 2.0);
 }
 
+// A shape's own random seed for turning it into splats (stable per file).
+static unsigned int ShapeSeed(const std::string& path) {
+    unsigned int h = 2166136261u;
+    for (char c : std::filesystem::path(path).filename().string()) h = (h ^ (unsigned char)c) * 16777619u;
+    return 42u + h % 100000u;
+}
+
 static SplatBakeResult RunSplatBake(SplatBakeSettings st) {
     SplatBakeResult res;
     res.pathA = st.pathA;
@@ -1316,8 +1336,11 @@ static SplatBakeResult RunSplatBake(SplatBakeSettings st) {
     int count = st.splatCount;
     if (A->capture) count = std::min(count, (int)A->splats.size());
     if (B->capture) count = std::min(count, (int)B->splats.size());
-    std::vector<Splat> splatsA = BakeSplats(*A, count, st.sizeMul, 42u);
-    std::vector<Splat> splatsB = BakeSplats(*B, count, st.sizeMul, 43u);
+    // Seeds belong to the shape, not to its role: a shape between two steps
+    // of a timeline is the same splats at the end of one and the start of the
+    // next, so the steps join without a pop
+    std::vector<Splat> splatsA = BakeSplats(*A, count, st.sizeMul, ShapeSeed(st.pathA));
+    std::vector<Splat> splatsB = BakeSplats(*B, count, st.sizeMul, ShapeSeed(st.pathB));
     const int n = (int)std::min(splatsA.size(), splatsB.size());
     splatsA.resize(n);
     splatsB.resize(n);
@@ -1334,8 +1357,8 @@ static SplatBakeResult RunSplatBake(SplatBakeSettings st) {
         for (Splat& s : full) s.scale *= st.sizeMul;
         return full;
     };
-    res.restA = fullCapture(*A, 44u);
-    res.restB = fullCapture(*B, 45u);
+    res.restA = fullCapture(*A, ShapeSeed(st.pathA) + 1u);
+    res.restB = fullCapture(*B, ShapeSeed(st.pathB) + 1u);
 
     // Mixture fit on surface samples; K = 1 reproduces the original single map
     SetBakeStage(1, 1);
@@ -1477,7 +1500,7 @@ static SplatBakeResult RunSplatBake(SplatBakeSettings st) {
     return res;
 }
 
-static std::future<SplatBakeResult> g_bakeFuture;
+static std::future<std::vector<SplatBakeResult>> g_bakeFuture;   // one result per baked step
 static int g_bakeEpoch  = 0;   // bumped by Clear / mode switches; a running bake is then dropped
 static int g_bakeLaunchEpoch = 0;   // epoch when the running bake started
 
@@ -1496,97 +1519,191 @@ static std::string SplatBakeKey(const SplatBakeSettings& st) {
            std::to_string(st.colorMatch);
 }
 
-// Starts the baked splat morph from A (after a bake, or Bake again unchanged)
+// The splat timeline: one bake per step (key k -> key k + 1), like Topology.
+// Steps whose settings didn't change since the last bake are kept.
+static std::vector<SplatBakeResult> g_splatSegs;
+static std::vector<std::string>     g_splatSegKeys;
+static std::vector<std::string>     g_splatLaunchKeys;
+static std::vector<int>             g_splatLaunchIdx;   // steps the running bake computes
+static int g_activeSplatSeg = -1;                       // step whose keyframes are loaded
+static int g_splatBoundSeg  = -1;                       // step the director's delays belong to
+
+// One step's settings. splatCount: the same for every step (the smallest
+// capture on the timeline caps it), so a shared key has one set of splats.
+static SplatBakeSettings SplatSettings(int k, int count) {
+    const MorphTimeline& tl = Window::timeline;
+    SplatBakeSettings st;
+    st.pathA         = Window::meshPaths[tl.keys[k] - 1];
+    st.pathB         = Window::meshPaths[tl.keys[k + 1] - 1];
+    st.splatCount    = count;
+    st.sampleCount   = Window::sampleCount;
+    st.mixtureK      = Window::mixtureK;
+    st.sizeMul       = Window::splatSizeMul;
+    st.sinkhornEps   = Window::sinkhornEps;
+    st.posteriorTemp = Window::posteriorTemp;
+    st.colorMatch    = Window::colorMatch;
+    st.ply           = Window::plyOptions;
+    st.heatWave      = false;   // the director computes the delays (EnsureSplatDelay)
+    return st;
+}
+
+// The splat count for the whole timeline: the setting, capped by the
+// smallest capture on it (as far as known; a bake learns the rest)
+static int TimelineSplatCount() {
+    int count = Window::splatCount;
+    for (int key : Window::timeline.keys) {
+        if (key <= 0 || key > (int)Window::meshPaths.size()) continue;
+        const std::string& path = Window::meshPaths[key - 1];
+        if (!IsCapture(path)) continue;
+        auto it = g_cleanedCounts.find(CaptureKey(path, Window::plyOptions));
+        if (it != g_cleanedCounts.end()) count = std::min(count, (int)it->second);
+    }
+    return count;
+}
+
+static bool SplatTimelineBakeable() {
+    for (int key : Window::timeline.keys)
+        if (key <= 0 || key > (int)Window::meshPaths.size()) return false;
+    return Window::timeline.keys.size() >= 2;
+}
+
+static int SplatSegCount()  { return (int)g_splatSegs.size(); }
+static int ActiveSplatSeg() { return g_activeSplatSeg; }
+
+// Puts step k's keyframes into the splat globals and on the GPU (main thread).
+static void ActivateSplatSegment(int k) {
+    if (k < 0 || k >= (int)g_splatSegs.size() || k == g_activeSplatSeg) return;
+    const SplatBakeResult& r = g_splatSegs[k];
+    g_activeSplatSeg        = k;
+    Window::splatStart      = r.start;
+    Window::splatEnd        = r.end;
+    Window::splatSmoothDisp = r.smoothDisp;
+    Window::splatStretch    = r.stretch;
+    Window::splatDelay.clear();   // the director fills it (EnsureSplatDelay)
+    Window::splatCurrent    = Window::splatStart;
+    g_splatWaveCell         = r.waveCell;
+    if (Window::gpuAvailable)
+        Window::splatRenderer->UploadKeyframes(Window::splatStart, Window::splatEnd, Window::splatSmoothDisp,
+                                               Window::splatStretch, Window::splatDelay);
+}
+
+// Starts the baked splat timeline from its first key
 static void PlaySplatMorph() {
-    Window::splatCurrent = Window::splatStart;
+    g_activeSplatSeg = -1;
+    g_splatBoundSeg  = -1;
+    ActivateSplatSegment(0);
+    // at rest: the first key's and the last key's full captures (if trimmed)
+    g_restSplatsA = g_splatSegs.front().restA;
+    g_restSplatsB = g_splatSegs.back().restB;
     if (Window::gpuAvailable) {
         g_fullSplats[0]->UploadKeyframes(g_restSplatsA, g_restSplatsA, {});   // empty = none
         g_fullSplats[1]->UploadKeyframes(g_restSplatsB, g_restSplatsB, {});
     }
-    // The animator only provides the timeline (easing, duration, state)
+    // The animator only provides the clock: progress 0..1 over the timeline
     Window::animator->InitializeWithEndPoints({}, {});
+    Window::animator->transportDuration = Window::timeline.Total();
     Window::animator->StartTransport();
     Window::splatMorphActive    = true;
     Window::trueMorphActive     = false;
     Window::particleMorphActive = false;
 }
 
-void Window::BakeSplatMorph(const std::string& pathA, const std::string& pathB) {
-    if (splatBaking || morphBaking) return;
-
-    SplatBakeSettings st;
-    st.pathA         = pathA;
-    st.pathB         = pathB;
-    st.splatCount    = splatCount;
-    st.sampleCount   = sampleCount;
-    st.mixtureK      = mixtureK;
-    st.sizeMul       = splatSizeMul;
-    st.sinkhornEps   = sinkhornEps;
-    st.posteriorTemp = posteriorTemp;
-    st.colorMatch    = colorMatch;
-    st.ply           = plyOptions;
-    st.heatWave      = false;   // the director computes the delays (EnsureSplatDelay)
-
-    std::string key = SplatBakeKey(st);
-    if (key == g_bakedSplatKey) {   // already baked: play it again
+void Window::BakeSplatTimeline() {
+    if (splatBaking || morphBaking || !SplatTimelineBakeable()) return;
+    timeline.SyncSegments();
+    const int n = (int)timeline.segs.size();
+    const int count = TimelineSplatCount();
+    std::vector<SplatBakeSettings> todo;
+    g_splatLaunchKeys.clear();
+    g_splatLaunchIdx.clear();
+    for (int k = 0; k < n; ++k) {
+        SplatBakeSettings st = SplatSettings(k, count);
+        std::string key = SplatBakeKey(st);
+        g_splatLaunchKeys.push_back(key);
+        bool have = std::find(g_splatSegKeys.begin(), g_splatSegKeys.end(), key) != g_splatSegKeys.end();
+        if (!have) {
+            g_splatLaunchIdx.push_back(k);
+            todo.push_back(st);
+        }
+    }
+    if (todo.empty()) {   // already baked: reorder what we have and play it again
+        std::vector<SplatBakeResult> results;
+        for (int k = 0; k < n; ++k)
+            for (size_t j = 0; j < g_splatSegKeys.size(); ++j)
+                if (g_splatSegKeys[j] == g_splatLaunchKeys[k]) { results.push_back(g_splatSegs[j]); break; }
+        g_splatSegs    = std::move(results);
+        g_splatSegKeys = g_splatLaunchKeys;
         PlaySplatMorph();
         return;
     }
-    g_launchKey = key;
 
     g_stageNames = kBakeStageNames;
     g_stageCount = 6;
     g_bakeStartMs = NowMs();
     SetBakeStage(0, 1);
+    g_segBaking = 0;
+    g_segTotal  = (int)todo.size();
     splatBaking  = true;
     g_bakeLaunchEpoch = g_bakeEpoch;
-    g_bakeFuture = std::async(std::launch::async, RunSplatBake, st);
+    g_bakeFuture = std::async(std::launch::async, [todo]() {
+        std::vector<SplatBakeResult> out;
+        for (size_t i = 0; i < todo.size(); ++i) {
+            g_segBaking = (int)i;
+            out.push_back(RunSplatBake(todo[i]));
+        }
+        return out;
+    });
 }
 
-// Called every frame: when the background bake has finished, hand its
-// keyframes to the renderer and start the animation (main thread only).
+// Called every frame: when the background bake has finished, take its steps
+// and start the animation (main thread only).
 void Window::PollSplatBake() {
     if (!splatBaking || !g_bakeFuture.valid()) return;
     if (g_bakeFuture.wait_for(std::chrono::seconds(0)) != std::future_status::ready) return;
 
     splatBaking = false;
-    SplatBakeResult res;
+    std::vector<SplatBakeResult> baked;
     try {
-        res = g_bakeFuture.get();
+        baked = g_bakeFuture.get();
     } catch (const std::exception& ex) {
         std::cerr << "[Splats] bake failed: " << ex.what() << "\n";
         return;
     }
-    if (!res.ok) {
-        std::cerr << "[Splats] bake failed: could not load meshes\n";
-        return;
+    for (const SplatBakeResult& res : baked) {
+        if (!res.ok) {
+            std::cerr << "[Splats] bake failed: could not load meshes\n";
+            return;
+        }
+        if (res.cleanedA > 0) RecordCleanedCount(CaptureKey(res.pathA, res.ply), res.cleanedA);
+        if (res.cleanedB > 0) RecordCleanedCount(CaptureKey(res.pathB, res.ply), res.cleanedB);
     }
-    if (res.cleanedA > 0) RecordCleanedCount(CaptureKey(res.pathA, res.ply), res.cleanedA);
-    if (res.cleanedB > 0) RecordCleanedCount(CaptureKey(res.pathB, res.ply), res.cleanedB);
-    // user pressed Clear or left Splats mode while the bake was running
+    // user pressed Reset or left Splats mode while the bake was running
     if (g_bakeLaunchEpoch != g_bakeEpoch || renderMode != RenderMode::Splats) return;
 
-    splatStart   = std::move(res.start);
-    splatEnd        = std::move(res.end);
-    splatSmoothDisp = std::move(res.smoothDisp);
-    splatStretch    = std::move(res.stretch);
-    splatDelay      = std::move(res.delay);
-    g_splatWaveCell = res.waveCell;
-    g_restSplatsA   = std::move(res.restA);
-    g_restSplatsB   = std::move(res.restB);
-    g_bakedSplatKey = g_launchKey;
+    double ms = 0.0;
+    for (const SplatBakeResult& r : baked) {
+        ms += r.ms;
+        g_perf.ObserveBake((int)r.start.size(), r.ms - r.loadMs);
+        std::cout << "[Splats] baked " << r.start.size() << " matched splats (" << r.pathA << " -> " << r.pathB
+                  << "), K=" << mixtureK << ", mean match distance " << r.meanMatchDist << ", " << r.ms << " ms\n";
+    }
+    std::vector<SplatBakeResult> results(g_splatLaunchKeys.size());
+    for (size_t k = 0; k < g_splatLaunchKeys.size(); ++k) {
+        auto it = std::find(g_splatLaunchIdx.begin(), g_splatLaunchIdx.end(), (int)k);
+        if (it != g_splatLaunchIdx.end()) {
+            results[k] = std::move(baked[it - g_splatLaunchIdx.begin()]);
+        } else {
+            for (size_t j = 0; j < g_splatSegKeys.size(); ++j)
+                if (g_splatSegKeys[j] == g_splatLaunchKeys[k]) { results[k] = g_splatSegs[j]; break; }
+        }
+    }
+    g_splatSegs     = std::move(results);
+    g_splatSegKeys  = g_splatLaunchKeys;
+    g_bakedSplatKey = g_splatSegKeys.empty() ? "" : g_splatSegKeys[0];
 
-    // GPU path: the keyframes go up once; each frame then only sends the time
-    if (gpuAvailable)
-        splatRenderer->UploadKeyframes(splatStart, splatEnd, splatSmoothDisp, splatStretch, splatDelay);
-
-    PlaySplatMorph();
-    lastBakeMs          = (float)res.ms;
-    g_perf.ObserveBake((int)splatStart.size(), res.ms - res.loadMs);
+    lastBakeMs     = (float)ms;
     g_refitQuality = true;
-
-    std::cout << "[Splats] baked " << splatStart.size() << " matched splats, K=" << mixtureK
-              << ", mean match distance " << res.meanMatchDist << ", " << res.ms << " ms\n";
+    PlaySplatMorph();
 }
 
 // The splats' delays come from the director: the style's origin (bottom,
@@ -1597,15 +1714,17 @@ static void EnsureSplatDelay() {
     const std::vector<Splat>& start = Window::splatStart;
     if (start.empty()) return;
     MorphDirector& d = Window::director;
-    if (d.Count() != start.size() || g_directorBoundToPreview) {
+    int seg = std::max(g_activeSplatSeg, 0);
+    if (d.Count() != start.size() || g_directorBoundToPreview || g_splatBoundSeg != seg) {
         std::vector<glm::vec3> pos(start.size());
         for (size_t i = 0; i < start.size(); ++i) pos[i] = start[i].mean;
-        d.Bind(pos, g_splatWaveCell, 0);
+        d.Bind(pos, g_splatWaveCell, seg);
+        g_splatBoundSeg = seg;
         g_directorBoundToPreview = false;
         SetPickSurface(pos, {});
         g_splatDelayVersion = -1;
     }
-    d.UpdateDelay(Window::timeline.segs[0].style.origin);
+    d.UpdateDelay(Window::timeline.segs[std::min(seg, (int)Window::timeline.segs.size() - 1)].style.origin);
     if (d.DelayVersion() == g_splatDelayVersion && Window::splatDelay.size() == start.size()) return;
     g_splatDelayVersion = d.DelayVersion();
     Window::splatDelay = d.Delay();
@@ -1745,7 +1864,7 @@ void Window::ComputeOTAndSpawnParticles() {
     const std::string& pathB = hasMeshB ? meshPaths[meshIndexB - 1] : "";
 
     if (renderMode == RenderMode::Splats) {
-        if (hasMeshA && hasMeshB) BakeSplatMorph(pathA, pathB);
+        BakeSplatTimeline();
         return;
     }
     splatMorphActive = false;
@@ -2214,7 +2333,6 @@ static std::vector<std::string> g_launchSegKeys;   // every segment's key at lau
 static std::vector<TrueMorphResult> g_segResults;  // baked segments (CPU data)
 static std::vector<std::string>     g_segKeys;
 static int g_activeSeg = -1;                       // segment whose data is in the g_morph* globals
-static std::atomic<int> g_segBaking{0}, g_segTotal{1};
 
 static std::string MorphBakeKey(const TrueMorphSettings& st) {
     return st.pathA + "|" + st.pathB + "|" + std::to_string((int)st.method) + "|" +
@@ -2730,8 +2848,11 @@ void Window::BenchReport(const std::string& label) {
 static float BakeFraction() {
     int stage = g_bakeStage.load();
     float f = glm::clamp((float)g_bakeDone.load() / (float)std::max(1, g_bakeTotal.load()), 0.0f, 1.0f);
-    if (g_stageNames != kMorphStageNames)   // splats: equal stages
-        return glm::clamp((stage + f) / (float)g_stageCount, 0.0f, 1.0f);
+    if (g_stageNames != kMorphStageNames) {   // splats: equal stages, per step
+        int steps = std::max(1, g_segTotal.load());
+        float step = glm::clamp((stage + f) / (float)g_stageCount, 0.0f, 1.0f);
+        return glm::clamp((g_segBaking.load() + step) / (float)steps, 0.0f, 1.0f);
+    }
     static const float base[7]   = { 0.00f, 0.05f, 0.10f, 0.10f, 0.25f, 0.35f, 1.0f };
     static const float weight[7] = { 0.05f, 0.05f, 0.90f, 0.15f, 0.10f, 0.65f, 0.0f };
     float step = base[std::clamp(stage, 0, 6)] + weight[std::clamp(stage, 0, 6)] * f;
@@ -2759,9 +2880,10 @@ static void DrawBakeProgress(bool compact, float width = -1.0f) {
     // the step's own number on the timeline (only changed steps are baked)
     std::string step;
     int steps = (int)Window::timeline.segs.size();
-    if (morph && steps > 1) {
+    if (steps > 1) {
+        const std::vector<int>& idx = morph ? g_launchBakeIdx : g_splatLaunchIdx;
         int i = g_segBaking.load();
-        int k = (i >= 0 && i < (int)g_launchBakeIdx.size()) ? g_launchBakeIdx[i] : i;
+        int k = (i >= 0 && i < (int)idx.size()) ? idx[i] : i;
         step = "Step " + std::to_string(k + 1) + "/" + std::to_string(steps);
     }
     std::string what = g_stageNames[stage];
@@ -2796,15 +2918,23 @@ bool Window::loopPlayback = false;
 static bool CanBakeNow() {
     if (Window::splatBaking || Window::morphBaking) return false;
     if (Window::renderMode == RenderMode::TriangleMorph) return TimelineBakeable();
-    if (Window::renderMode == RenderMode::Splats) return Window::meshIndexA > 0 && Window::meshIndexB > 0;
+    if (Window::renderMode == RenderMode::Splats) return SplatTimelineBakeable();
     return true;
 }
 
 // Topology: the shapes, pins or bake settings changed since the last bake.
 static bool TimelineStale() {
+    const MorphTimeline& tl = Window::timeline;
+    if (Window::renderMode == RenderMode::Splats) {
+        if (!Window::splatMorphActive || !SplatTimelineBakeable()) return false;
+        if (g_splatSegKeys.size() != tl.segs.size()) return true;
+        int count = TimelineSplatCount();
+        for (int k = 0; k < (int)tl.segs.size(); ++k)
+            if (g_splatSegKeys[k] != SplatBakeKey(SplatSettings(k, count))) return true;
+        return false;
+    }
     if (Window::renderMode != RenderMode::TriangleMorph || !Window::trueMorphActive || !TimelineBakeable())
         return false;
-    const MorphTimeline& tl = Window::timeline;
     if (g_segKeys.size() != tl.segs.size()) return true;
     for (int k = 0; k < (int)tl.segs.size(); ++k)
         if (g_segKeys[k] != MorphBakeKey(SegmentSettings(k))) return true;
@@ -2894,17 +3024,9 @@ void Window::DrawDirectorGUI() {
     const bool baked = trueMorphActive || splatMorphActive;
     const bool stale = TimelineStale();
     const float icon = ImGui::GetFrameHeight() * 1.15f;
-    // Splats play one step: show the track with just the first two shapes
-    MorphTimeline splatView;
-    if (!topo) {
-        splatView = tl;
-        splatView.keys.resize(2);
-        splatView.SyncSegments();
-        splatView.selected = 0;
-        splatView.selectedKey = -1;
-    }
-    const MorphTimeline& shown = topo ? tl : splatView;
-    const int sel = topo ? tl.selected : 0;
+    // Topology and Splats both play the whole timeline of shapes
+    const MorphTimeline& shown = tl;
+    const int sel = std::clamp(tl.selected, 0, (int)tl.segs.size() - 1);
     MorphSegmentSpec& seg = tl.segs[sel];
     MorphStyle& style = seg.style;
 
@@ -2928,7 +3050,7 @@ void Window::DrawDirectorGUI() {
     if (IconButton("##loop", Icon::Loop, loopPlayback, loopPlayback ? "Loop: on" : "Loop: off", icon))
         loopPlayback = !loopPlayback;
     ImGui::SameLine();
-    float total = topo ? tl.Total() : tl.segs[0].duration;
+    float total = tl.Total();
     ImGui::SetCursorPosY(rowY + 0.5f * (icon - ImGui::GetTextLineHeight()));
     ImGui::Text("%.1f", (baked ? animator->GetProgress() : 0.0f) * total);
     ImGui::SameLine(0.0f, 2.0f);
@@ -2948,11 +3070,11 @@ void Window::DrawDirectorGUI() {
 
     // ---- the track ----
     TrackResult r;
-    TimelineTrack("##track", shown, baked ? animator->GetProgress() : 0.0f, topo, baked, meshNames, r);
+    TimelineTrack("##track", shown, baked ? animator->GetProgress() : 0.0f, true, baked, meshNames, r);
     bool keysChanged = false;
     if (r.seek && baked) animator->Seek(r.progress);
-    if (r.selectSeg >= 0 && topo) { tl.selected = r.selectSeg; tl.selectedKey = -1; }
-    if (r.selectKey >= 0 && topo) {
+    if (r.selectSeg >= 0) { tl.selected = r.selectSeg; tl.selectedKey = -1; }
+    if (r.selectKey >= 0) {
         tl.selectedKey = r.selectKey;
         tl.selected = std::min(r.selectKey, (int)tl.segs.size() - 1);
     }
@@ -2961,14 +3083,14 @@ void Window::DrawDirectorGUI() {
     if (r.deleteKey >= 0) { tl.RemoveKey(r.deleteKey); keysChanged = true; }
     if (r.shapeKey >= 0)  { tl.SetKey(r.shapeKey, r.shapeMesh); keysChanged = true; }
     if (r.styleSeg >= 0) {
-        int s = topo ? r.styleSeg : 0;
+        int s = r.styleSeg;
         tl.ApplyPreset(s, r.styleIndex);
         tl.selected = s;
     }
 
     // ---- the selected step ----
     ImGui::Spacing();
-    if (topo) {
+    {
         char head[32];
         snprintf(head, sizeof(head), "Step %d", sel + 1);
         ImGui::SeparatorText(head);
@@ -2988,9 +3110,6 @@ void Window::DrawDirectorGUI() {
         ImGui::SetItemTooltip("The shape this step ends on");
         ImGui::SameLine();
         ImGui::SetNextItemWidth(durW);
-    } else {
-        ImGui::SeparatorText("Motion");
-        PropLabel("Length", nullptr);
     }
     ImGui::DragFloat("##dur", &seg.duration, 0.05f, MorphTimeline::kMinStep, 20.0f, "%.1f s");
     ImGui::SetItemTooltip("How long this step takes (drag, or double-click to type)");
@@ -3051,8 +3170,7 @@ void Window::DrawDirectorGUI() {
     {
         float now = -1.0f;   // the playback, as a dot riding the curve
         if (baked && !stale) {
-            MorphTimeline::Place place = topo ? tl.Locate(animator->GetProgress())
-                                              : MorphTimeline::Place{ 0, animator->GetProgress() };
+            MorphTimeline::Place place = tl.Locate(animator->GetProgress());
             if (place.seg == sel) now = place.local;
         }
         const auto& base = BuiltinStyles()[std::clamp(seg.basePreset, 0, (int)BuiltinStyles().size() - 1)];
@@ -3188,7 +3306,7 @@ void Window::DrawMainGUI() {
 
     // ---- 2. Shapes ----
     ImGui::SeparatorText("Shapes");
-    if (renderMode == RenderMode::TriangleMorph) {
+    if (renderMode != RenderMode::Particles) {
         // The timeline owns the shapes: a summary here, edited on the right
         std::string chain;
         for (size_t k = 0; k < timeline.keys.size(); ++k) {
@@ -3218,7 +3336,7 @@ void Window::DrawMainGUI() {
     for (int key : timeline.keys) allKeys &= key > 0;
     bool baking  = splatBaking || morphBaking;
     bool canBake = !baking && !captureOutsideSplats &&
-                   (!needsMeshes || (renderMode == RenderMode::TriangleMorph ? allKeys : hasA && hasB));
+                   (!needsMeshes || allKeys);
 
     // ---- 3. Transport ----
     if (renderMode == RenderMode::Particles) {
@@ -3259,10 +3377,8 @@ void Window::DrawMainGUI() {
         StopAllMorphs();
     ImGui::SetItemTooltip("Stop the morph and show the starting shape again");
 
-    if (needsMeshes && renderMode == RenderMode::TriangleMorph && !allKeys)
-        ImGui::TextColored(ImVec4(1.0f, 0.55f, 0.4f, 1.0f), "Pick a mesh for every shape to bake.");
-    else if (needsMeshes && !(hasA && hasB))
-        ImGui::TextColored(ImVec4(1.0f, 0.55f, 0.4f, 1.0f), "Pick a mesh for both A and B to bake.");
+    if (needsMeshes && !allKeys)
+        ImGui::TextColored(ImVec4(1.0f, 0.55f, 0.4f, 1.0f), "Pick a shape for every key to bake.");
     if (captureOutsideSplats)
         ImGui::TextColored(ImVec4(1.0f, 0.55f, 0.4f, 1.0f), ".ply captures work in Splats and Particles modes.");
 

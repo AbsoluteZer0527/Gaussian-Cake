@@ -146,7 +146,7 @@ public:
     static void BakeTimeline();          // Topology: bake every segment of the timeline
     static void PollTrueMorphBake();
     static void UpdateTrueMorph(float dt = 0.0f);
-    static void BakeSplatMorph(const std::string& pathA, const std::string& pathB);
+    static void BakeSplatTimeline();     // Splats: bake every step of the timeline
     static void UpdateSplatPreview();
     static void PollSplatBake();
     static void DrawMainGUI();
